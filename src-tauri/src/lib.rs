@@ -127,6 +127,58 @@ fn backup_tool_config(tool_id: String) -> Result<String, String> {
     config::backup::backup_config(&tool_id)
 }
 
+// --- API Proxy (bypasses CORS) ---
+
+const API_BASE: &str = "https://mcpscoreboard.com/api/v1";
+
+#[tauri::command]
+async fn api_search_servers(query: String, per_page: Option<u32>) -> Result<JsonValue, String> {
+    let per_page = per_page.unwrap_or(25);
+    let url = format!(
+        "{}/servers/?q={}&per_page={}",
+        API_BASE,
+        urlencoding::encode(&query),
+        per_page
+    );
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    let json: JsonValue = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+    Ok(json)
+}
+
+#[tauri::command]
+async fn api_get_install_config(server_id: u64) -> Result<JsonValue, String> {
+    let url = format!("{}/servers/{}/install-config/", API_BASE, server_id);
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    if resp.status().as_u16() == 404 {
+        return Ok(JsonValue::Null);
+    }
+    let json: JsonValue = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+    Ok(json)
+}
+
+#[tauri::command]
+async fn api_get_server(server_id: u64) -> Result<JsonValue, String> {
+    let url = format!("{}/servers/{}/", API_BASE, server_id);
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    let json: JsonValue = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+    Ok(json)
+}
+
 // --- App Setup ---
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -173,6 +225,9 @@ pub fn run() {
             get_pending_deep_link,
             clear_pending_deep_link,
             backup_tool_config,
+            api_search_servers,
+            api_get_install_config,
+            api_get_server,
         ])
         .setup(|app| {
             // Handle deep links on macOS (open-url event)

@@ -7,11 +7,8 @@ import type {
   View,
   ScoreboardServer,
   ApiInstallConfig,
-  ScoreboardSearchResponse,
 } from "./lib/types";
 import * as tauri from "./lib/tauri";
-
-const API_BASE = "https://patchworkmcp.com/scoreboard/api/v1";
 
 interface AppState {
   // Navigation
@@ -155,11 +152,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
     set({ searchLoading: true });
     try {
-      const response = await fetch(
-        `${API_BASE}/servers/?q=${encodeURIComponent(query)}&per_page=25`
-      );
-      if (!response.ok) throw new Error(`API error: ${response.status}`);
-      const data: ScoreboardSearchResponse = await response.json();
+      const data = await tauri.apiSearchServers(query, 25);
       set({
         searchResults: data.results,
         searchLoading: false,
@@ -187,18 +180,8 @@ export const useStore = create<AppState>((set, get) => ({
   fetchInstallConfig: async (serverId) => {
     set({ installConfigLoading: true });
     try {
-      const response = await fetch(
-        `${API_BASE}/servers/${serverId}/install-config/`
-      );
-      if (response.ok) {
-        const config: ApiInstallConfig = await response.json();
-        set({ installConfig: config, installConfigLoading: false });
-      } else if (response.status === 404) {
-        // No install config available for this server
-        set({ installConfig: null, installConfigLoading: false });
-      } else {
-        throw new Error(`API error: ${response.status}`);
-      }
+      const config = await tauri.apiGetInstallConfig(serverId);
+      set({ installConfig: config, installConfigLoading: false });
     } catch (e) {
       console.error("Failed to fetch install config:", e);
       set({ installConfig: null, installConfigLoading: false });

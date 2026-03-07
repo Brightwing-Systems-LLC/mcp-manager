@@ -6,6 +6,9 @@ import type {
   Installation,
   Favorite,
   DeepLinkAction,
+  ScoreboardSearchResponse,
+  ApiInstallConfig,
+  ScoreboardServer,
 } from "./types";
 
 export async function scanTools(): Promise<DetectedTool[]> {
@@ -71,4 +74,32 @@ export async function clearPendingDeepLink(): Promise<void> {
 
 export async function backupToolConfig(toolId: string): Promise<string> {
   return invoke<string>("backup_tool_config", { toolId });
+}
+
+// --- API Proxy (routes through Rust to bypass CORS) ---
+
+export async function apiSearchServers(
+  query: string,
+  perPage?: number
+): Promise<ScoreboardSearchResponse> {
+  return invoke<ScoreboardSearchResponse>("api_search_servers", {
+    query,
+    perPage,
+  });
+}
+
+export async function apiGetInstallConfig(
+  serverId: number
+): Promise<ApiInstallConfig | null> {
+  const result = await invoke<ApiInstallConfig | null>(
+    "api_get_install_config",
+    { serverId }
+  );
+  return result;
+}
+
+export async function apiGetServer(
+  serverId: number
+): Promise<ScoreboardServer> {
+  return invoke<ScoreboardServer>("api_get_server", { serverId });
 }
