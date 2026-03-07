@@ -1,8 +1,181 @@
 use crate::tools::definitions::{ConfigFormat, TOOL_DEFINITIONS};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfiguredServer {
+    pub tool_id: String,
+    pub tool_short_name: String,
+    pub server_name: String,
+}
+
+/// Read all configured MCP servers across all detected tools.
+pub fn read_all_configured_servers() -> Vec<ConfiguredServer> {
+    let mut servers = Vec::new();
+
+    for def in TOOL_DEFINITIONS {
+        if def.is_cli_only {
+            // For Claude Code, try to parse `claude mcp list` output
+            if let Some(cmd) = def.cli_command {
+                match read_cli_servers(cmd) {
+                    Ok(names) => {
+                        log::info!(
+                            "Found {} servers from {} CLI",
+                            names.len(),
+                            def.display_name
+                        );
+                        for name in names {
+                            servers.push(ConfiguredServer {
+                                tool_id: def.id.to_string(),
+                                tool_short_name: def.short_name.to_string(),
+                                server_name: name,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to read {} servers: {}", def.display_name, e);
+                    }
+                }
+            }
+            continue;
+        }
+
+        match read_installed_servers(def.id) {
+            Ok(map) => {
+                if !map.is_empty() {
+                    log::info!(
+                        "Found {} servers in {} config",
+                        map.len(),
+                        def.display_name
+                    );
+                }
+                for name in map.keys() {
+                    servers.push(ConfiguredServer {
+                        tool_id: def.id.to_string(),
+                        tool_short_name: def.short_name.to_string(),
+                        server_name: name.clone(),
+                    });
+                }
+            }
+            Err(e) => {
+                log::debug!("Skipping {}: {}", def.display_name, e);
+            }
+        }
+    }
+
+    servers
+}
+
+/// Parse server names from `claude mcp list` output.
+fn read_cli_servers(cmd: &str) -> Result<Vec<String>, String> {
+    // Find the binary in common locations since GUI apps have limited PATH
+    let bin = find_cli_binary(cmd).ok_or("CLI not found")?;
+
+    // Build a PATH that includes common user binary locations
+    // since macOS GUI apps inherit a minimal environment from launchd
+    let mut path_parts: Vec<String> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        path_parts.push(home.join(".local/bin").to_string_lossy().to_string());
+        path_parts.push(home.join(".cargo/bin").to_string_lossy().to_string());
+        path_parts.push(home.join("bin").to_string_lossy().to_string());
+    }
+    path_parts.push("/usr/local/bin".to_string());
+    path_parts.push("/opt/homebrew/bin".to_string());
+    path_parts.push("/usr/bin".to_string());
+    path_parts.push("/bin".to_string());
+    if let Ok(existing) = std::env::var("PATH") {
+        path_parts.push(existing);
+    }
+    let full_path = path_parts.join(":");
+
+    // Use a child process with timeout since `claude mcp list` does health checks
+    let mut cmd_builder = std::process::Command::new(&bin);
+    cmd_builder
+        .args(["mcp", "list"])
+        .env("PATH", &full_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // Ensure HOME is set (macOS GUI apps may not have it)
+    if let Some(home) = dirs::home_dir() {
+        cmd_builder.env("HOME", home);
+    }
+
+    let mut child = cmd_builder
+        .spawn()
+        .map_err(|e| format!("Failed to spawn {} mcp list: {}", cmd, e))?;
+
+    // Wait up to 30 seconds for the command to complete
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    return Err(format!("{} mcp list timed out after 30s", cmd));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("Error waiting for {} mcp list: {}", cmd, e)),
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to read output from {} mcp list: {}", cmd, e))?;
+
+    // Parse both stdout and stderr since some output may go to either
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+
+    let mut names = Vec::new();
+    for line in combined.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with("Checking")
+            || line.starts_with("error")
+            || line.starts_with("Warning")
+        {
+            continue;
+        }
+        // Format: "server_name: details..." — the name is everything before the first colon
+        // but names themselves can contain colons (e.g. "plugin:sentry:sentry")
+        // The pattern is: name + ": " + url_or_details
+        if let Some(idx) = line.find(": ") {
+            let name = line[..idx].trim();
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn find_cli_binary(cmd: &str) -> Option<std::path::PathBuf> {
+    if let Ok(path) = which::which(cmd) {
+        return Some(path);
+    }
+    let extra_dirs = [
+        dirs::home_dir().map(|h| h.join(".local/bin")),
+        dirs::home_dir().map(|h| h.join(".cargo/bin")),
+        dirs::home_dir().map(|h| h.join("bin")),
+        Some(std::path::PathBuf::from("/usr/local/bin")),
+        Some(std::path::PathBuf::from("/opt/homebrew/bin")),
+    ];
+    for dir in extra_dirs.iter().flatten() {
+        let full = dir.join(cmd);
+        if full.exists() {
+            return Some(full);
+        }
+    }
+    None
+}
 
 /// Read existing MCP servers from a tool's config file.
 /// Returns a map of server_name -> server_config_json for each installed server.

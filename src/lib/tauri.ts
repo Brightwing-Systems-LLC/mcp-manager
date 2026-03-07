@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   DetectedTool,
+  ConfiguredServer,
   ServerInstallConfig,
   InstallResult,
   Installation,
@@ -13,6 +14,10 @@ import type {
 
 export async function scanTools(): Promise<DetectedTool[]> {
   return invoke<DetectedTool[]>("scan_tools");
+}
+
+export async function scanConfiguredServers(): Promise<ConfiguredServer[]> {
+  return invoke<ConfiguredServer[]>("scan_configured_servers");
 }
 
 export async function readToolConfig(

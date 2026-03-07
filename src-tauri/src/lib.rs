@@ -3,6 +3,7 @@ mod db;
 mod deeplink;
 mod tools;
 
+use config::reader::ConfiguredServer;
 use config::writer::{InstallResult, ServerInstallConfig};
 use db::queries::{Favorite, Installation};
 use db::Database;
@@ -17,6 +18,15 @@ use tools::definitions::DetectedTool;
 #[tauri::command]
 fn scan_tools() -> Result<Vec<DetectedTool>, String> {
     Ok(tools::scanner::scan_all_tools())
+}
+
+#[tauri::command]
+async fn scan_configured_servers() -> Result<Vec<ConfiguredServer>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(config::reader::read_all_configured_servers());
+    });
+    rx.recv().map_err(|e| format!("Scan failed: {}", e))
 }
 
 #[tauri::command]
@@ -249,6 +259,7 @@ pub fn run() {
         .manage(deep_link_state)
         .invoke_handler(tauri::generate_handler![
             scan_tools,
+            scan_configured_servers,
             read_tool_config,
             install_server,
             uninstall_server,

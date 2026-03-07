@@ -12,6 +12,12 @@ export interface DetectedTool {
   cli_command: string | null;
 }
 
+export interface ConfiguredServer {
+  tool_id: string;
+  tool_short_name: string;
+  server_name: string;
+}
+
 export interface ServerInstallConfig {
   server_name: string;
   config_key: string;

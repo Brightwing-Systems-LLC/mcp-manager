@@ -1,39 +1,59 @@
+import { useEffect } from "react";
 import { useStore } from "../store";
 
 export default function Dashboard() {
-  const { tools, toolsLoading, refreshTools, installations, installationsLoading } = useStore();
+  const {
+    tools,
+    toolsLoading,
+    refreshTools,
+    configuredServers,
+    configuredServersLoading,
+    refreshConfiguredServers,
+  } = useStore();
+
+  useEffect(() => {
+    refreshConfiguredServers();
+  }, [refreshConfiguredServers]);
 
   const detectedTools = tools.filter((t) => t.detected);
   const notDetected = tools.filter((t) => !t.detected);
 
-  // Group installations by server
-  const serverMap = new Map<string, { name: string; tools: string[] }>();
-  for (const inst of installations) {
-    const existing = serverMap.get(inst.server_uuid);
+  // Group configured servers by name, collecting which tools they're in
+  const serverMap = new Map<string, { name: string; tools: { id: string; shortName: string }[] }>();
+  for (const cs of configuredServers) {
+    const existing = serverMap.get(cs.server_name);
     if (existing) {
-      existing.tools.push(inst.tool_id);
+      if (!existing.tools.some((t) => t.id === cs.tool_id)) {
+        existing.tools.push({ id: cs.tool_id, shortName: cs.tool_short_name });
+      }
     } else {
-      serverMap.set(inst.server_uuid, {
-        name: inst.server_name,
-        tools: [inst.tool_id],
+      serverMap.set(cs.server_name, {
+        name: cs.server_name,
+        tools: [{ id: cs.tool_id, shortName: cs.tool_short_name }],
       });
     }
   }
-
-  // Map tool_id to short_name
-  const toolShortNames = new Map(tools.map((t) => [t.id, t.short_name]));
 
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-semibold">Dashboard</h1>
-        <button
-          onClick={refreshTools}
-          disabled={toolsLoading}
-          className="px-3 py-1.5 text-sm bg-brightwing-gray-700 hover:bg-brightwing-gray-600 rounded-md transition-colors disabled:opacity-50"
-        >
-          {toolsLoading ? "Scanning..." : "Rescan Tools"}
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={refreshConfiguredServers}
+            disabled={configuredServersLoading}
+            className="px-3 py-1.5 text-sm bg-brightwing-gray-700 hover:bg-brightwing-gray-600 rounded-md transition-colors disabled:opacity-50"
+          >
+            {configuredServersLoading ? "Scanning..." : "Rescan Configs"}
+          </button>
+          <button
+            onClick={refreshTools}
+            disabled={toolsLoading}
+            className="px-3 py-1.5 text-sm bg-brightwing-gray-700 hover:bg-brightwing-gray-600 rounded-md transition-colors disabled:opacity-50"
+          >
+            {toolsLoading ? "Scanning..." : "Rescan Tools"}
+          </button>
+        </div>
       </div>
 
       {/* Detected Tools */}
@@ -75,17 +95,17 @@ export default function Dashboard() {
         </div>
       </section>
 
-      {/* Installed Servers */}
+      {/* Configured Servers */}
       <section>
         <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
-          Installed Servers ({serverMap.size})
+          Configured MCP Servers ({serverMap.size})
         </h2>
-        {installationsLoading ? (
-          <p className="text-brightwing-gray-500 text-sm">Loading...</p>
+        {configuredServersLoading ? (
+          <p className="text-brightwing-gray-500 text-sm">Scanning config files...</p>
         ) : serverMap.size === 0 ? (
           <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-8 text-center">
             <p className="text-brightwing-gray-400">
-              No servers installed yet.
+              No MCP servers configured in any tool.
             </p>
             <p className="text-brightwing-gray-500 text-sm mt-1">
               Use Search to find and install MCP servers.
@@ -100,27 +120,27 @@ export default function Dashboard() {
                     Server
                   </th>
                   <th className="text-left px-4 py-2.5 text-brightwing-gray-400 font-medium">
-                    Installed In
+                    Configured In
                   </th>
                 </tr>
               </thead>
               <tbody>
-                {Array.from(serverMap.entries()).map(([uuid, server]) => (
+                {Array.from(serverMap.entries()).map(([name, server]) => (
                   <tr
-                    key={uuid}
+                    key={name}
                     className="border-b border-brightwing-gray-700/50 hover:bg-brightwing-gray-700/30"
                   >
                     <td className="px-4 py-2.5 font-mono">
                       {server.name}
                     </td>
                     <td className="px-4 py-2.5">
-                      <div className="flex gap-1.5">
-                        {server.tools.map((toolId) => (
+                      <div className="flex gap-1.5 flex-wrap">
+                        {server.tools.map((tool) => (
                           <span
-                            key={toolId}
+                            key={tool.id}
                             className="px-1.5 py-0.5 text-xs bg-brightwing-blue/20 text-brightwing-blue rounded"
                           >
-                            {toolShortNames.get(toolId) || toolId}
+                            {tool.shortName}
                           </span>
                         ))}
                       </div>

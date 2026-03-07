@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type {
   DetectedTool,
+  ConfiguredServer,
   Installation,
   Favorite,
   DeepLinkAction,
@@ -19,6 +20,11 @@ interface AppState {
   tools: DetectedTool[];
   toolsLoading: boolean;
   refreshTools: () => Promise<void>;
+
+  // Configured servers (read from tool config files)
+  configuredServers: ConfiguredServer[];
+  configuredServersLoading: boolean;
+  refreshConfiguredServers: () => Promise<void>;
 
   // Installations
   installations: Installation[];
@@ -79,6 +85,20 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       console.error("Failed to scan tools:", e);
       set({ toolsLoading: false });
+    }
+  },
+
+  // Configured servers
+  configuredServers: [],
+  configuredServersLoading: false,
+  refreshConfiguredServers: async () => {
+    set({ configuredServersLoading: true });
+    try {
+      const servers = await tauri.scanConfiguredServers();
+      set({ configuredServers: servers, configuredServersLoading: false });
+    } catch (e) {
+      console.error("Failed to scan configured servers:", e);
+      set({ configuredServersLoading: false });
     }
   },
 
