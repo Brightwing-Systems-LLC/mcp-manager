@@ -117,4 +117,4 @@ export interface ApiInstallConfig {
   verified: boolean;
 }
 
-export type View = "dashboard" | "search" | "favorites" | "install" | "about";
+export type View = "dashboard" | "search" | "favorites" | "install" | "add-server" | "about";

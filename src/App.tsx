@@ -6,6 +6,7 @@ import Dashboard from "./components/Dashboard";
 import Search from "./components/Search";
 import Favorites from "./components/Favorites";
 import InstallDialog from "./components/InstallDialog";
+import AddServer from "./components/AddServer";
 import About from "./components/About";
 import Toast from "./components/Toast";
 import type { DeepLinkAction } from "./lib/types";
@@ -40,6 +41,7 @@ export default function App() {
         {view === "search" && <Search />}
         {view === "favorites" && <Favorites />}
         {view === "install" && <InstallDialog />}
+        {view === "add-server" && <AddServer />}
         {view === "about" && <About />}
       </main>
       <Toast />
