@@ -5,7 +5,7 @@ mod tools;
 
 use config::reader::ConfiguredServer;
 use config::writer::{InstallResult, ServerInstallConfig};
-use db::queries::{Favorite, Installation};
+use db::queries::{DisabledServer, Favorite, Installation};
 use db::Database;
 use deeplink::{DeepLinkAction, DeepLinkState};
 use serde_json::Value as JsonValue;
@@ -130,6 +130,43 @@ fn clear_pending_deep_link(
     let mut pending = state.pending.lock().map_err(|e| e.to_string())?;
     *pending = None;
     Ok(())
+}
+
+#[tauri::command]
+fn disable_server(
+    tool_id: String,
+    server_name: String,
+    config_json: String,
+    db: tauri::State<'_, Database>,
+) -> Result<InstallResult, String> {
+    // Backup first
+    let _ = config::backup::backup_config(&tool_id);
+
+    // Store the config snapshot in DB
+    db.disable_server(&tool_id, &server_name, &config_json)?;
+
+    // Remove from config file
+    config::writer::uninstall_server(&tool_id, &server_name)
+}
+
+#[tauri::command]
+fn enable_server(
+    tool_id: String,
+    server_name: String,
+    db: tauri::State<'_, Database>,
+) -> Result<InstallResult, String> {
+    // Get stored config from DB
+    let config_json = db.enable_server(&tool_id, &server_name)?;
+
+    // Restore to config file
+    config::writer::restore_server_entry(&tool_id, &server_name, &config_json)
+}
+
+#[tauri::command]
+fn get_disabled_servers(
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<DisabledServer>, String> {
+    db.get_disabled_servers()
 }
 
 #[tauri::command]
@@ -269,6 +306,9 @@ pub fn run() {
             remove_favorite,
             get_pending_deep_link,
             clear_pending_deep_link,
+            disable_server,
+            enable_server,
+            get_disabled_servers,
             backup_tool_config,
             api_search_servers,
             api_get_install_config,

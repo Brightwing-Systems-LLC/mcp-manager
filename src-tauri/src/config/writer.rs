@@ -232,6 +232,165 @@ fn install_cli(
     }
 }
 
+/// Restore a server entry from raw JSON into a tool's config file.
+pub fn restore_server_entry(
+    tool_id: &str,
+    server_name: &str,
+    config_json: &str,
+) -> Result<InstallResult, String> {
+    let def = TOOL_DEFINITIONS
+        .iter()
+        .find(|d| d.id == tool_id)
+        .ok_or_else(|| format!("Unknown tool: {}", tool_id))?;
+
+    match def.config_format {
+        ConfigFormat::Json => {
+            let entry: JsonValue = serde_json::from_str(config_json)
+                .map_err(|e| format!("Invalid config JSON: {}", e))?;
+            restore_json(def, server_name, entry)
+        }
+        ConfigFormat::Toml => {
+            restore_toml(def, server_name, config_json)
+        }
+        ConfigFormat::Cli => {
+            restore_cli(def, server_name, config_json)
+        }
+    }
+}
+
+fn restore_json(
+    def: &crate::tools::definitions::ToolDefinition,
+    server_name: &str,
+    entry: JsonValue,
+) -> Result<InstallResult, String> {
+    let config_path = def
+        .config_path()
+        .ok_or_else(|| format!("No config path for {}", def.id))?;
+
+    let mut root: JsonValue = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config: {}", e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Invalid JSON in config: {}", e))?
+    } else {
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create config directory: {}", e))?;
+        }
+        JsonValue::Object(serde_json::Map::new())
+    };
+
+    let root_obj = root
+        .as_object_mut()
+        .ok_or("Config root is not a JSON object")?;
+
+    if !root_obj.contains_key(def.servers_key) {
+        root_obj.insert(
+            def.servers_key.to_string(),
+            JsonValue::Object(serde_json::Map::new()),
+        );
+    }
+
+    let servers = root_obj
+        .get_mut(def.servers_key)
+        .and_then(|v| v.as_object_mut())
+        .ok_or("Servers key is not an object")?;
+
+    servers.insert(server_name.to_string(), entry);
+
+    let output = serde_json::to_string_pretty(&root)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+    fs::write(&config_path, output)
+        .map_err(|e| format!("Failed to write config: {}", e))?;
+
+    Ok(InstallResult {
+        success: true,
+        message: format!("Restored {} in {}", server_name, def.display_name),
+        needs_restart: true,
+    })
+}
+
+fn restore_toml(
+    def: &crate::tools::definitions::ToolDefinition,
+    server_name: &str,
+    config_json: &str,
+) -> Result<InstallResult, String> {
+    // Convert JSON back to TOML-compatible structure
+    let json_val: JsonValue = serde_json::from_str(config_json)
+        .map_err(|e| format!("Invalid config JSON: {}", e))?;
+    let toml_val: toml::Value = serde_json::from_str(config_json)
+        .map_err(|e| format!("Failed to convert JSON to TOML: {}", e))?;
+
+    let config_path = def
+        .config_path()
+        .ok_or_else(|| format!("No config path for {}", def.id))?;
+
+    let mut doc: toml_edit::DocumentMut = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config: {}", e))?;
+        content
+            .parse()
+            .map_err(|e| format!("Invalid TOML: {}", e))?
+    } else {
+        toml_edit::DocumentMut::new()
+    };
+
+    if !doc.contains_key(def.servers_key) {
+        doc[def.servers_key] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+
+    // Serialize the JSON value as a TOML string, parse it, and insert
+    let toml_str = toml::to_string(&toml_val)
+        .map_err(|e| format!("Failed to serialize as TOML: {}", e))?;
+    let wrapper = format!("[{}]\n{}", server_name, toml_str);
+    let parsed: toml_edit::DocumentMut = wrapper
+        .parse()
+        .map_err(|e| format!("Failed to parse TOML entry: {}", e))?;
+
+    if let Some(entry) = parsed.get(server_name) {
+        doc[def.servers_key][server_name] = entry.clone();
+    }
+
+    fs::write(&config_path, doc.to_string())
+        .map_err(|e| format!("Failed to write config: {}", e))?;
+
+    let _ = json_val; // suppress unused warning
+    Ok(InstallResult {
+        success: true,
+        message: format!("Restored {} in {}", server_name, def.display_name),
+        needs_restart: true,
+    })
+}
+
+fn restore_cli(
+    def: &crate::tools::definitions::ToolDefinition,
+    server_name: &str,
+    config_json: &str,
+) -> Result<InstallResult, String> {
+    let cli_cmd = def
+        .cli_command
+        .ok_or_else(|| format!("No CLI command for {}", def.id))?;
+
+    let bin = crate::config::reader::find_cli_binary(cli_cmd)
+        .unwrap_or_else(|| std::path::PathBuf::from(cli_cmd));
+
+    let output = std::process::Command::new(&bin)
+        .args(["mcp", "add-json", server_name, config_json, "--scope", "user"])
+        .output()
+        .map_err(|e| format!("Failed to run {} mcp add-json: {}", cli_cmd, e))?;
+
+    if output.status.success() {
+        Ok(InstallResult {
+            success: true,
+            message: format!("Restored {} in {} via CLI", server_name, def.display_name),
+            needs_restart: false,
+        })
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("{} mcp add-json failed: {}", cli_cmd, stderr))
+    }
+}
+
 fn uninstall_json(
     def: &crate::tools::definitions::ToolDefinition,
     config_key: &str,

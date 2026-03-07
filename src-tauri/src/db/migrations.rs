@@ -59,6 +59,15 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
             key TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS disabled_servers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool_id TEXT NOT NULL,
+            server_name TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            disabled_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(tool_id, server_name)
+        );
         ",
     )
     .map_err(|e| format!("Migration failed: {}", e))?;

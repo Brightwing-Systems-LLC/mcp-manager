@@ -10,6 +10,8 @@ pub struct ConfiguredServer {
     pub tool_id: String,
     pub tool_short_name: String,
     pub server_name: String,
+    pub config_json: Option<String>,
+    pub is_cli_only: bool,
 }
 
 /// Read all configured MCP servers across all detected tools.
@@ -32,6 +34,8 @@ pub fn read_all_configured_servers() -> Vec<ConfiguredServer> {
                                 tool_id: def.id.to_string(),
                                 tool_short_name: def.short_name.to_string(),
                                 server_name: name,
+                                config_json: None,
+                                is_cli_only: true,
                             });
                         }
                     }
@@ -52,11 +56,14 @@ pub fn read_all_configured_servers() -> Vec<ConfiguredServer> {
                         def.display_name
                     );
                 }
-                for name in map.keys() {
+                for (name, config_val) in &map {
+                    let json_str = serde_json::to_string(config_val).ok();
                     servers.push(ConfiguredServer {
                         tool_id: def.id.to_string(),
                         tool_short_name: def.short_name.to_string(),
                         server_name: name.clone(),
+                        config_json: json_str,
+                        is_cli_only: false,
                     });
                 }
             }
@@ -157,7 +164,7 @@ fn read_cli_servers(cmd: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn find_cli_binary(cmd: &str) -> Option<std::path::PathBuf> {
+pub fn find_cli_binary(cmd: &str) -> Option<std::path::PathBuf> {
     if let Ok(path) = which::which(cmd) {
         return Some(path);
     }

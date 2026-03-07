@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   DetectedTool,
   ConfiguredServer,
+  DisabledServer,
   ServerInstallConfig,
   InstallResult,
   Installation,
@@ -18,6 +19,25 @@ export async function scanTools(): Promise<DetectedTool[]> {
 
 export async function scanConfiguredServers(): Promise<ConfiguredServer[]> {
   return invoke<ConfiguredServer[]>("scan_configured_servers");
+}
+
+export async function disableServer(
+  toolId: string,
+  serverName: string,
+  configJson: string
+): Promise<InstallResult> {
+  return invoke<InstallResult>("disable_server", { toolId, serverName, configJson });
+}
+
+export async function enableServer(
+  toolId: string,
+  serverName: string
+): Promise<InstallResult> {
+  return invoke<InstallResult>("enable_server", { toolId, serverName });
+}
+
+export async function getDisabledServers(): Promise<DisabledServer[]> {
+  return invoke<DisabledServer[]>("get_disabled_servers");
 }
 
 export async function readToolConfig(

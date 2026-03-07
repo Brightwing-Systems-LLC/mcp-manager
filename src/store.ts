@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type {
   DetectedTool,
   ConfiguredServer,
+  DisabledServer,
   Installation,
   Favorite,
   DeepLinkAction,
@@ -25,6 +26,12 @@ interface AppState {
   configuredServers: ConfiguredServer[];
   configuredServersLoading: boolean;
   refreshConfiguredServers: () => Promise<void>;
+
+  // Disabled servers
+  disabledServers: DisabledServer[];
+  refreshDisabledServers: () => Promise<void>;
+  disableServer: (toolId: string, serverName: string, configJson: string) => Promise<void>;
+  enableServer: (toolId: string, serverName: string) => Promise<void>;
 
   // Installations
   installations: Installation[];
@@ -99,6 +106,45 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       console.error("Failed to scan configured servers:", e);
       set({ configuredServersLoading: false });
+    }
+  },
+
+  // Disabled servers
+  disabledServers: [],
+  refreshDisabledServers: async () => {
+    try {
+      const servers = await tauri.getDisabledServers();
+      set({ disabledServers: servers });
+    } catch (e) {
+      console.error("Failed to get disabled servers:", e);
+    }
+  },
+  disableServer: async (toolId, serverName, configJson) => {
+    try {
+      const result = await tauri.disableServer(toolId, serverName, configJson);
+      if (result.success) {
+        get().showToast(result.message, "success");
+        await get().refreshConfiguredServers();
+        await get().refreshDisabledServers();
+      } else {
+        get().showToast(result.message, "error");
+      }
+    } catch (e) {
+      get().showToast(`Failed to disable: ${e}`, "error");
+    }
+  },
+  enableServer: async (toolId, serverName) => {
+    try {
+      const result = await tauri.enableServer(toolId, serverName);
+      if (result.success) {
+        get().showToast(result.message, "success");
+        await get().refreshConfiguredServers();
+        await get().refreshDisabledServers();
+      } else {
+        get().showToast(result.message, "error");
+      }
+    } catch (e) {
+      get().showToast(`Failed to enable: ${e}`, "error");
     }
   },
 

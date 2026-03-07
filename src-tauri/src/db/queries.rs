@@ -23,6 +23,15 @@ pub struct Favorite {
     pub added_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisabledServer {
+    pub id: i64,
+    pub tool_id: String,
+    pub server_name: String,
+    pub config_json: String,
+    pub disabled_at: String,
+}
+
 impl Database {
     pub fn record_installation(
         &self,
@@ -133,6 +142,64 @@ impl Database {
             })
             .map_err(|e| format!("Query failed: {}", e))?;
 
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(|e| format!("Row error: {}", e))?);
+        }
+        Ok(result)
+    }
+
+    pub fn disable_server(
+        &self,
+        tool_id: &str,
+        server_name: &str,
+        config_json: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR REPLACE INTO disabled_servers (tool_id, server_name, config_json)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![tool_id, server_name, config_json],
+        )
+        .map_err(|e| format!("Failed to save disabled server: {}", e))?;
+        Ok(())
+    }
+
+    pub fn enable_server(&self, tool_id: &str, server_name: &str) -> Result<String, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let config_json: String = conn
+            .query_row(
+                "SELECT config_json FROM disabled_servers WHERE tool_id = ?1 AND server_name = ?2",
+                rusqlite::params![tool_id, server_name],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("No disabled server found: {}", e))?;
+        conn.execute(
+            "DELETE FROM disabled_servers WHERE tool_id = ?1 AND server_name = ?2",
+            rusqlite::params![tool_id, server_name],
+        )
+        .map_err(|e| format!("Failed to remove disabled record: {}", e))?;
+        Ok(config_json)
+    }
+
+    pub fn get_disabled_servers(&self) -> Result<Vec<DisabledServer>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, tool_id, server_name, config_json, disabled_at FROM disabled_servers ORDER BY disabled_at DESC",
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(DisabledServer {
+                    id: row.get(0)?,
+                    tool_id: row.get(1)?,
+                    server_name: row.get(2)?,
+                    config_json: row.get(3)?,
+                    disabled_at: row.get(4)?,
+                })
+            })
+            .map_err(|e| format!("Query failed: {}", e))?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row.map_err(|e| format!("Row error: {}", e))?);

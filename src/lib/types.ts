@@ -16,6 +16,16 @@ export interface ConfiguredServer {
   tool_id: string;
   tool_short_name: string;
   server_name: string;
+  config_json: string | null;
+  is_cli_only: boolean;
+}
+
+export interface DisabledServer {
+  id: number;
+  tool_id: string;
+  server_name: string;
+  config_json: string;
+  disabled_at: string;
 }
 
 export interface ServerInstallConfig {
