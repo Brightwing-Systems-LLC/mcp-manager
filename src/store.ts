@@ -30,12 +30,18 @@ interface AppState {
   favoritesLoading: boolean;
   refreshFavorites: () => Promise<void>;
   toggleFavorite: (server: ScoreboardServer) => Promise<void>;
-  isFavorite: (id: number) => boolean;
+  isFavorite: (id: string) => boolean;
 
   // Deep link
   pendingDeepLink: DeepLinkAction | null;
   setPendingDeepLink: (action: DeepLinkAction | null) => void;
   checkPendingDeepLink: () => Promise<void>;
+
+  // Installable server IDs
+  installableIds: Set<string>;
+  installableIdsLoaded: boolean;
+  refreshInstallableIds: () => Promise<void>;
+  isInstallable: (id: string) => boolean;
 
   // Search
   searchQuery: string;
@@ -49,7 +55,7 @@ interface AppState {
   installConfig: ApiInstallConfig | null;
   installConfigLoading: boolean;
   setInstallTarget: (server: ScoreboardServer | null) => void;
-  fetchInstallConfig: (serverId: number) => Promise<void>;
+  fetchInstallConfig: (serverId: string) => Promise<void>;
 
   // Notifications
   toast: { message: string; type: "success" | "error" } | null;
@@ -138,6 +144,21 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       console.error("Failed to check deep link:", e);
     }
+  },
+
+  // Installable server IDs
+  installableIds: new Set<string>(),
+  installableIdsLoaded: false,
+  refreshInstallableIds: async () => {
+    try {
+      const ids = await tauri.apiGetInstallableIds();
+      set({ installableIds: new Set(ids), installableIdsLoaded: true });
+    } catch (e) {
+      console.error("Failed to fetch installable IDs:", e);
+    }
+  },
+  isInstallable: (id) => {
+    return get().installableIds.has(id);
   },
 
   // Search

@@ -55,7 +55,7 @@ export interface DeepLinkAction {
 
 // PatchworkMCP Scoreboard API types
 export interface ScoreboardServer {
-  id: number;
+  id: string;
   name: string;
   description: string;
   language: string;
@@ -87,7 +87,7 @@ export interface EnvSchemaEntry {
 }
 
 export interface ApiInstallConfig {
-  server_id: number;
+  server_id: string;
   server_name: string;
   command: string;
   args: string[];

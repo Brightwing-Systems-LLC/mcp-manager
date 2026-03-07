@@ -88,8 +88,12 @@ export async function apiSearchServers(
   });
 }
 
+export async function apiGetInstallableIds(): Promise<string[]> {
+  return invoke<string[]>("api_get_installable_ids");
+}
+
 export async function apiGetInstallConfig(
-  serverId: number
+  serverId: string
 ): Promise<ApiInstallConfig | null> {
   const result = await invoke<ApiInstallConfig | null>(
     "api_get_install_config",
@@ -99,7 +103,7 @@ export async function apiGetInstallConfig(
 }
 
 export async function apiGetServer(
-  serverId: number
+  serverId: string
 ): Promise<ScoreboardServer> {
   return invoke<ScoreboardServer>("api_get_server", { serverId });
 }

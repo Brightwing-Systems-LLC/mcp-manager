@@ -151,7 +151,7 @@ async fn api_search_servers(query: String, per_page: Option<u32>) -> Result<Json
 }
 
 #[tauri::command]
-async fn api_get_install_config(server_id: u64) -> Result<JsonValue, String> {
+async fn api_get_install_config(server_id: String) -> Result<JsonValue, String> {
     let url = format!("{}/servers/{}/install-config/", API_BASE, server_id);
     let resp = reqwest::get(&url)
         .await
@@ -167,7 +167,41 @@ async fn api_get_install_config(server_id: u64) -> Result<JsonValue, String> {
 }
 
 #[tauri::command]
-async fn api_get_server(server_id: u64) -> Result<JsonValue, String> {
+async fn api_get_installable_ids() -> Result<Vec<String>, String> {
+    let mut all_ids = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let url = format!(
+            "{}/servers/installable/?per_page=100&page={}",
+            API_BASE, page
+        );
+        let resp = reqwest::get(&url)
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+        let json: JsonValue = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        if let Some(results) = json["results"].as_array() {
+            for r in results {
+                if let Some(id) = r["id"].as_str() {
+                    all_ids.push(id.to_string());
+                }
+            }
+            let total_pages = json["meta"]["total_pages"].as_u64().unwrap_or(1);
+            if (page as u64) >= total_pages {
+                break;
+            }
+            page += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(all_ids)
+}
+
+#[tauri::command]
+async fn api_get_server(server_id: String) -> Result<JsonValue, String> {
     let url = format!("{}/servers/{}/", API_BASE, server_id);
     let resp = reqwest::get(&url)
         .await
@@ -227,6 +261,7 @@ pub fn run() {
             backup_tool_config,
             api_search_servers,
             api_get_install_config,
+            api_get_installable_ids,
             api_get_server,
         ])
         .setup(|app| {
