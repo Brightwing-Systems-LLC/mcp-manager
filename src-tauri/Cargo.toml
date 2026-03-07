@@ -1,0 +1,31 @@
+[package]
+name = "brightwing-mcp-manager"
+version = "0.1.0"
+description = "Brightwing MCP Manager - Universal MCP server installer"
+authors = ["Brightwing Systems"]
+edition = "2021"
+
+[lib]
+name = "brightwing_mcp_manager_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-http = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+dirs = "6"
+which = "7"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"

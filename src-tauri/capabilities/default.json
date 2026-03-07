@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicedoc/schemas/main/tauri/capability.json",
+  "identifier": "default",
+  "description": "Default capabilities for Brightwing MCP Manager",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "shell:allow-execute",
+    "fs:default",
+    "fs:allow-read-text-file",
+    "fs:allow-write-text-file",
+    "fs:allow-exists",
+    "fs:allow-mkdir",
+    "http:default",
+    "notification:default",
+    "deep-link:default"
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicedoc/schemas/main/tauri/tauri.conf.v2.json",
+  "productName": "Brightwing MCP Manager",
+  "identifier": "com.brightwing.mcp-manager",
+  "version": "0.1.0",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Brightwing MCP Manager",
+        "width": 960,
+        "height": 700,
+        "resizable": true,
+        "fullscreen": false,
+        "minWidth": 800,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/192x192.png",
+      "icons/512x512.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["brightwing"]
+      }
+    }
+  }
+}
