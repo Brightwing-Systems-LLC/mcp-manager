@@ -2,7 +2,8 @@ import { useState, useCallback } from "react";
 import { useStore } from "../store";
 import type { ScoreboardServer } from "../lib/types";
 
-function gradeColor(grade: string): string {
+function gradeColor(grade: string | null): string {
+  if (!grade) return "text-brightwing-gray-500";
   if (grade.startsWith("A")) return "text-green-400";
   if (grade.startsWith("B")) return "text-blue-400";
   if (grade.startsWith("C")) return "text-yellow-400";
@@ -75,9 +76,9 @@ export default function Search() {
         <div className="space-y-2">
           {searchResults.map((server) => (
             <ServerRow
-              key={server.uuid}
+              key={server.id}
               server={server}
-              isFav={isFavorite(server.uuid)}
+              isFav={isFavorite(server.id)}
               onInstall={() => setInstallTarget(server)}
               onToggleFav={() => toggleFavorite(server)}
             />
@@ -103,10 +104,12 @@ function ServerRow({
     <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4 flex items-center gap-4 hover:border-brightwing-gray-600 transition-colors">
       {/* Grade */}
       <div className="text-center w-12">
-        <span className={`text-lg font-bold ${gradeColor(server.grade)}`}>
-          {server.grade}
+        <span className={`text-lg font-bold ${gradeColor(server.current_grade)}`}>
+          {server.current_grade || "?"}
         </span>
-        <p className="text-xs text-brightwing-gray-500">{server.overall_score}</p>
+        {server.current_score != null && (
+          <p className="text-xs text-brightwing-gray-500">{server.current_score}</p>
+        )}
       </div>
 
       {/* Info */}
@@ -121,10 +124,13 @@ function ServerRow({
               {server.language}
             </span>
           )}
-          {server.stars > 0 && (
+          {server.stars_count > 0 && (
             <span className="text-xs text-brightwing-gray-500">
-              {server.stars} stars
+              {server.stars_count} stars
             </span>
+          )}
+          {server.is_remote && (
+            <span className="text-xs text-cyan-500">remote</span>
           )}
         </div>
       </div>

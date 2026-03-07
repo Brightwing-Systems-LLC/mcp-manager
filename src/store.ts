@@ -6,8 +6,12 @@ import type {
   DeepLinkAction,
   View,
   ScoreboardServer,
+  ApiInstallConfig,
+  ScoreboardSearchResponse,
 } from "./lib/types";
 import * as tauri from "./lib/tauri";
+
+const API_BASE = "https://patchworkmcp.com/scoreboard/api/v1";
 
 interface AppState {
   // Navigation
@@ -29,7 +33,7 @@ interface AppState {
   favoritesLoading: boolean;
   refreshFavorites: () => Promise<void>;
   toggleFavorite: (server: ScoreboardServer) => Promise<void>;
-  isFavorite: (uuid: string) => boolean;
+  isFavorite: (id: number) => boolean;
 
   // Deep link
   pendingDeepLink: DeepLinkAction | null;
@@ -45,7 +49,10 @@ interface AppState {
 
   // Install dialog
   installTarget: ScoreboardServer | null;
+  installConfig: ApiInstallConfig | null;
+  installConfigLoading: boolean;
   setInstallTarget: (server: ScoreboardServer | null) => void;
+  fetchInstallConfig: (serverId: number) => Promise<void>;
 
   // Notifications
   toast: { message: string; type: "success" | "error" } | null;
@@ -101,23 +108,24 @@ export const useStore = create<AppState>((set, get) => ({
   },
   toggleFavorite: async (server) => {
     const { favorites } = get();
-    const existing = favorites.find((f) => f.server_uuid === server.uuid);
+    const serverId = String(server.id);
+    const existing = favorites.find((f) => f.server_uuid === serverId);
     if (existing) {
-      await tauri.removeFavorite(server.uuid);
+      await tauri.removeFavorite(serverId);
     } else {
       await tauri.addFavorite({
-        serverUuid: server.uuid,
+        serverUuid: serverId,
         serverName: server.name,
         displayName: server.name,
-        grade: server.grade,
-        score: server.overall_score,
+        grade: server.current_grade ?? undefined,
+        score: server.current_score ?? undefined,
         language: server.language,
       });
     }
     await get().refreshFavorites();
   },
-  isFavorite: (uuid) => {
-    return get().favorites.some((f) => f.server_uuid === uuid);
+  isFavorite: (id) => {
+    return get().favorites.some((f) => f.server_uuid === String(id));
   },
 
   // Deep link
@@ -148,12 +156,12 @@ export const useStore = create<AppState>((set, get) => ({
     set({ searchLoading: true });
     try {
       const response = await fetch(
-        `https://patchworkmcp.com/scoreboard/api/servers/?search=${encodeURIComponent(query)}`
+        `${API_BASE}/servers/?q=${encodeURIComponent(query)}&per_page=25`
       );
       if (!response.ok) throw new Error(`API error: ${response.status}`);
-      const data = await response.json();
+      const data: ScoreboardSearchResponse = await response.json();
       set({
-        searchResults: data.results || data,
+        searchResults: data.results,
         searchLoading: false,
       });
     } catch (e) {
@@ -164,8 +172,38 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Install dialog
   installTarget: null,
-  setInstallTarget: (server) =>
-    set({ installTarget: server, view: server ? "install" : get().view }),
+  installConfig: null,
+  installConfigLoading: false,
+  setInstallTarget: (server) => {
+    set({
+      installTarget: server,
+      installConfig: null,
+      view: server ? "install" : get().view,
+    });
+    if (server) {
+      get().fetchInstallConfig(server.id);
+    }
+  },
+  fetchInstallConfig: async (serverId) => {
+    set({ installConfigLoading: true });
+    try {
+      const response = await fetch(
+        `${API_BASE}/servers/${serverId}/install-config/`
+      );
+      if (response.ok) {
+        const config: ApiInstallConfig = await response.json();
+        set({ installConfig: config, installConfigLoading: false });
+      } else if (response.status === 404) {
+        // No install config available for this server
+        set({ installConfig: null, installConfigLoading: false });
+      } else {
+        throw new Error(`API error: ${response.status}`);
+      }
+    } catch (e) {
+      console.error("Failed to fetch install config:", e);
+      set({ installConfig: null, installConfigLoading: false });
+    }
+  },
 
   // Notifications
   toast: null,

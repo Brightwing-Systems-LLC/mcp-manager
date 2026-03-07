@@ -53,17 +53,52 @@ export interface DeepLinkAction {
   tool_id: string | null;
 }
 
-// PatchworkMCP API types
+// PatchworkMCP Scoreboard API types
 export interface ScoreboardServer {
-  uuid: string;
+  id: number;
   name: string;
   description: string;
-  github_url: string;
-  grade: string;
-  overall_score: number;
   language: string;
-  stars: number;
-  categories: string[];
+  repo_url: string;
+  current_score: number | null;
+  current_grade: string | null;
+  score_type: string;
+  visibility_level: string;
+  stars_count: number;
+  is_remote: boolean;
+  updated_at: string;
+}
+
+export interface ScoreboardSearchResponse {
+  meta: {
+    page: number;
+    per_page: number;
+    total: number;
+    total_pages: number;
+  };
+  results: ScoreboardServer[];
+}
+
+export interface EnvSchemaEntry {
+  required: boolean;
+  sensitive: boolean;
+  description: string;
+  default?: string;
+}
+
+export interface ApiInstallConfig {
+  server_id: number;
+  server_name: string;
+  command: string;
+  args: string[];
+  env_schema: Record<string, EnvSchemaEntry>;
+  config_key: string;
+  transport: string;
+  remote_url: string | null;
+  compatibility: Record<string, boolean>;
+  install_notes: string;
+  source: string;
+  verified: boolean;
 }
 
 export type View = "dashboard" | "search" | "favorites" | "install" | "about";

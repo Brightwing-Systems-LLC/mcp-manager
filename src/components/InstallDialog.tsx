@@ -6,6 +6,8 @@ import type { ServerInstallConfig } from "../lib/types";
 export default function InstallDialog() {
   const {
     installTarget,
+    installConfig,
+    installConfigLoading,
     pendingDeepLink,
     tools,
     installations,
@@ -17,8 +19,8 @@ export default function InstallDialog() {
   } = useStore();
 
   const [installing, setInstalling] = useState<string | null>(null);
+  const [envValues, setEnvValues] = useState<Record<string, string>>({});
 
-  // Determine which server we're looking at
   const server = installTarget;
   const deepLink = pendingDeepLink;
 
@@ -38,7 +40,6 @@ export default function InstallDialog() {
     );
   }
 
-  // If deep link but no server details yet, show placeholder
   if (deepLink && !server) {
     return (
       <div className="flex flex-col items-center justify-center h-full">
@@ -51,7 +52,7 @@ export default function InstallDialog() {
             Server: <span className="font-mono">{deepLink.server_uuid}</span>
           </p>
           <p className="text-brightwing-gray-500 text-xs mt-4">
-            Fetching server details from PatchworkMCP...
+            Fetching server details from MCP Scoreboard...
           </p>
           <button
             onClick={() => {
@@ -70,29 +71,57 @@ export default function InstallDialog() {
   if (!server) return null;
 
   const detectedTools = tools.filter((t) => t.detected);
-
-  // Check which tools already have this server installed
   const installedToolIds = new Set(
     installations
-      .filter((i) => i.server_name === server.name)
+      .filter((i) => i.server_name === server.name || i.server_uuid === String(server.id))
       .map((i) => i.tool_id)
   );
 
+  const config = installConfig;
+  const hasConfig = config !== null;
+
+  const handleEnvChange = (key: string, value: string) => {
+    setEnvValues((prev) => ({ ...prev, [key]: value }));
+  };
+
   const handleInstall = async (toolId: string) => {
+    if (!config) return;
+
+    // Check required env vars
+    const missingRequired = Object.entries(config.env_schema)
+      .filter(([, schema]) => schema.required)
+      .filter(([key]) => !envValues[key]?.trim());
+
+    if (missingRequired.length > 0) {
+      showToast(
+        `Missing required: ${missingRequired.map(([k]) => k).join(", ")}`,
+        "error"
+      );
+      return;
+    }
+
     setInstalling(toolId);
     try {
-      // Build a basic config from the server info
-      // In a full version, this comes from the PatchworkMCP API install-config endpoint
-      const config: ServerInstallConfig = {
+      const env: Record<string, string> = {};
+      for (const [key, schema] of Object.entries(config.env_schema)) {
+        const value = envValues[key]?.trim();
+        if (value) {
+          env[key] = value;
+        } else if (schema.default) {
+          env[key] = schema.default;
+        }
+      }
+
+      const installConfig: ServerInstallConfig = {
         server_name: server.name,
-        config_key: server.name,
-        command: "npx",
-        args: ["-y", server.name],
-        env: {},
-        transport: "stdio",
+        config_key: config.config_key,
+        command: config.command,
+        args: config.args,
+        env,
+        transport: config.transport,
       };
 
-      const result = await installServer(toolId, config);
+      const result = await installServer(toolId, installConfig);
       if (result.success) {
         showToast(result.message, "success");
         await refreshInstallations();
@@ -107,9 +136,14 @@ export default function InstallDialog() {
   };
 
   const handleUninstall = async (toolId: string) => {
+    if (!config) return;
     setInstalling(toolId);
     try {
-      const result = await uninstallServer(toolId, server.name, server.uuid);
+      const result = await uninstallServer(
+        toolId,
+        config.config_key,
+        String(server.id)
+      );
       if (result.success) {
         showToast(result.message, "success");
         await refreshInstallations();
@@ -131,7 +165,6 @@ export default function InstallDialog() {
 
   return (
     <div>
-      {/* Back button */}
       <button
         onClick={handleBack}
         className="flex items-center gap-1 text-sm text-brightwing-gray-400 hover:text-brightwing-gray-200 mb-4"
@@ -145,84 +178,156 @@ export default function InstallDialog() {
       {/* Server info */}
       <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-6 mb-6">
         <div className="flex items-start gap-4">
-          <div>
+          <div className="flex-1">
             <h1 className="text-xl font-mono font-semibold">{server.name}</h1>
             <p className="text-sm text-brightwing-gray-400 mt-1">
               {server.description}
             </p>
             <div className="flex gap-3 mt-2 text-xs text-brightwing-gray-500">
-              {server.grade && (
+              {server.current_grade && (
                 <span className="font-semibold text-green-400">
-                  {server.grade} ({server.overall_score})
+                  {server.current_grade}
+                  {server.current_score != null && ` (${server.current_score})`}
                 </span>
               )}
               {server.language && <span>{server.language}</span>}
-              {server.stars > 0 && <span>{server.stars} stars</span>}
+              {server.stars_count > 0 && <span>{server.stars_count} stars</span>}
             </div>
           </div>
+          {config?.verified && (
+            <span className="px-2 py-1 text-xs bg-green-500/10 text-green-400 rounded-md">
+              Verified
+            </span>
+          )}
         </div>
-      </div>
-
-      {/* Tool installation grid */}
-      <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
-        Install Into
-      </h2>
-
-      <div className="space-y-2">
-        {detectedTools.map((tool) => {
-          const isInstalled = installedToolIds.has(tool.id);
-          const isLoading = installing === tool.id;
-
-          return (
-            <div
-              key={tool.id}
-              className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4 flex items-center justify-between"
-            >
-              <div className="flex items-center gap-3">
-                <div
-                  className={`w-2 h-2 rounded-full ${
-                    isInstalled ? "bg-green-400" : "bg-brightwing-gray-600"
-                  }`}
-                />
-                <div>
-                  <span className="text-sm font-medium">
-                    {tool.display_name}
-                  </span>
-                  <span className="text-xs text-brightwing-gray-500 ml-2">
-                    ({tool.short_name})
-                  </span>
-                </div>
-              </div>
-
-              <div>
-                {isInstalled ? (
-                  <button
-                    onClick={() => handleUninstall(tool.id)}
-                    disabled={isLoading}
-                    className="px-3 py-1.5 text-sm bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-md transition-colors disabled:opacity-50"
-                  >
-                    {isLoading ? "Removing..." : "Remove"}
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => handleInstall(tool.id)}
-                    disabled={isLoading}
-                    className="px-3 py-1.5 text-sm bg-brightwing-blue hover:bg-brightwing-blue-dark text-white rounded-md transition-colors disabled:opacity-50"
-                  >
-                    {isLoading ? "Installing..." : "Install"}
-                  </button>
-                )}
-              </div>
-            </div>
-          );
-        })}
-
-        {detectedTools.length === 0 && (
-          <p className="text-brightwing-gray-500 text-sm">
-            No AI tools detected on your machine.
+        {config?.install_notes && (
+          <p className="text-xs text-brightwing-gray-500 mt-3 border-t border-brightwing-gray-700 pt-3">
+            {config.install_notes}
           </p>
         )}
       </div>
+
+      {/* Install config status */}
+      {installConfigLoading ? (
+        <p className="text-brightwing-gray-500 text-sm mb-6">
+          Fetching install configuration...
+        </p>
+      ) : !hasConfig ? (
+        <div className="bg-brightwing-gray-800 border border-yellow-500/30 rounded-lg p-5 mb-6">
+          <p className="text-yellow-400 text-sm font-medium mb-1">
+            No install configuration available
+          </p>
+          <p className="text-brightwing-gray-500 text-xs">
+            This server doesn't have a verified install config on MCP Scoreboard
+            yet. You can install it manually by editing your tool's config file
+            directly.
+          </p>
+        </div>
+      ) : (
+        <>
+          {/* Command preview */}
+          <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4 mb-4">
+            <p className="text-xs text-brightwing-gray-500 mb-1">Command</p>
+            <code className="text-sm text-brightwing-gray-200 font-mono">
+              {config.command} {config.args.join(" ")}
+            </code>
+          </div>
+
+          {/* Env var form */}
+          {Object.keys(config.env_schema).length > 0 && (
+            <div className="mb-6">
+              <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
+                Configuration
+              </h2>
+              <div className="space-y-3">
+                {Object.entries(config.env_schema).map(([key, schema]) => (
+                  <div key={key}>
+                    <label className="block text-xs text-brightwing-gray-400 mb-1">
+                      {key}
+                      {schema.required && (
+                        <span className="text-red-400 ml-1">*</span>
+                      )}
+                      {schema.description && (
+                        <span className="text-brightwing-gray-600 ml-2">
+                          — {schema.description}
+                        </span>
+                      )}
+                    </label>
+                    <input
+                      type={schema.sensitive ? "password" : "text"}
+                      placeholder={schema.default || ""}
+                      value={envValues[key] || ""}
+                      onChange={(e) => handleEnvChange(key, e.target.value)}
+                      className="w-full px-3 py-2 bg-brightwing-gray-900 border border-brightwing-gray-700 rounded-md text-sm font-mono placeholder-brightwing-gray-600 focus:outline-none focus:border-brightwing-blue focus:ring-1 focus:ring-brightwing-blue"
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Tool installation grid */}
+          <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
+            Install Into
+          </h2>
+
+          <div className="space-y-2">
+            {detectedTools.map((tool) => {
+              const isInstalled = installedToolIds.has(tool.id);
+              const isLoading = installing === tool.id;
+
+              return (
+                <div
+                  key={tool.id}
+                  className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4 flex items-center justify-between"
+                >
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={`w-2 h-2 rounded-full ${
+                        isInstalled ? "bg-green-400" : "bg-brightwing-gray-600"
+                      }`}
+                    />
+                    <div>
+                      <span className="text-sm font-medium">
+                        {tool.display_name}
+                      </span>
+                      <span className="text-xs text-brightwing-gray-500 ml-2">
+                        ({tool.short_name})
+                      </span>
+                    </div>
+                  </div>
+
+                  <div>
+                    {isInstalled ? (
+                      <button
+                        onClick={() => handleUninstall(tool.id)}
+                        disabled={isLoading}
+                        className="px-3 py-1.5 text-sm bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-md transition-colors disabled:opacity-50"
+                      >
+                        {isLoading ? "Removing..." : "Remove"}
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => handleInstall(tool.id)}
+                        disabled={isLoading}
+                        className="px-3 py-1.5 text-sm bg-brightwing-blue hover:bg-brightwing-blue-dark text-white rounded-md transition-colors disabled:opacity-50"
+                      >
+                        {isLoading ? "Installing..." : "Install"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+
+            {detectedTools.length === 0 && (
+              <p className="text-brightwing-gray-500 text-sm">
+                No AI tools detected on your machine.
+              </p>
+            )}
+          </div>
+        </>
+      )}
 
       <p className="text-xs text-brightwing-gray-500 mt-4">
         Most tools need a restart after config changes to activate new MCP
