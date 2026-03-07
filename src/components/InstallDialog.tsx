@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useStore } from "../store";
-import { installServer, uninstallServer } from "../lib/tauri";
-import type { ServerInstallConfig } from "../lib/types";
+import { installServer, uninstallServer, apiGetServer } from "../lib/tauri";
+import type { ServerInstallConfig, ScoreboardServer } from "../lib/types";
 
 export default function InstallDialog() {
   const {
@@ -20,9 +20,30 @@ export default function InstallDialog() {
 
   const [installing, setInstalling] = useState<string | null>(null);
   const [envValues, setEnvValues] = useState<Record<string, string>>({});
+  const [deepLinkLoading, setDeepLinkLoading] = useState(false);
+  const [deepLinkError, setDeepLinkError] = useState<string | null>(null);
 
   const server = installTarget;
   const deepLink = pendingDeepLink;
+
+  // When we have a deep link but no server, fetch the server details
+  useEffect(() => {
+    if (deepLink && !server && !deepLinkLoading) {
+      setDeepLinkLoading(true);
+      setDeepLinkError(null);
+      apiGetServer(deepLink.server_uuid)
+        .then((serverData: ScoreboardServer) => {
+          setInstallTarget(serverData);
+          setPendingDeepLink(null);
+        })
+        .catch((e) => {
+          setDeepLinkError(`Failed to fetch server: ${e}`);
+        })
+        .finally(() => {
+          setDeepLinkLoading(false);
+        });
+    }
+  }, [deepLink, server, deepLinkLoading, setInstallTarget, setPendingDeepLink]);
 
   if (!server && !deepLink) {
     return (
@@ -44,19 +65,23 @@ export default function InstallDialog() {
     return (
       <div className="flex flex-col items-center justify-center h-full">
         <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-8 text-center max-w-md">
-          <h2 className="text-lg font-semibold mb-2">Deep Link Received</h2>
-          <p className="text-brightwing-gray-400 text-sm">
-            Action: <span className="font-mono">{deepLink.action}</span>
-          </p>
-          <p className="text-brightwing-gray-400 text-sm">
-            Server: <span className="font-mono">{deepLink.server_uuid}</span>
-          </p>
-          <p className="text-brightwing-gray-500 text-xs mt-4">
-            Fetching server details from MCP Scoreboard...
-          </p>
+          {deepLinkError ? (
+            <>
+              <h2 className="text-lg font-semibold mb-2 text-red-400">Error</h2>
+              <p className="text-brightwing-gray-400 text-sm">{deepLinkError}</p>
+            </>
+          ) : (
+            <>
+              <h2 className="text-lg font-semibold mb-2">Loading Server</h2>
+              <p className="text-brightwing-gray-500 text-sm">
+                Fetching server details from MCP Scoreboard...
+              </p>
+            </>
+          )}
           <button
             onClick={() => {
               setPendingDeepLink(null);
+              setDeepLinkError(null);
               setView("dashboard");
             }}
             className="mt-4 px-4 py-2 text-sm bg-brightwing-gray-700 hover:bg-brightwing-gray-600 rounded-md"
