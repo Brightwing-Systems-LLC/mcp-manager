@@ -13,7 +13,7 @@ Built with [Tauri v2](https://v2.tauri.app/) (Rust + React + TypeScript).
 - **Batch operations** — Make multiple changes, then save them all at once with a progress indicator.
 - **Enable/disable toggles** — Temporarily disable an MCP server without losing its config. Re-enable restores it exactly as it was.
 - **Auto-detection** — Scans your machine for installed AI tools and their configured MCP servers on launch.
-- **Scoreboard search** — Search the [PatchworkMCP Scoreboard](https://patchworkmcp.com) for quality-scored MCP servers and install them directly.
+- **Scoreboard search** — Search the [MCP Scoreboard](https://mcpscoreboard.com) for quality-scored MCP servers and install them directly.
 - **One-click install** — Supports `brightwing://` deep links for installing servers from the web.
 - **Tool restart** — Prompts to restart tools after config changes and can restart them for you.
 - **Favorites** — Bookmark servers for quick access.
@@ -143,7 +143,7 @@ MCP Manager registers the `brightwing://` URL scheme. Websites can link directly
 brightwing://install?server=<uuid>&tool=<tool_id>
 ```
 
-This is used by the [PatchworkMCP Scoreboard](https://patchworkmcp.com) for one-click "Install with Brightwing" buttons.
+This is used by the [MCP Scoreboard](https://mcpscoreboard.com) for one-click "Install with Brightwing" buttons.
 
 ## Roadmap
 
