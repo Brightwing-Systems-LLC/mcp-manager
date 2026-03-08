@@ -48,7 +48,9 @@ export default function InstallDialog() {
   }, [deepLink, server, deepLinkLoading, setInstallTarget, setPendingDeepLink]);
 
   // Initialize checkbox state from current installations when server loads
-  const detectedTools = tools.filter((t) => t.detected);
+  // Filter out tools that don't support programmatic config updates
+  const UNSUPPORTED_TOOL_IDS = new Set(["claude_desktop"]);
+  const detectedTools = tools.filter((t) => t.detected && !UNSUPPORTED_TOOL_IDS.has(t.id));
   const installedToolIds = server
     ? new Set(
         installations
@@ -237,7 +239,7 @@ export default function InstallDialog() {
   const handleBack = () => {
     setInstallTarget(null);
     setPendingDeepLink(null);
-    setView("search");
+    setView("dashboard");
   };
 
   return (

@@ -474,17 +474,32 @@ pub fn run() {
             // Handle deep links (open-url event from tauri-plugin-deep-link)
             {
                 let handle = app.handle().clone();
+
                 app.listen("deep-link://new-url", move |event: tauri::Event| {
-                    if let Ok(urls) = serde_json::from_str::<Vec<String>>(event.payload()) {
-                        for url in urls {
-                            if let Some(action) = deeplink::parse_deep_link(&url) {
-                                if let Some(state) = handle.try_state::<DeepLinkState>() {
-                                    if let Ok(mut pending) = state.pending.lock() {
-                                        *pending = Some(action.clone());
-                                    }
-                                }
-                                let _ = handle.emit("deep-link-action", action);
+                    let payload = event.payload();
+
+                    let url_strings: Vec<String> = if let Ok(urls) = serde_json::from_str::<Vec<String>>(payload) {
+                        urls
+                    } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                        match value {
+                            serde_json::Value::Array(arr) => {
+                                arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
                             }
+                            serde_json::Value::String(s) => vec![s],
+                            _ => vec![],
+                        }
+                    } else {
+                        vec![]
+                    };
+
+                    for url in url_strings {
+                        if let Some(action) = deeplink::parse_deep_link(&url) {
+                            if let Some(state) = handle.try_state::<DeepLinkState>() {
+                                if let Ok(mut pending) = state.pending.lock() {
+                                    *pending = Some(action.clone());
+                                }
+                            }
+                            let _ = handle.emit("deep-link-action", action);
                         }
                     }
                 });
