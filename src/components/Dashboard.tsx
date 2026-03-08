@@ -1,5 +1,21 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo, useCallback } from "react";
 import { useStore } from "../store";
+import { fetchCliServerConfig, addServerToTool } from "../lib/tauri";
+
+type CellInfo = {
+  configJson: string | null;
+  isCliOnly: boolean;
+};
+
+type PendingChange = {
+  serverName: string;
+  toolId: string;
+  action: "enable" | "disable" | "add" | "remove";
+  cellInfo: CellInfo;
+};
+
+// Tools where remote connectors are cloud-managed with no local API
+const LOCKED_TOOLS = new Set(["claude_desktop"]);
 
 export default function Dashboard() {
   const {
@@ -13,9 +29,12 @@ export default function Dashboard() {
     refreshDisabledServers,
     disableServer,
     enableServer,
+    showToast,
   } = useStore();
 
-  const [togglingKey, setTogglingKey] = useState<string | null>(null);
+  const [pendingChanges, setPendingChanges] = useState<Map<string, PendingChange>>(new Map());
+  const [saving, setSaving] = useState(false);
+  const [saveProgress, setSaveProgress] = useState({ current: 0, total: 0, currentName: "" });
 
   useEffect(() => {
     refreshConfiguredServers();
@@ -25,62 +44,184 @@ export default function Dashboard() {
   const detectedTools = tools.filter((t) => t.detected);
   const notDetected = tools.filter((t) => !t.detected);
 
-  // Map tool_id -> short_name from tools list
-  const toolShortNames = new Map(tools.map((t) => [t.id, t.short_name]));
+  // Separate locked vs manageable detected tools
+  const manageableTools = detectedTools.filter((t) => !LOCKED_TOOLS.has(t.id));
+  const lockedDetected = detectedTools.filter((t) => LOCKED_TOOLS.has(t.id));
 
-  // Build a combined list: active servers + disabled servers
-  // Group by server_name, collecting tool entries
-  type ServerEntry = {
-    toolId: string;
-    shortName: string;
-    configJson: string | null;
-    isCliOnly: boolean;
-    enabled: boolean;
+  // Build the grid data model
+  const { originalState, cellInfoMap, allServerNames, serverConfigMap } = useMemo(() => {
+    const state = new Map<string, boolean>();
+    const info = new Map<string, CellInfo>();
+    const serverNames = new Set<string>();
+    // Map serverName -> configJson (from any source, for cross-tool installs)
+    const configByServer = new Map<string, string>();
+
+    for (const cs of configuredServers) {
+      // Skip locked tools from grid data
+      if (LOCKED_TOOLS.has(cs.tool_id)) continue;
+      const key = `${cs.server_name}:${cs.tool_id}`;
+      state.set(key, true);
+      info.set(key, { configJson: cs.config_json, isCliOnly: cs.is_cli_only });
+      serverNames.add(cs.server_name);
+      if (cs.config_json && !configByServer.has(cs.server_name)) {
+        configByServer.set(cs.server_name, cs.config_json);
+      }
+    }
+
+    for (const ds of disabledServers) {
+      if (LOCKED_TOOLS.has(ds.tool_id)) continue;
+      const key = `${ds.server_name}:${ds.tool_id}`;
+      state.set(key, false);
+      info.set(key, { configJson: ds.config_json, isCliOnly: false });
+      serverNames.add(ds.server_name);
+      if (ds.config_json && !configByServer.has(ds.server_name)) {
+        configByServer.set(ds.server_name, ds.config_json);
+      }
+    }
+
+    return {
+      originalState: state,
+      cellInfoMap: info,
+      allServerNames: Array.from(serverNames).sort(),
+      serverConfigMap: configByServer,
+    };
+  }, [configuredServers, disabledServers]);
+
+  const cellKey = (serverName: string, toolId: string) => `${serverName}:${toolId}`;
+
+  // Returns: true = enabled, false = disabled, null = not present in tool
+  const getOriginalState = useCallback(
+    (serverName: string, toolId: string): boolean | null => {
+      const key = cellKey(serverName, toolId);
+      const original = originalState.get(key);
+      return original !== undefined ? original : null;
+    },
+    [originalState]
+  );
+
+  const getEffectiveState = useCallback(
+    (serverName: string, toolId: string): boolean => {
+      const key = cellKey(serverName, toolId);
+      const pending = pendingChanges.get(key);
+      if (pending) {
+        return pending.action === "enable" || pending.action === "add";
+      }
+      const original = originalState.get(key);
+      return original === true;
+    },
+    [originalState, pendingChanges]
+  );
+
+  const isChanged = useCallback(
+    (serverName: string, toolId: string): boolean => {
+      return pendingChanges.has(cellKey(serverName, toolId));
+    },
+    [pendingChanges]
+  );
+
+  const handleCellToggle = (serverName: string, toolId: string) => {
+    const key = cellKey(serverName, toolId);
+    const original = getOriginalState(serverName, toolId);
+    const currentEffective = getEffectiveState(serverName, toolId);
+    const targetChecked = !currentEffective;
+
+    setPendingChanges((prev) => {
+      const next = new Map(prev);
+
+      if (original === null) {
+        // Cell is empty — toggling adds or removes
+        if (targetChecked) {
+          const configJson = serverConfigMap.get(serverName) || null;
+          next.set(key, {
+            serverName,
+            toolId,
+            action: "add",
+            cellInfo: { configJson, isCliOnly: false },
+          });
+        } else {
+          // Unchecking a pending add — remove the change
+          next.delete(key);
+        }
+      } else if (targetChecked === original) {
+        // Toggling back to original — remove pending change
+        next.delete(key);
+      } else {
+        const ci = cellInfoMap.get(key) || { configJson: null, isCliOnly: false };
+        next.set(key, {
+          serverName,
+          toolId,
+          action: targetChecked ? "enable" : "disable",
+          cellInfo: ci,
+        });
+      }
+
+      return next;
+    });
   };
 
-  const serverMap = new Map<string, ServerEntry[]>();
+  const handleSave = async () => {
+    const changes = Array.from(pendingChanges.values());
+    if (changes.length === 0) return;
 
-  // Active servers from config files
-  for (const cs of configuredServers) {
-    const entries = serverMap.get(cs.server_name) || [];
-    entries.push({
-      toolId: cs.tool_id,
-      shortName: cs.tool_short_name,
-      configJson: cs.config_json,
-      isCliOnly: cs.is_cli_only,
-      enabled: true,
-    });
-    serverMap.set(cs.server_name, entries);
-  }
+    setSaving(true);
+    setSaveProgress({ current: 0, total: changes.length, currentName: "" });
 
-  // Disabled servers from DB
-  for (const ds of disabledServers) {
-    const entries = serverMap.get(ds.server_name) || [];
-    entries.push({
-      toolId: ds.tool_id,
-      shortName: toolShortNames.get(ds.tool_id) || ds.tool_id,
-      configJson: ds.config_json,
-      isCliOnly: false,
-      enabled: false,
-    });
-    serverMap.set(ds.server_name, entries);
-  }
+    let successCount = 0;
+    for (let i = 0; i < changes.length; i++) {
+      const change = changes[i];
+      setSaveProgress({ current: i + 1, total: changes.length, currentName: change.serverName });
 
-  const handleToggle = async (
-    serverName: string,
-    entry: ServerEntry
-  ) => {
-    const key = `${entry.toolId}:${serverName}`;
-    setTogglingKey(key);
-    try {
-      if (entry.enabled) {
-        if (!entry.configJson) return;
-        await disableServer(entry.toolId, serverName, entry.configJson);
-      } else {
-        await enableServer(entry.toolId, serverName);
+      try {
+        if (change.action === "enable") {
+          await enableServer(change.toolId, change.serverName);
+          successCount++;
+        } else if (change.action === "disable") {
+          let configJson = change.cellInfo.configJson;
+          if (!configJson && change.cellInfo.isCliOnly) {
+            try {
+              configJson = await fetchCliServerConfig(change.toolId, change.serverName);
+            } catch {
+              showToast(`Failed to fetch config for ${change.serverName}`, "error");
+              continue;
+            }
+          }
+          if (!configJson) {
+            showToast(`No config available for ${change.serverName}`, "error");
+            continue;
+          }
+          await disableServer(change.toolId, change.serverName, configJson);
+          successCount++;
+        } else if (change.action === "add") {
+          let configJson = change.cellInfo.configJson;
+          if (!configJson) {
+            // Try to get config from another tool
+            configJson = serverConfigMap.get(change.serverName) || null;
+          }
+          if (!configJson) {
+            showToast(`No config available to install ${change.serverName}`, "error");
+            continue;
+          }
+          const result = await addServerToTool(change.toolId, change.serverName, configJson);
+          if (result.success) {
+            successCount++;
+          } else {
+            showToast(result.message, "error");
+          }
+        }
+      } catch (e) {
+        showToast(`Failed: ${change.serverName} — ${e}`, "error");
       }
-    } finally {
-      setTogglingKey(null);
+    }
+
+    await refreshConfiguredServers();
+    await refreshDisabledServers();
+    setPendingChanges(new Map());
+    setSaving(false);
+
+    if (successCount === changes.length) {
+      showToast(`Saved ${successCount} change${successCount > 1 ? "s" : ""} successfully`, "success");
+    } else {
+      showToast(`Saved ${successCount}/${changes.length} changes`, "error");
     }
   };
 
@@ -115,47 +256,55 @@ export default function Dashboard() {
           Detected Tools
         </h2>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          {detectedTools.map((tool) => (
+          {manageableTools.map((tool) => (
             <div
               key={tool.id}
-              className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-3"
+              className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg px-3 py-2 flex items-center gap-2"
             >
-              <div className="flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-green-400" />
-                <span className="text-sm font-medium">{tool.display_name}</span>
-              </div>
-              <p className="text-xs text-brightwing-gray-500 mt-1 font-mono">
-                {tool.short_name}
-              </p>
+              <div className="w-2 h-2 rounded-full bg-green-400 shrink-0" />
+              <span className="text-sm font-medium flex-1">{tool.display_name}</span>
+              <span className="text-xs text-brightwing-gray-500 font-mono">{tool.short_name}</span>
             </div>
           ))}
-          {notDetected.map((tool) => (
+          {notDetected.filter((t) => !LOCKED_TOOLS.has(t.id)).map((tool) => (
             <div
               key={tool.id}
-              className="bg-brightwing-gray-800/50 border border-brightwing-gray-700/50 rounded-lg p-3 opacity-50"
+              className="bg-brightwing-gray-800/50 border border-brightwing-gray-700/50 rounded-lg px-3 py-2 flex items-center gap-2 opacity-50"
             >
-              <div className="flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-brightwing-gray-600" />
-                <span className="text-sm font-medium text-brightwing-gray-500">
-                  {tool.display_name}
-                </span>
-              </div>
-              <p className="text-xs text-brightwing-gray-600 mt-1">
-                Not detected
-              </p>
+              <div className="w-2 h-2 rounded-full bg-brightwing-gray-600 shrink-0" />
+              <span className="text-sm font-medium text-brightwing-gray-500 flex-1">{tool.display_name}</span>
+              <span className="text-xs text-brightwing-gray-600 font-mono">N/A</span>
             </div>
           ))}
         </div>
+        {lockedDetected.length > 0 && (
+          <p className="text-xs text-brightwing-gray-500 mt-2">
+            {lockedDetected.map((t) => t.display_name).join(", ")}{" "}
+            {lockedDetected.length === 1 ? "is" : "are"} installed but{" "}
+            {lockedDetected.length === 1 ? "its" : "their"} MCP servers cannot be managed externally.
+          </p>
+        )}
       </section>
 
-      {/* Configured Servers */}
+      {/* MCP Servers Grid */}
       <section>
-        <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
-          MCP Servers ({serverMap.size})
-        </h2>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider">
+            MCP Servers ({allServerNames.length})
+          </h2>
+          {pendingChanges.size > 0 && (
+            <button
+              onClick={handleSave}
+              className="px-4 py-1.5 text-sm font-medium bg-brightwing-blue hover:bg-brightwing-blue/80 text-white rounded-md transition-colors"
+            >
+              Save Changes ({pendingChanges.size})
+            </button>
+          )}
+        </div>
+
         {configuredServersLoading ? (
           <p className="text-brightwing-gray-500 text-sm">Scanning config files...</p>
-        ) : serverMap.size === 0 ? (
+        ) : allServerNames.length === 0 ? (
           <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-8 text-center">
             <p className="text-brightwing-gray-400">
               No MCP servers configured in any tool.
@@ -165,76 +314,106 @@ export default function Dashboard() {
             </p>
           </div>
         ) : (
-          <div className="space-y-2">
-            {Array.from(serverMap.entries()).map(([name, entries]) => (
-              <div
-                key={name}
-                className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4"
-              >
-                <h3 className="font-mono font-medium text-sm mb-2">{name}</h3>
-                <div className="space-y-1.5">
-                  {entries.map((entry) => {
-                    const key = `${entry.toolId}:${name}`;
-                    const isToggling = togglingKey === key;
-                    const canToggle = entry.configJson != null;
-
-                    return (
-                      <div
-                        key={key}
-                        className="flex items-center justify-between"
+          <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-brightwing-gray-700">
+                    <th className="text-left px-4 py-3 text-brightwing-gray-400 font-medium text-xs uppercase tracking-wider sticky left-0 bg-brightwing-gray-800 z-10">
+                      Server
+                    </th>
+                    {manageableTools.map((tool) => (
+                      <th
+                        key={tool.id}
+                        className="px-3 py-3 text-center text-brightwing-gray-400 font-mono font-medium text-xs uppercase tracking-wider min-w-[60px]"
+                        title={tool.display_name}
                       >
-                        <div className="flex items-center gap-2">
-                          <span
-                            className={`px-1.5 py-0.5 text-xs rounded ${
-                              entry.enabled
-                                ? "bg-brightwing-blue/20 text-brightwing-blue"
-                                : "bg-brightwing-gray-700 text-brightwing-gray-500"
-                            }`}
-                          >
-                            {entry.shortName}
-                          </span>
-                          {!entry.enabled && (
-                            <span className="text-xs text-brightwing-gray-500">
-                              disabled
-                            </span>
-                          )}
-                        </div>
-                        {canToggle ? (
-                          <button
-                            onClick={() => handleToggle(name, entry)}
-                            disabled={isToggling}
-                            className={`relative w-10 h-5 rounded-full transition-colors disabled:opacity-50 ${
-                              entry.enabled
-                                ? "bg-green-500"
-                                : "bg-brightwing-gray-600"
-                            }`}
-                          >
-                            <span
-                              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                                entry.enabled
-                                  ? "translate-x-5"
-                                  : "translate-x-0.5"
-                              }`}
-                            />
-                          </button>
-                        ) : (
-                          <span className="text-xs text-brightwing-gray-600">
-                            read-only
-                          </span>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
+                        {tool.short_name}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {allServerNames.map((serverName, idx) => (
+                    <tr
+                      key={serverName}
+                      className={`border-b border-brightwing-gray-700/50 ${
+                        idx % 2 === 0 ? "" : "bg-brightwing-gray-800/50"
+                      }`}
+                    >
+                      <td className="px-4 py-2.5 font-mono text-xs sticky left-0 bg-inherit z-10 max-w-[200px] truncate" title={serverName}>
+                        {serverName}
+                      </td>
+                      {manageableTools.map((tool) => {
+                        const effective = getEffectiveState(serverName, tool.id);
+                        const changed = isChanged(serverName, tool.id);
+                        const hasConfig = serverConfigMap.has(serverName);
+                        const original = getOriginalState(serverName, tool.id);
+                        // Can interact if: exists in this tool, OR we have config to install it
+                        const canInteract = original !== null || hasConfig;
+
+                        return (
+                          <td key={tool.id} className="px-3 py-2.5 text-center">
+                            {canInteract ? (
+                              <button
+                                onClick={() => handleCellToggle(serverName, tool.id)}
+                                className={`w-5 h-5 rounded border-2 inline-flex items-center justify-center transition-all ${
+                                  changed
+                                    ? "ring-2 ring-amber-400/50 ring-offset-1 ring-offset-brightwing-gray-800"
+                                    : ""
+                                } ${
+                                  effective
+                                    ? "bg-green-500 border-green-500"
+                                    : "bg-transparent border-brightwing-gray-600 hover:border-brightwing-gray-400"
+                                }`}
+                              >
+                                {effective && (
+                                  <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                                  </svg>
+                                )}
+                              </button>
+                            ) : (
+                              <span className="text-brightwing-gray-700">&mdash;</span>
+                            )}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         )}
         <p className="text-xs text-brightwing-gray-500 mt-4">
-          Toggle switches disable/enable MCP servers in each tool's config file.
-          Most tools need a restart after changes.
+          Check/uncheck to enable/disable MCP servers, then click Save Changes to apply.
         </p>
       </section>
+
+      {/* Saving modal */}
+      {saving && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-xl p-6 max-w-sm mx-4 shadow-2xl">
+            <h3 className="text-lg font-semibold mb-4">Saving Changes</h3>
+            <div className="mb-3">
+              <div className="flex justify-between text-sm text-brightwing-gray-400 mb-1">
+                <span>{saveProgress.currentName}</span>
+                <span>{saveProgress.current}/{saveProgress.total}</span>
+              </div>
+              <div className="w-full bg-brightwing-gray-700 rounded-full h-2">
+                <div
+                  className="bg-brightwing-blue h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${(saveProgress.current / saveProgress.total) * 100}%` }}
+                />
+              </div>
+            </div>
+            <p className="text-xs text-brightwing-gray-500">
+              Applying changes to tool configurations...
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

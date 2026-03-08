@@ -101,6 +101,25 @@ export async function backupToolConfig(toolId: string): Promise<string> {
   return invoke<string>("backup_tool_config", { toolId });
 }
 
+export async function fetchCliServerConfig(
+  toolId: string,
+  serverName: string
+): Promise<string> {
+  return invoke<string>("fetch_cli_server_config", { toolId, serverName });
+}
+
+export async function addServerToTool(
+  toolId: string,
+  serverName: string,
+  configJson: string
+): Promise<InstallResult> {
+  return invoke<InstallResult>("add_server_to_tool", { toolId, serverName, configJson });
+}
+
+export async function restartTool(toolId: string): Promise<string> {
+  return invoke<string>("restart_tool", { toolId });
+}
+
 // --- API Proxy (routes through Rust to bypass CORS) ---
 
 export async function apiSearchServers(
