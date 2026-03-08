@@ -1,3 +1,4 @@
+use crate::config::reader::{build_cli_env, find_cli_binary};
 use crate::tools::definitions::{ConfigFormat, TOOL_DEFINITIONS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -207,13 +208,22 @@ fn install_cli(
         .cli_command
         .ok_or_else(|| format!("No CLI command for {}", def.id))?;
 
+    let bin = find_cli_binary(cli_cmd)
+        .unwrap_or_else(|| std::path::PathBuf::from(cli_cmd));
+    let (full_path, home) = build_cli_env();
+
     // Build the JSON config for claude mcp add-json
     let entry = build_server_entry(def, config);
     let json_str = serde_json::to_string(&entry)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
-    let output = std::process::Command::new(cli_cmd)
+    let mut cmd_builder = std::process::Command::new(&bin);
+    cmd_builder
         .args(["mcp", "add-json", &config.config_key, &json_str, "--scope", "user"])
+        .env("PATH", &full_path);
+    if let Some(h) = home { cmd_builder.env("HOME", h); }
+
+    let output = cmd_builder
         .output()
         .map_err(|e| format!("Failed to run {} mcp add-json: {}", cli_cmd, e))?;
 
@@ -342,7 +352,7 @@ fn restore_toml(
     // Serialize the JSON value as a TOML string, parse it, and insert
     let toml_str = toml::to_string(&toml_val)
         .map_err(|e| format!("Failed to serialize as TOML: {}", e))?;
-    let wrapper = format!("[{}]\n{}", server_name, toml_str);
+    let wrapper = format!("[\"{}\"]\n{}", server_name, toml_str);
     let parsed: toml_edit::DocumentMut = wrapper
         .parse()
         .map_err(|e| format!("Failed to parse TOML entry: {}", e))?;
@@ -371,11 +381,17 @@ fn restore_cli(
         .cli_command
         .ok_or_else(|| format!("No CLI command for {}", def.id))?;
 
-    let bin = crate::config::reader::find_cli_binary(cli_cmd)
+    let bin = find_cli_binary(cli_cmd)
         .unwrap_or_else(|| std::path::PathBuf::from(cli_cmd));
+    let (full_path, home) = build_cli_env();
 
-    let output = std::process::Command::new(&bin)
+    let mut cmd_builder = std::process::Command::new(&bin);
+    cmd_builder
         .args(["mcp", "add-json", server_name, config_json, "--scope", "user"])
+        .env("PATH", &full_path);
+    if let Some(h) = home { cmd_builder.env("HOME", h); }
+
+    let output = cmd_builder
         .output()
         .map_err(|e| format!("Failed to run {} mcp add-json: {}", cli_cmd, e))?;
 
@@ -475,8 +491,17 @@ fn uninstall_cli(
         .cli_command
         .ok_or_else(|| format!("No CLI command for {}", def.id))?;
 
-    let output = std::process::Command::new(cli_cmd)
+    let bin = find_cli_binary(cli_cmd)
+        .unwrap_or_else(|| std::path::PathBuf::from(cli_cmd));
+    let (full_path, home) = build_cli_env();
+
+    let mut cmd_builder = std::process::Command::new(&bin);
+    cmd_builder
         .args(["mcp", "remove", config_key, "--scope", "user"])
+        .env("PATH", &full_path);
+    if let Some(h) = home { cmd_builder.env("HOME", h); }
+
+    let output = cmd_builder
         .output()
         .map_err(|e| format!("Failed to run {} mcp remove: {}", cli_cmd, e))?;
 
