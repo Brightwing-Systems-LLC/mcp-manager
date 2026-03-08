@@ -73,7 +73,7 @@ export default function Navigation() {
 
       {/* Footer */}
       <div className="px-4 py-3 border-t border-brightwing-gray-700">
-        <p className="text-xs text-brightwing-gray-500">v0.1.0</p>
+        <p className="text-xs text-brightwing-gray-500">v0.2.0</p>
       </div>
     </nav>
   );
