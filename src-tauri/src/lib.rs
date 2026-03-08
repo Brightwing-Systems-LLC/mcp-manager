@@ -163,6 +163,16 @@ fn enable_server(
 }
 
 #[tauri::command]
+fn add_server_to_tool(
+    tool_id: String,
+    server_name: String,
+    config_json: String,
+) -> Result<InstallResult, String> {
+    let _ = config::backup::backup_config(&tool_id);
+    config::writer::restore_server_entry(&tool_id, &server_name, &config_json)
+}
+
+#[tauri::command]
 fn get_disabled_servers(
     db: tauri::State<'_, Database>,
 ) -> Result<Vec<DisabledServer>, String> {
@@ -172,6 +182,148 @@ fn get_disabled_servers(
 #[tauri::command]
 fn backup_tool_config(tool_id: String) -> Result<String, String> {
     config::backup::backup_config(&tool_id)
+}
+
+#[tauri::command]
+async fn fetch_cli_server_config(tool_id: String, server_name: String) -> Result<String, String> {
+    let def = tools::definitions::TOOL_DEFINITIONS
+        .iter()
+        .find(|d| d.id == tool_id)
+        .ok_or_else(|| format!("Unknown tool: {}", tool_id))?;
+
+    let cmd = def
+        .cli_command
+        .ok_or_else(|| format!("{} is not a CLI tool", tool_id))?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cmd_str = cmd.to_string();
+    let name = server_name.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(config::reader::fetch_cli_server_config(&cmd_str, &name));
+    });
+    rx.recv().map_err(|e| format!("Fetch failed: {}", e))?
+}
+
+#[tauri::command]
+async fn restart_tool(tool_id: String) -> Result<String, String> {
+    // Returns a message about what happened
+    match tool_id.as_str() {
+        "claude_desktop" => {
+            #[cfg(target_os = "macos")]
+            {
+                // Kill Claude Desktop gracefully first, then force if needed
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", r#"tell application "Claude" to quit"#])
+                    .output();
+                // Give it a moment to quit gracefully
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                // Force kill if still running
+                let _ = std::process::Command::new("pkill")
+                    .args(["-f", "Claude.app"])
+                    .output();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                // Relaunch
+                let output = std::process::Command::new("open")
+                    .args(["-a", "Claude"])
+                    .output()
+                    .map_err(|e| format!("Failed to relaunch Claude Desktop: {}", e))?;
+                if output.status.success() {
+                    Ok("Claude Desktop restarted".to_string())
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Err(format!("Failed to relaunch Claude Desktop: {}", stderr))
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/IM", "Claude.exe", "/F"])
+                    .output();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                // Try to find and relaunch Claude on Windows
+                if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+                    let claude_path = std::path::PathBuf::from(local_app_data)
+                        .join("Programs")
+                        .join("Claude")
+                        .join("Claude.exe");
+                    if claude_path.exists() {
+                        let _ = std::process::Command::new(claude_path)
+                            .spawn()
+                            .map_err(|e| format!("Failed to relaunch Claude Desktop: {}", e))?;
+                        return Ok("Claude Desktop restarted".to_string());
+                    }
+                }
+                Err("Could not find Claude Desktop to relaunch".to_string())
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("pkill")
+                    .args(["-f", "claude"])
+                    .output();
+                Err("Please relaunch Claude Desktop manually on Linux".to_string())
+            }
+        }
+        "cursor" => {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", r#"tell application "Cursor" to quit"#])
+                    .output();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let _ = std::process::Command::new("open")
+                    .args(["-a", "Cursor"])
+                    .output()
+                    .map_err(|e| format!("Failed to relaunch Cursor: {}", e))?;
+                Ok("Cursor restarted".to_string())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err("Automatic restart not supported for Cursor on this platform".to_string())
+            }
+        }
+        "windsurf" => {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", r#"tell application "Windsurf" to quit"#])
+                    .output();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let _ = std::process::Command::new("open")
+                    .args(["-a", "Windsurf"])
+                    .output()
+                    .map_err(|e| format!("Failed to relaunch Windsurf: {}", e))?;
+                Ok("Windsurf restarted".to_string())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err("Automatic restart not supported for Windsurf on this platform".to_string())
+            }
+        }
+        "vscode" => {
+            // VS Code typically auto-reloads settings, but we can offer a reload
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", r#"tell application "Visual Studio Code" to quit"#])
+                    .output();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let _ = std::process::Command::new("open")
+                    .args(["-a", "Visual Studio Code"])
+                    .output()
+                    .map_err(|e| format!("Failed to relaunch VS Code: {}", e))?;
+                Ok("VS Code restarted".to_string())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err("Automatic restart not supported for VS Code on this platform".to_string())
+            }
+        }
+        // CLI tools don't need restart
+        "claude_code" | "codex" | "gemini_cli" => {
+            Ok("No restart needed for CLI tools".to_string())
+        }
+        _ => Err(format!("Unknown tool: {}", tool_id)),
+    }
 }
 
 // --- API Proxy (bypasses CORS) ---
@@ -280,7 +432,7 @@ pub fn run() {
                         }
                     }
                     // Emit event to frontend
-                    let _ = app.emit("deep-link", action);
+                    let _ = app.emit("deep-link-action", action);
                 }
             }
             // Focus the existing window
@@ -314,13 +466,15 @@ pub fn run() {
             api_get_install_config,
             api_get_installable_ids,
             api_get_server,
+            restart_tool,
+            fetch_cli_server_config,
+            add_server_to_tool,
         ])
         .setup(|app| {
-            // Handle deep links on macOS (open-url event)
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            // Handle deep links (open-url event from tauri-plugin-deep-link)
             {
                 let handle = app.handle().clone();
-                app.listen("tauri://deep-link", move |event: tauri::Event| {
+                app.listen("deep-link://new-url", move |event: tauri::Event| {
                     if let Ok(urls) = serde_json::from_str::<Vec<String>>(event.payload()) {
                         for url in urls {
                             if let Some(action) = deeplink::parse_deep_link(&url) {
@@ -329,7 +483,7 @@ pub fn run() {
                                         *pending = Some(action.clone());
                                     }
                                 }
-                                let _ = handle.emit("deep-link", action);
+                                let _ = handle.emit("deep-link-action", action);
                             }
                         }
                     }
