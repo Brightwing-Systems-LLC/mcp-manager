@@ -48,7 +48,7 @@ export default function RestartBanner() {
         </svg>
         <div className="flex-1 min-w-0">
           <p className="text-sm text-amber-200 font-medium">
-            Restart needed to apply changes
+            Restart needed — changes won't take effect until these tools are restarted
           </p>
           <div className="flex flex-wrap gap-2 mt-2">
             {toolIds.map((toolId) => {

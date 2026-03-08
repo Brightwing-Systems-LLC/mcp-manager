@@ -29,6 +29,7 @@ export default function Dashboard() {
     refreshDisabledServers,
     disableServer,
     enableServer,
+    addPendingRestart,
     showToast,
   } = useStore();
 
@@ -204,6 +205,7 @@ export default function Dashboard() {
           const result = await addServerToTool(change.toolId, change.serverName, configJson);
           if (result.success) {
             successCount++;
+            if (result.needs_restart) addPendingRestart(change.toolId);
           } else {
             showToast(result.message, "error");
           }
