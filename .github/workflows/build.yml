@@ -48,20 +48,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: Install dependencies (macOS)
-        if: matrix.platform == 'macos-latest'
-        run: |
-          npm ci
-
-      - name: Install dependencies (Windows)
-        if: matrix.platform == 'windows-latest'
-        run: |
-          npm ci
-
-      - name: Install dependencies (Linux)
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          npm ci
+      - name: Install npm dependencies
+        run: npm ci
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
@@ -70,7 +58,31 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "MCP Manager ${{ github.ref_name }}"
-          releaseBody: "See the changelog for details."
+          releaseBody: |
+            ## Download
+
+            | Platform | File |
+            |----------|------|
+            | macOS (Apple Silicon) | `Brightwing.MCP.Manager_x.x.x_aarch64.dmg` |
+            | macOS (Intel) | `Brightwing.MCP.Manager_x.x.x_x64.dmg` |
+            | Windows (64-bit) | `Brightwing.MCP.Manager_x.x.x_x64-setup.exe` |
+            | Windows (MSI) | `Brightwing.MCP.Manager_x.x.x_x64_en-US.msi` |
+            | Linux (Debian/Ubuntu) | `brightwing-mcp-manager_x.x.x_amd64.deb` |
+            | Linux (AppImage) | `brightwing-mcp-manager_x.x.x_amd64.AppImage` |
+
+            ### Unsigned Build Workarounds
+
+            Builds are not yet code-signed. Your OS will show a warning on first launch.
+
+            **macOS:** System Settings → Privacy & Security → Open Anyway. Or run `xattr -cr "/Applications/Brightwing MCP Manager.app"` in Terminal.
+
+            **Windows:** SmartScreen → More info → Run anyway.
+
+            **Linux AppImage:** `chmod +x` the file, then run it.
+
+            ---
+
+            See [README](https://github.com/Brightwing-Systems-LLC/mcp-manager#readme) for full documentation.
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
