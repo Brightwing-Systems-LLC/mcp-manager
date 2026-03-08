@@ -19,7 +19,8 @@ export default function InstallDialog() {
     addPendingRestart,
   } = useStore();
 
-  const [installing, setInstalling] = useState<string | null>(null);
+  const [selectedTools, setSelectedTools] = useState<Set<string>>(new Set());
+  const [saving, setSaving] = useState(false);
   const [envValues, setEnvValues] = useState<Record<string, string>>({});
   const [deepLinkLoading, setDeepLinkLoading] = useState(false);
   const [deepLinkError, setDeepLinkError] = useState<string | null>(null);
@@ -45,6 +46,26 @@ export default function InstallDialog() {
         });
     }
   }, [deepLink, server, deepLinkLoading, setInstallTarget, setPendingDeepLink]);
+
+  // Initialize checkbox state from current installations when server loads
+  const detectedTools = tools.filter((t) => t.detected);
+  const installedToolIds = server
+    ? new Set(
+        installations
+          .filter(
+            (i) =>
+              i.server_name === server.name ||
+              i.server_uuid === String(server.id)
+          )
+          .map((i) => i.tool_id)
+      )
+    : new Set<string>();
+
+  useEffect(() => {
+    if (server) {
+      setSelectedTools(new Set(installedToolIds));
+    }
+  }, [server?.id, installations]);
 
   if (!server && !deepLink) {
     return (
@@ -96,92 +117,120 @@ export default function InstallDialog() {
 
   if (!server) return null;
 
-  const detectedTools = tools.filter((t) => t.detected);
-  const installedToolIds = new Set(
-    installations
-      .filter((i) => i.server_name === server.name || i.server_uuid === String(server.id))
-      .map((i) => i.tool_id)
-  );
-
   const config = installConfig;
   const hasConfig = config !== null;
+
+  const toggleTool = (toolId: string) => {
+    const next = new Set(selectedTools);
+    if (next.has(toolId)) {
+      next.delete(toolId);
+    } else {
+      next.add(toolId);
+    }
+    setSelectedTools(next);
+  };
 
   const handleEnvChange = (key: string, value: string) => {
     setEnvValues((prev) => ({ ...prev, [key]: value }));
   };
 
-  const handleInstall = async (toolId: string) => {
+  // Compute what changed vs. current installations
+  const toInstall = [...selectedTools].filter((id) => !installedToolIds.has(id));
+  const toRemove = [...installedToolIds].filter((id) => !selectedTools.has(id));
+  const hasChanges = toInstall.length > 0 || toRemove.length > 0;
+
+  const handleSave = async () => {
     if (!config) return;
 
-    // Check required env vars
-    const missingRequired = Object.entries(config.env_schema)
-      .filter(([, schema]) => schema.required)
-      .filter(([key]) => !envValues[key]?.trim());
+    // Check required env vars if installing into new tools
+    if (toInstall.length > 0) {
+      const missingRequired = Object.entries(config.env_schema)
+        .filter(([, schema]) => schema.required)
+        .filter(([key]) => !envValues[key]?.trim());
 
-    if (missingRequired.length > 0) {
-      showToast(
-        `Missing required: ${missingRequired.map(([k]) => k).join(", ")}`,
-        "error"
-      );
-      return;
+      if (missingRequired.length > 0) {
+        showToast(
+          `Missing required: ${missingRequired.map(([k]) => k).join(", ")}`,
+          "error"
+        );
+        return;
+      }
     }
 
-    setInstalling(toolId);
-    try {
-      const env: Record<string, string> = {};
-      for (const [key, schema] of Object.entries(config.env_schema)) {
-        const value = envValues[key]?.trim();
-        if (value) {
-          env[key] = value;
-        } else if (schema.default) {
-          env[key] = schema.default;
+    setSaving(true);
+    let successCount = 0;
+    let failCount = 0;
+
+    // Install into newly selected tools
+    for (const toolId of toInstall) {
+      try {
+        const env: Record<string, string> = {};
+        for (const [key, schema] of Object.entries(config.env_schema)) {
+          const value = envValues[key]?.trim();
+          if (value) {
+            env[key] = value;
+          } else if (schema.default) {
+            env[key] = schema.default;
+          }
         }
-      }
 
-      const installConfig: ServerInstallConfig = {
-        server_name: server.name,
-        config_key: config.config_key,
-        command: config.command,
-        args: config.args,
-        env,
-        transport: config.transport,
-      };
+        const installConfig: ServerInstallConfig = {
+          server_name: server.name,
+          config_key: config.config_key,
+          command: config.command,
+          args: config.args,
+          env,
+          transport: config.transport,
+        };
 
-      const result = await installServer(toolId, installConfig);
-      if (result.success) {
-        showToast(result.message, "success");
-        if (result.needs_restart) addPendingRestart(toolId);
-        await refreshInstallations();
-      } else {
-        showToast(result.message, "error");
+        const result = await installServer(toolId, installConfig);
+        if (result.success) {
+          successCount++;
+          if (result.needs_restart) addPendingRestart(toolId);
+        } else {
+          failCount++;
+          showToast(result.message, "error");
+        }
+      } catch (e) {
+        failCount++;
+        showToast(`Install failed: ${e}`, "error");
       }
-    } catch (e) {
-      showToast(`Install failed: ${e}`, "error");
-    } finally {
-      setInstalling(null);
     }
-  };
 
-  const handleUninstall = async (toolId: string) => {
-    if (!config) return;
-    setInstalling(toolId);
-    try {
-      const result = await uninstallServer(
-        toolId,
-        config.config_key,
-        String(server.id)
-      );
-      if (result.success) {
-        showToast(result.message, "success");
-        if (result.needs_restart) addPendingRestart(toolId);
-        await refreshInstallations();
-      } else {
-        showToast(result.message, "error");
+    // Remove from newly unchecked tools
+    for (const toolId of toRemove) {
+      try {
+        const result = await uninstallServer(
+          toolId,
+          config.config_key,
+          String(server.id)
+        );
+        if (result.success) {
+          successCount++;
+          if (result.needs_restart) addPendingRestart(toolId);
+        } else {
+          failCount++;
+          showToast(result.message, "error");
+        }
+      } catch (e) {
+        failCount++;
+        showToast(`Uninstall failed: ${e}`, "error");
       }
-    } catch (e) {
-      showToast(`Uninstall failed: ${e}`, "error");
-    } finally {
-      setInstalling(null);
+    }
+
+    await refreshInstallations();
+    setSaving(false);
+
+    if (failCount === 0) {
+      const parts = [];
+      if (toInstall.length > 0)
+        parts.push(`installed into ${toInstall.length}`);
+      if (toRemove.length > 0)
+        parts.push(`removed from ${toRemove.length}`);
+      showToast(
+        `${server.name}: ${parts.join(", ")} tool${successCount !== 1 ? "s" : ""}`,
+        "success"
+      );
     }
   };
 
@@ -252,9 +301,9 @@ export default function InstallDialog() {
           </p>
         </div>
       ) : (
-        <>
+        <div className="space-y-5 max-w-xl">
           {/* Command preview */}
-          <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4 mb-4">
+          <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
             <p className="text-xs text-brightwing-gray-500 mb-1">Command</p>
             <code className="text-sm text-brightwing-gray-200 font-mono">
               {config.command} {config.args.join(" ")}
@@ -263,7 +312,7 @@ export default function InstallDialog() {
 
           {/* Env var form */}
           {Object.keys(config.env_schema).length > 0 && (
-            <div className="mb-6">
+            <div>
               <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
                 Configuration
               </h2>
@@ -294,73 +343,89 @@ export default function InstallDialog() {
             </div>
           )}
 
-          {/* Tool installation grid */}
-          <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
-            Install Into
-          </h2>
-
-          <div className="space-y-2">
-            {detectedTools.map((tool) => {
-              const isInstalled = installedToolIds.has(tool.id);
-              const isLoading = installing === tool.id;
-
-              return (
-                <div
-                  key={tool.id}
-                  className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4 flex items-center justify-between"
-                >
-                  <div className="flex items-center gap-3">
+          {/* Tool selection with checkboxes */}
+          <div>
+            <label className="block text-xs text-brightwing-gray-400 uppercase tracking-wider mb-2">
+              Install Into
+            </label>
+            <div className="space-y-2">
+              {detectedTools.map((tool) => {
+                const isSelected = selectedTools.has(tool.id);
+                return (
+                  <button
+                    key={tool.id}
+                    onClick={() => toggleTool(tool.id)}
+                    disabled={saving}
+                    className={`w-full flex items-center gap-3 p-3 rounded-lg border transition-colors text-left ${
+                      isSelected
+                        ? "bg-brightwing-blue/10 border-brightwing-blue"
+                        : "bg-brightwing-gray-800 border-brightwing-gray-700 hover:border-brightwing-gray-600"
+                    } disabled:opacity-50`}
+                  >
                     <div
-                      className={`w-2 h-2 rounded-full ${
-                        isInstalled ? "bg-green-400" : "bg-brightwing-gray-600"
+                      className={`w-4 h-4 rounded border-2 flex items-center justify-center flex-shrink-0 ${
+                        isSelected
+                          ? "border-brightwing-blue bg-brightwing-blue"
+                          : "border-brightwing-gray-600"
                       }`}
-                    />
-                    <div>
-                      <span className="text-sm font-medium">
-                        {tool.display_name}
-                      </span>
-                      <span className="text-xs text-brightwing-gray-500 ml-2">
-                        ({tool.short_name})
-                      </span>
+                    >
+                      {isSelected && (
+                        <svg
+                          className="w-3 h-3 text-white"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          strokeWidth={3}
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            d="m4.5 12.75 6 6 9-13.5"
+                          />
+                        </svg>
+                      )}
                     </div>
-                  </div>
-
-                  <div>
-                    {isInstalled ? (
-                      <button
-                        onClick={() => handleUninstall(tool.id)}
-                        disabled={isLoading}
-                        className="px-3 py-1.5 text-sm bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-md transition-colors disabled:opacity-50"
-                      >
-                        {isLoading ? "Removing..." : "Remove"}
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => handleInstall(tool.id)}
-                        disabled={isLoading}
-                        className="px-3 py-1.5 text-sm bg-brightwing-blue hover:bg-brightwing-blue-dark text-white rounded-md transition-colors disabled:opacity-50"
-                      >
-                        {isLoading ? "Installing..." : "Install"}
-                      </button>
+                    <span className="text-sm font-medium">
+                      {tool.display_name}
+                    </span>
+                    <span className="text-xs text-brightwing-gray-500">
+                      ({tool.short_name})
+                    </span>
+                    {installedToolIds.has(tool.id) && (
+                      <span className="ml-auto text-xs text-green-400">
+                        installed
+                      </span>
                     )}
-                  </div>
-                </div>
-              );
-            })}
-
-            {detectedTools.length === 0 && (
-              <p className="text-brightwing-gray-500 text-sm">
-                No AI tools detected on your machine.
-              </p>
-            )}
+                  </button>
+                );
+              })}
+              {detectedTools.length === 0 && (
+                <p className="text-brightwing-gray-500 text-sm">
+                  No AI tools detected on your machine.
+                </p>
+              )}
+            </div>
           </div>
-        </>
-      )}
 
-      <p className="text-xs text-brightwing-gray-500 mt-4">
-        Changes will appear in the restart banner above when tools need
-        restarting.
-      </p>
+          {/* Save button */}
+          <button
+            onClick={handleSave}
+            disabled={saving || !hasChanges}
+            className="w-full py-2.5 text-sm bg-brightwing-blue hover:bg-brightwing-blue-dark text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {saving
+              ? "Saving..."
+              : !hasChanges
+                ? "No Changes"
+                : `Save Changes`}
+          </button>
+
+          <p className="text-xs text-brightwing-gray-500">
+            Changes will appear in the restart banner above when tools need
+            restarting.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

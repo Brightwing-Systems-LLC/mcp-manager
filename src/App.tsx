@@ -26,6 +26,7 @@ export default function App() {
     // Listen for deep link events from Tauri
     const unlisten = listen<DeepLinkAction>("deep-link-action", (event) => {
       setPendingDeepLink(event.payload);
+      setView("install");
     });
 
     return () => {
