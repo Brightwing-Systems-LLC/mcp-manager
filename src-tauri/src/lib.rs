@@ -169,7 +169,13 @@ fn add_server_to_tool(
     config_json: String,
 ) -> Result<InstallResult, String> {
     let _ = config::backup::backup_config(&tool_id);
-    config::writer::restore_server_entry(&tool_id, &server_name, &config_json)
+    // Sanitize server name for tools that require clean identifiers
+    let safe_name = if config::writer::needs_sanitizing(&server_name) {
+        config::writer::sanitize_server_name(&server_name)
+    } else {
+        server_name
+    };
+    config::writer::restore_server_entry(&tool_id, &safe_name, &config_json)
 }
 
 #[tauri::command]
@@ -318,8 +324,35 @@ async fn restart_tool(tool_id: String) -> Result<String, String> {
                 Err("Automatic restart not supported for VS Code on this platform".to_string())
             }
         }
+        "codex" => {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", r#"tell application "Codex" to quit"#])
+                    .output();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let _ = std::process::Command::new("pkill")
+                    .args(["-f", "Codex.app"])
+                    .output();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let output = std::process::Command::new("open")
+                    .args(["-a", "Codex"])
+                    .output()
+                    .map_err(|e| format!("Failed to relaunch Codex: {}", e))?;
+                if output.status.success() {
+                    Ok("OpenAI Codex restarted".to_string())
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Err(format!("Failed to relaunch Codex: {}", stderr))
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err("Automatic restart not supported for Codex on this platform".to_string())
+            }
+        }
         // CLI tools don't need restart
-        "claude_code" | "codex" | "gemini_cli" => {
+        "claude_code" | "gemini_cli" => {
             Ok("No restart needed for CLI tools".to_string())
         }
         _ => Err(format!("Unknown tool: {}", tool_id)),

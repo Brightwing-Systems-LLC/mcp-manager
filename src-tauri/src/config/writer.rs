@@ -187,6 +187,12 @@ fn install_toml(
 
     server_table.insert(&config.config_key, toml_edit::Item::Table(entry));
 
+    // Use dotted keys (e.g. [mcp_servers.name]) instead of a bare [mcp_servers] header
+    // to avoid breaking parsers that treat a later bare header as an override
+    if let Some(table) = doc.get_mut(def.servers_key).and_then(|v| v.as_table_mut()) {
+        table.set_implicit(true);
+    }
+
     fs::write(&config_path, doc.to_string())
         .map_err(|e| format!("Failed to write config: {}", e))?;
 
@@ -242,7 +248,45 @@ fn install_cli(
     }
 }
 
+/// Sanitize a server name into a valid config key.
+/// Many tools (Codex, Claude Code) only accept [a-zA-Z0-9_-] identifiers.
+/// "claude.ai AI Cost Manager" -> "claude_ai_ai_cost_manager"
+pub fn sanitize_server_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Collapse multiple underscores
+    let mut result = String::new();
+    let mut prev_underscore = false;
+    for c in sanitized.chars() {
+        if c == '_' {
+            if !prev_underscore {
+                result.push(c);
+            }
+            prev_underscore = true;
+        } else {
+            result.push(c);
+            prev_underscore = false;
+        }
+    }
+    result.trim_matches('_').to_lowercase()
+}
+
+/// Check if a server name needs sanitizing (contains non-identifier chars).
+pub fn needs_sanitizing(name: &str) -> bool {
+    name.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+}
+
 /// Restore a server entry from raw JSON into a tool's config file.
+/// The server_name is used as-is for the config key. Callers should
+/// sanitize it first if needed (see sanitize_server_name).
 pub fn restore_server_entry(
     tool_id: &str,
     server_name: &str,
@@ -361,6 +405,11 @@ fn restore_toml(
         doc[def.servers_key][server_name] = entry.clone();
     }
 
+    // Use dotted keys only — no bare [mcp_servers] header
+    if let Some(table) = doc.get_mut(def.servers_key).and_then(|v| v.as_table_mut()) {
+        table.set_implicit(true);
+    }
+
     fs::write(&config_path, doc.to_string())
         .map_err(|e| format!("Failed to write config: {}", e))?;
 
@@ -471,6 +520,8 @@ fn uninstall_toml(
 
     if let Some(servers) = doc.get_mut(def.servers_key).and_then(|v| v.as_table_mut()) {
         servers.remove(config_key);
+        // Keep dotted keys only — no bare [mcp_servers] header
+        servers.set_implicit(true);
     }
 
     fs::write(&config_path, doc.to_string())
