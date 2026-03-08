@@ -23,18 +23,18 @@ pub fn read_all_configured_servers() -> Vec<ConfiguredServer> {
             // For Claude Code, try to parse `claude mcp list` output
             if let Some(cmd) = def.cli_command {
                 match read_cli_servers(cmd) {
-                    Ok(names) => {
+                    Ok(entries) => {
                         log::info!(
                             "Found {} servers from {} CLI",
-                            names.len(),
+                            entries.len(),
                             def.display_name
                         );
-                        for name in names {
+                        for entry in entries {
                             servers.push(ConfiguredServer {
                                 tool_id: def.id.to_string(),
                                 tool_short_name: def.short_name.to_string(),
-                                server_name: name,
-                                config_json: None,
+                                server_name: entry.name,
+                                config_json: entry.config_json,
                                 is_cli_only: true,
                             });
                         }
@@ -76,13 +76,15 @@ pub fn read_all_configured_servers() -> Vec<ConfiguredServer> {
     servers
 }
 
-/// Parse server names from `claude mcp list` output.
-fn read_cli_servers(cmd: &str) -> Result<Vec<String>, String> {
-    // Find the binary in common locations since GUI apps have limited PATH
-    let bin = find_cli_binary(cmd).ok_or("CLI not found")?;
+/// Result from CLI server scan: name + optional config JSON.
+struct CliServerEntry {
+    name: String,
+    config_json: Option<String>,
+}
 
-    // Build a PATH that includes common user binary locations
-    // since macOS GUI apps inherit a minimal environment from launchd
+/// Build an enriched environment for CLI subprocesses.
+/// macOS GUI apps inherit minimal PATH from launchd.
+pub fn build_cli_env() -> (String, Option<std::path::PathBuf>) {
     let mut path_parts: Vec<String> = Vec::new();
     if let Some(home) = dirs::home_dir() {
         path_parts.push(home.join(".local/bin").to_string_lossy().to_string());
@@ -96,52 +98,69 @@ fn read_cli_servers(cmd: &str) -> Result<Vec<String>, String> {
     if let Ok(existing) = std::env::var("PATH") {
         path_parts.push(existing);
     }
-    let full_path = path_parts.join(":");
+    (path_parts.join(":"), dirs::home_dir())
+}
 
-    // Use a child process with timeout since `claude mcp list` does health checks
-    let mut cmd_builder = std::process::Command::new(&bin);
+/// Run a CLI command with timeout and enriched environment.
+fn run_cli_with_timeout(
+    bin: &std::path::Path,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    let (full_path, home) = build_cli_env();
+    let cmd_name = bin.file_name().unwrap_or_default().to_string_lossy();
+
+    let mut cmd_builder = std::process::Command::new(bin);
     cmd_builder
-        .args(["mcp", "list"])
+        .args(args)
         .env("PATH", &full_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    // Ensure HOME is set (macOS GUI apps may not have it)
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = home {
         cmd_builder.env("HOME", home);
     }
 
     let mut child = cmd_builder
         .spawn()
-        .map_err(|e| format!("Failed to spawn {} mcp list: {}", cmd, e))?;
+        .map_err(|e| format!("Failed to spawn {}: {}", cmd_name, e))?;
 
-    // Wait up to 30 seconds for the command to complete
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(30);
+    let timeout = std::time::Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
-                    return Err(format!("{} mcp list timed out after 30s", cmd));
+                    return Err(format!("{} timed out after {}s", cmd_name, timeout_secs));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Err(e) => return Err(format!("Error waiting for {} mcp list: {}", cmd, e)),
+            Err(e) => return Err(format!("Error waiting for {}: {}", cmd_name, e)),
         }
     }
 
-    let output = child
+    child
         .wait_with_output()
-        .map_err(|e| format!("Failed to read output from {} mcp list: {}", cmd, e))?;
+        .map_err(|e| format!("Failed to read output from {}: {}", cmd_name, e))
+}
 
-    // Parse both stdout and stderr since some output may go to either
+/// Parse servers from `claude mcp list` text output.
+fn read_cli_servers(cmd: &str) -> Result<Vec<CliServerEntry>, String> {
+    let bin = find_cli_binary(cmd).ok_or("CLI not found")?;
+    read_cli_servers_text(&bin, cmd)
+}
+
+/// Parse `claude mcp list` text output, extracting names and URLs.
+fn read_cli_servers_text(bin: &std::path::Path, cmd: &str) -> Result<Vec<CliServerEntry>, String> {
+    let output = run_cli_with_timeout(bin, &["mcp", "list"], 30)?;
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}\n{}", stdout, stderr);
 
-    let mut names = Vec::new();
+    let mut entries = Vec::new();
     for line in combined.lines() {
         let line = line.trim();
         if line.is_empty()
@@ -151,17 +170,153 @@ fn read_cli_servers(cmd: &str) -> Result<Vec<String>, String> {
         {
             continue;
         }
-        // Format: "server_name: details..." — the name is everything before the first colon
-        // but names themselves can contain colons (e.g. "plugin:sentry:sentry")
-        // The pattern is: name + ": " + url_or_details
+        // Format: "server_name: https://url (HTTP) - status"
+        // or:     "server_name: https://url - status"
         if let Some(idx) = line.find(": ") {
             let name = line[..idx].trim();
-            if !name.is_empty() {
-                names.push(name.to_string());
+            if name.is_empty() {
+                continue;
+            }
+            let rest = line[idx + 2..].trim();
+            // Try to extract URL from the rest
+            // The rest looks like: "https://url (HTTP) - status" or "https://url - status"
+            let config_json = if let Some(url) = extract_url_from_list_line(rest) {
+                // Build a minimal config JSON for HTTP servers
+                let mut obj = serde_json::Map::new();
+                obj.insert("url".to_string(), JsonValue::String(url));
+                serde_json::to_string(&JsonValue::Object(obj)).ok()
+            } else {
+                None
+            };
+            entries.push(CliServerEntry {
+                name: name.to_string(),
+                config_json,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+/// Extract a URL from `claude mcp list` line remainder.
+/// Input like: "https://url (HTTP) - status" or "https://url - status"
+fn extract_url_from_list_line(rest: &str) -> Option<String> {
+    // URL is the first token, ends at space or end of string
+    let url_end = rest.find(' ').unwrap_or(rest.len());
+    let url = &rest[..url_end];
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Some(url.to_string())
+    } else {
+        None
+    }
+}
+
+/// Fetch config JSON for a single CLI server on demand.
+/// Parses the text output of `claude mcp get <name>`.
+pub fn fetch_cli_server_config(cmd: &str, server_name: &str) -> Result<String, String> {
+    let bin = find_cli_binary(cmd).ok_or("CLI not found")?;
+    let output = run_cli_with_timeout(&bin, &["mcp", "get", server_name], 15)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to get config for {}: {}", server_name, stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse text output like:
+    //   server_name:
+    //     Scope: User config (...)
+    //     Type: http
+    //     URL: https://example.com/mcp
+    //     Command: npx
+    //     Args: -y @org/pkg
+    //     Env: KEY=value, KEY2=value2
+    parse_cli_get_output(&stdout)
+}
+
+/// Parse the text output of `claude mcp get` into a JSON config string.
+fn parse_cli_get_output(output: &str) -> Result<String, String> {
+    let mut server_type: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut command: Option<String> = None;
+    let mut args_str: Option<String> = None;
+    let mut env_str: Option<String> = None;
+    let mut headers: Vec<(String, String)> = Vec::new();
+
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("Type: ") {
+            server_type = Some(val.trim().to_lowercase());
+        } else if let Some(val) = line.strip_prefix("URL: ") {
+            url = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("Command: ") {
+            command = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("Args: ") {
+            args_str = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("Env: ") {
+            env_str = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("Header: ") {
+            // Format: "Key: Value"
+            if let Some(colon_idx) = val.find(": ") {
+                headers.push((
+                    val[..colon_idx].trim().to_string(),
+                    val[colon_idx + 2..].trim().to_string(),
+                ));
             }
         }
     }
-    Ok(names)
+
+    let mut obj = serde_json::Map::new();
+
+    match server_type.as_deref() {
+        Some("http") | Some("sse") => {
+            if let Some(u) = url {
+                obj.insert("url".to_string(), JsonValue::String(u));
+            }
+            if !headers.is_empty() {
+                let mut h = serde_json::Map::new();
+                for (k, v) in headers {
+                    h.insert(k, JsonValue::String(v));
+                }
+                obj.insert("headers".to_string(), JsonValue::Object(h));
+            }
+        }
+        Some("stdio") | _ => {
+            if let Some(cmd) = command {
+                obj.insert("command".to_string(), JsonValue::String(cmd));
+            }
+            if let Some(args) = args_str {
+                let args_vec: Vec<JsonValue> = args
+                    .split_whitespace()
+                    .map(|a| JsonValue::String(a.to_string()))
+                    .collect();
+                obj.insert("args".to_string(), JsonValue::Array(args_vec));
+            }
+        }
+    }
+
+    // Parse env vars (format: "KEY=value, KEY2=value2")
+    if let Some(env) = env_str {
+        let mut env_obj = serde_json::Map::new();
+        for pair in env.split(", ") {
+            if let Some(eq_idx) = pair.find('=') {
+                env_obj.insert(
+                    pair[..eq_idx].to_string(),
+                    JsonValue::String(pair[eq_idx + 1..].to_string()),
+                );
+            }
+        }
+        if !env_obj.is_empty() {
+            obj.insert("env".to_string(), JsonValue::Object(env_obj));
+        }
+    }
+
+    if obj.is_empty() {
+        return Err("Could not parse any config fields".to_string());
+    }
+
+    serde_json::to_string(&JsonValue::Object(obj))
+        .map_err(|e| format!("Failed to serialize config: {}", e))
 }
 
 pub fn find_cli_binary(cmd: &str) -> Option<std::path::PathBuf> {
