@@ -70,6 +70,12 @@ interface AppState {
   setInstallTarget: (server: ScoreboardServer | null) => void;
   fetchInstallConfig: (serverId: string) => Promise<void>;
 
+  // Pending restarts
+  pendingRestarts: Set<string>;
+  addPendingRestart: (toolId: string) => void;
+  clearPendingRestart: (toolId: string) => void;
+  restartTool: (toolId: string) => Promise<void>;
+
   // Notifications
   toast: { message: string; type: "success" | "error" } | null;
   showToast: (message: string, type: "success" | "error") => void;
@@ -124,6 +130,7 @@ export const useStore = create<AppState>((set, get) => ({
       const result = await tauri.disableServer(toolId, serverName, configJson);
       if (result.success) {
         get().showToast(result.message, "success");
+        if (result.needs_restart) get().addPendingRestart(toolId);
         await get().refreshConfiguredServers();
         await get().refreshDisabledServers();
       } else {
@@ -138,6 +145,7 @@ export const useStore = create<AppState>((set, get) => ({
       const result = await tauri.enableServer(toolId, serverName);
       if (result.success) {
         get().showToast(result.message, "success");
+        if (result.needs_restart) get().addPendingRestart(toolId);
         await get().refreshConfiguredServers();
         await get().refreshDisabledServers();
       } else {
@@ -272,6 +280,32 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       console.error("Failed to fetch install config:", e);
       set({ installConfig: null, installConfigLoading: false });
+    }
+  },
+
+  // Pending restarts
+  pendingRestarts: new Set<string>(),
+  addPendingRestart: (toolId) => {
+    set((state) => {
+      const next = new Set(state.pendingRestarts);
+      next.add(toolId);
+      return { pendingRestarts: next };
+    });
+  },
+  clearPendingRestart: (toolId) => {
+    set((state) => {
+      const next = new Set(state.pendingRestarts);
+      next.delete(toolId);
+      return { pendingRestarts: next };
+    });
+  },
+  restartTool: async (toolId) => {
+    try {
+      const msg = await tauri.restartTool(toolId);
+      get().showToast(msg, "success");
+      get().clearPendingRestart(toolId);
+    } catch (e) {
+      get().showToast(`Restart failed: ${e}`, "error");
     }
   },
 

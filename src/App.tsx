@@ -9,6 +9,7 @@ import InstallDialog from "./components/InstallDialog";
 import AddServer from "./components/AddServer";
 import About from "./components/About";
 import Toast from "./components/Toast";
+import RestartBanner from "./components/RestartBanner";
 import type { DeepLinkAction } from "./lib/types";
 
 export default function App() {
@@ -23,9 +24,8 @@ export default function App() {
     checkPendingDeepLink();
 
     // Listen for deep link events from Tauri
-    const unlisten = listen<DeepLinkAction>("deep-link", (event) => {
+    const unlisten = listen<DeepLinkAction>("deep-link-action", (event) => {
       setPendingDeepLink(event.payload);
-      setView("install");
     });
 
     return () => {
@@ -37,6 +37,7 @@ export default function App() {
     <div className="flex h-screen overflow-hidden">
       <Navigation />
       <main className="flex-1 overflow-y-auto p-6">
+        <RestartBanner />
         {view === "dashboard" && <Dashboard />}
         {view === "search" && <Search />}
         {view === "favorites" && <Favorites />}

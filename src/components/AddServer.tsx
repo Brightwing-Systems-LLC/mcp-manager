@@ -4,7 +4,7 @@ import { installServer } from "../lib/tauri";
 import type { ServerInstallConfig } from "../lib/types";
 
 export default function AddServer() {
-  const { tools, refreshConfiguredServers, refreshDisabledServers, showToast } =
+  const { tools, refreshConfiguredServers, refreshDisabledServers, showToast, addPendingRestart } =
     useStore();
 
   const [configKey, setConfigKey] = useState("");
@@ -89,6 +89,7 @@ export default function AddServer() {
         const result = await installServer(toolId, serverConfig);
         if (result.success) {
           successCount++;
+          if (result.needs_restart) addPendingRestart(toolId);
         } else {
           lastError = result.message;
         }
@@ -342,8 +343,8 @@ export default function AddServer() {
         </button>
 
         <p className="text-xs text-brightwing-gray-500">
-          Most tools need a restart after config changes to activate new MCP
-          servers.
+          Changes will appear in the restart banner above when tools need
+          restarting.
         </p>
       </div>
     </div>

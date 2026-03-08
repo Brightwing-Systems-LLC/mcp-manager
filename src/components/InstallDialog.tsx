@@ -16,6 +16,7 @@ export default function InstallDialog() {
     setPendingDeepLink,
     refreshInstallations,
     showToast,
+    addPendingRestart,
   } = useStore();
 
   const [installing, setInstalling] = useState<string | null>(null);
@@ -149,6 +150,7 @@ export default function InstallDialog() {
       const result = await installServer(toolId, installConfig);
       if (result.success) {
         showToast(result.message, "success");
+        if (result.needs_restart) addPendingRestart(toolId);
         await refreshInstallations();
       } else {
         showToast(result.message, "error");
@@ -171,6 +173,7 @@ export default function InstallDialog() {
       );
       if (result.success) {
         showToast(result.message, "success");
+        if (result.needs_restart) addPendingRestart(toolId);
         await refreshInstallations();
       } else {
         showToast(result.message, "error");
@@ -355,8 +358,8 @@ export default function InstallDialog() {
       )}
 
       <p className="text-xs text-brightwing-gray-500 mt-4">
-        Most tools need a restart after config changes to activate new MCP
-        servers.
+        Changes will appear in the restart banner above when tools need
+        restarting.
       </p>
     </div>
   );
