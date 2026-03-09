@@ -27,6 +27,19 @@ jobs:
       - name: TypeScript check
         run: npx tsc --noEmit
 
+      - name: Create sidecar placeholders
+        run: |
+          TARGET=$(rustc -vV | grep '^host:' | awk '{print $2}')
+          mkdir -p src-tauri/binaries
+          for name in brightwing-authd brightwing-proxy bw; do
+            touch "src-tauri/binaries/${name}-${TARGET}"
+            chmod +x "src-tauri/binaries/${name}-${TARGET}"
+          done
+
       - name: Rust check
         working-directory: src-tauri
         run: cargo check
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test
