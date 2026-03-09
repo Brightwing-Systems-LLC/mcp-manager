@@ -37,7 +37,10 @@ To ship a new version:
    - `src/components/Navigation.tsx` → `APP_VERSION`
    - `src/components/About.tsx` → version string
 
-2. **Commit** the version bump
+2. **Commit** the version bump with `[skip ci]` in the message to avoid a redundant CI run:
+   ```bash
+   git commit -m "Bump to vX.Y.Z [skip ci]"
+   ```
 
 3. **Tag and push**:
    ```bash
