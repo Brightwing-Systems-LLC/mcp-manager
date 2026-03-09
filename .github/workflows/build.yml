@@ -93,7 +93,6 @@ jobs:
             | macOS (Apple Silicon) | `Brightwing.MCP.Manager_x.x.x_aarch64.dmg` |
             | macOS (Intel) | `Brightwing.MCP.Manager_x.x.x_x64.dmg` |
             | Windows (64-bit) | `Brightwing.MCP.Manager_x.x.x_x64-setup.exe` |
-            | Windows (MSI) | `Brightwing.MCP.Manager_x.x.x_x64_en-US.msi` |
             | Linux (Debian/Ubuntu) | `brightwing-mcp-manager_x.x.x_amd64.deb` |
             | Linux (AppImage) | `brightwing-mcp-manager_x.x.x_amd64.AppImage` |
 
