@@ -33,6 +33,14 @@ Built with [Tauri v2](https://v2.tauri.app/) (Rust + React + TypeScript).
 
 Claude Desktop's OAuth-based cloud connectors (Google Calendar, Gmail, Slack, etc.) are managed by Anthropic's servers and cannot be controlled externally. Local MCP servers added to `claude_desktop_config.json` work normally.
 
+## Platform Support
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| **macOS** (Apple Silicon & Intel) | Beta | Primary development platform. Fully functional. |
+| **Linux** (x64) | Beta | Fully functional. AppImage and .deb packages available. |
+| **Windows** (x64) | **Alpha** | **Expect bugs.** The Windows build is untested on real hardware and should be considered experimental. Core UI and config management should work, but the auth daemon, proxy, and CLI shim have not been validated on Windows. If you encounter issues, please [file a bug](https://github.com/Brightwing-Systems-LLC/mcp-manager/issues). |
+
 ## Download
 
 Pre-built binaries are available on the [Releases](https://github.com/Brightwing-Systems-LLC/mcp-manager/releases) page.
@@ -41,10 +49,9 @@ Pre-built binaries are available on the [Releases](https://github.com/Brightwing
 |----------|------|
 | macOS (Apple Silicon) | `Brightwing.MCP.Manager_x.x.x_aarch64.dmg` |
 | macOS (Intel) | `Brightwing.MCP.Manager_x.x.x_x64.dmg` |
-| Windows (64-bit) | `Brightwing.MCP.Manager_x.x.x_x64-setup.exe` |
-| Windows (MSI) | `Brightwing.MCP.Manager_x.x.x_x64_en-US.msi` |
-| Linux (Debian/Ubuntu) | `brightwing-mcp-manager_x.x.x_amd64.deb` |
-| Linux (AppImage) | `brightwing-mcp-manager_x.x.x_amd64.AppImage` |
+| Windows (64-bit) | `Brightwing.MCP.Manager_x.x.x_x64-setup-ALPHA.exe` |
+| Linux (Debian/Ubuntu) | `Brightwing.MCP.Manager_x.x.x_amd64.deb` |
+| Linux (AppImage) | `Brightwing.MCP.Manager_x.x.x_amd64.AppImage` |
 
 ### Unsigned Build Workarounds
 
@@ -147,11 +154,14 @@ This is used by the [MCP Scoreboard](https://mcpscoreboard.com) for one-click "I
 
 ## Roadmap
 
+- [x] Auto-update via Tauri updater plugin
+- [ ] Central auth proxy — authenticate once, use everywhere
+- [ ] OAuth flow management in-app
+- [ ] CLI shim (`bw`) for terminal-native agents
+- [ ] Tool filtering for context-efficient MCP access
 - [ ] Encrypted API key vault (Stronghold)
-- [ ] OAuth detection with per-tool auth instructions
-- [ ] Vault export/import for backup and machine migration
 - [ ] Code signing for macOS, Windows, and Linux
-- [ ] Auto-update via Tauri updater plugin
+- [ ] Windows platform hardening (currently alpha)
 
 ## License
 

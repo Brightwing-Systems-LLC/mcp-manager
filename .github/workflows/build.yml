@@ -88,13 +88,17 @@ jobs:
           releaseBody: |
             ## Download
 
-            | Platform | File |
-            |----------|------|
-            | macOS (Apple Silicon) | `Brightwing.MCP.Manager_x.x.x_aarch64.dmg` |
-            | macOS (Intel) | `Brightwing.MCP.Manager_x.x.x_x64.dmg` |
-            | Windows (64-bit) | `Brightwing.MCP.Manager_x.x.x_x64-setup.exe` |
-            | Linux (Debian/Ubuntu) | `brightwing-mcp-manager_x.x.x_amd64.deb` |
-            | Linux (AppImage) | `brightwing-mcp-manager_x.x.x_amd64.AppImage` |
+            | Platform | File | Status |
+            |----------|------|--------|
+            | macOS (Apple Silicon) | `Brightwing.MCP.Manager_x.x.x_aarch64.dmg` | Beta |
+            | macOS (Intel) | `Brightwing.MCP.Manager_x.x.x_x64.dmg` | Beta |
+            | Windows (64-bit) | `Brightwing.MCP.Manager_x.x.x_x64-setup-ALPHA.exe` | **Alpha — expect bugs** |
+            | Linux (Debian/Ubuntu) | `Brightwing.MCP.Manager_x.x.x_amd64.deb` | Beta |
+            | Linux (AppImage) | `Brightwing.MCP.Manager_x.x.x_amd64.AppImage` | Beta |
+
+            ### Windows Alpha Notice
+
+            The Windows build compiles and installs but has **not been tested on real hardware**. The core UI and config management should work, but the auth daemon, proxy, and CLI shim are unverified on Windows. Please [report issues](https://github.com/Brightwing-Systems-LLC/mcp-manager/issues) if you encounter problems.
 
             ### Unsigned Build Workarounds
 
@@ -112,3 +116,21 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }}
+
+      - name: Rename Windows installer to include ALPHA tag
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${{ github.ref_name }}
+          VERSION=${TAG#v}
+          OLD_NAME="Brightwing.MCP.Manager_${VERSION}_x64-setup.exe"
+          NEW_NAME="Brightwing.MCP.Manager_${VERSION}_x64-setup-ALPHA.exe"
+          # Download, rename, re-upload
+          gh release download "$TAG" --pattern "$OLD_NAME" --dir /tmp --clobber || true
+          if [ -f "/tmp/$OLD_NAME" ]; then
+            mv "/tmp/$OLD_NAME" "/tmp/$NEW_NAME"
+            gh release upload "$TAG" "/tmp/$NEW_NAME" --clobber
+            gh release delete-asset "$TAG" "$OLD_NAME" --yes
+          fi
