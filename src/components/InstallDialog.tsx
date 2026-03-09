@@ -183,6 +183,7 @@ export default function InstallDialog() {
           args: config.args,
           env,
           transport: config.transport,
+          url: config.remote_url || "",
         };
 
         const result = await installServer(toolId, installConfig);

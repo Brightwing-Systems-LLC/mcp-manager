@@ -9,6 +9,9 @@ import type {
   View,
   ScoreboardServer,
   ApiInstallConfig,
+  ProxyServer,
+  ToolFilterEntry,
+  DaemonStatusInfo,
 } from "./lib/types";
 import * as tauri from "./lib/tauri";
 
@@ -75,6 +78,27 @@ interface AppState {
   addPendingRestart: (toolId: string) => void;
   clearPendingRestart: (toolId: string) => void;
   restartTool: (toolId: string) => Promise<void>;
+
+  // Proxy servers
+  proxyServers: ProxyServer[];
+  proxyServersLoading: boolean;
+  refreshProxyServers: () => Promise<void>;
+
+  // Tool filter (per-server, loaded on demand)
+  activeFilterServerId: string | null;
+  activeFilter: ToolFilterEntry[];
+  activeFilterLoading: boolean;
+  loadToolFilter: (serverId: string) => Promise<void>;
+  toggleToolFilter: (serverId: string, toolName: string, enabled: boolean, tokenEstimate: number) => Promise<void>;
+
+  // Daemon lifecycle
+  daemonStatus: DaemonStatusInfo | null;
+  daemonLoading: boolean;
+  autostart: boolean;
+  refreshDaemonStatus: () => Promise<void>;
+  startDaemon: () => Promise<void>;
+  stopDaemon: () => Promise<void>;
+  toggleAutostart: () => Promise<void>;
 
   // Notifications
   toast: { message: string; type: "success" | "error" } | null;
@@ -306,6 +330,97 @@ export const useStore = create<AppState>((set, get) => ({
       get().clearPendingRestart(toolId);
     } catch (e) {
       get().showToast(`Restart failed: ${e}`, "error");
+    }
+  },
+
+  // Proxy servers
+  proxyServers: [],
+  proxyServersLoading: false,
+  refreshProxyServers: async () => {
+    set({ proxyServersLoading: true });
+    try {
+      const servers = await tauri.getProxyServers();
+      set({ proxyServers: servers, proxyServersLoading: false });
+    } catch (e) {
+      console.error("Failed to get proxy servers:", e);
+      set({ proxyServersLoading: false });
+    }
+  },
+
+  // Tool filter
+  activeFilterServerId: null,
+  activeFilter: [],
+  activeFilterLoading: false,
+  loadToolFilter: async (serverId: string) => {
+    set({ activeFilterServerId: serverId, activeFilterLoading: true });
+    try {
+      const filter = await tauri.getToolFilter(serverId);
+      set({ activeFilter: filter, activeFilterLoading: false });
+    } catch (e) {
+      console.error("Failed to load tool filter:", e);
+      set({ activeFilter: [], activeFilterLoading: false });
+    }
+  },
+  toggleToolFilter: async (serverId: string, toolName: string, enabled: boolean, tokenEstimate: number) => {
+    try {
+      await tauri.setToolFilter(serverId, toolName, enabled, tokenEstimate);
+      // Optimistic update
+      set((state) => ({
+        activeFilter: state.activeFilter.map((t) =>
+          t.tool_name === toolName ? { ...t, enabled } : t
+        ),
+      }));
+    } catch (e) {
+      get().showToast(`Failed to update filter: ${e}`, "error");
+    }
+  },
+
+  // Daemon lifecycle
+  daemonStatus: null,
+  daemonLoading: false,
+  autostart: false,
+  refreshDaemonStatus: async () => {
+    set({ daemonLoading: true });
+    try {
+      const [status, autostart] = await Promise.all([
+        tauri.daemonStatus(),
+        tauri.isAutostartEnabled(),
+      ]);
+      set({ daemonStatus: status, autostart, daemonLoading: false });
+    } catch (e) {
+      console.error("Failed to get daemon status:", e);
+      set({ daemonLoading: false });
+    }
+  },
+  startDaemon: async () => {
+    try {
+      const status = await tauri.startDaemon();
+      set({ daemonStatus: status });
+      get().showToast("Daemon started", "success");
+    } catch (e) {
+      get().showToast(`Failed to start daemon: ${e}`, "error");
+    }
+  },
+  stopDaemon: async () => {
+    try {
+      const status = await tauri.stopDaemon();
+      set({ daemonStatus: status });
+      get().showToast("Daemon stopped", "success");
+    } catch (e) {
+      get().showToast(`Failed to stop daemon: ${e}`, "error");
+    }
+  },
+  toggleAutostart: async () => {
+    try {
+      const newValue = !get().autostart;
+      await tauri.setAutostart(newValue);
+      set({ autostart: newValue });
+      get().showToast(
+        newValue ? "Auto-start enabled" : "Auto-start disabled",
+        "success"
+      );
+    } catch (e) {
+      get().showToast(`Failed to toggle auto-start: ${e}`, "error");
     }
   },
 

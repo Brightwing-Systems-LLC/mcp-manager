@@ -1,11 +1,12 @@
 mod config;
-mod db;
+pub mod db;
 mod deeplink;
+pub mod oauth;
 mod tools;
 
 use config::reader::ConfiguredServer;
 use config::writer::{InstallResult, ServerInstallConfig};
-use db::queries::{DisabledServer, Favorite, Installation};
+use db::queries::{DisabledServer, Favorite, Installation, ProxyServer, ProxyApiKey, ToolFilterEntry, CachedTool};
 use db::Database;
 use deeplink::{DeepLinkAction, DeepLinkState};
 use serde_json::Value as JsonValue;
@@ -359,6 +360,640 @@ async fn restart_tool(tool_id: String) -> Result<String, String> {
     }
 }
 
+// --- Proxy Server Management ---
+
+#[tauri::command]
+fn register_proxy_server(
+    server_id: String,
+    display_name: String,
+    auth_type: String,
+    upstream_url: Option<String>,
+    upstream_command: Option<String>,
+    upstream_args: Option<String>,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    db.register_proxy_server(
+        &server_id,
+        &display_name,
+        &auth_type,
+        upstream_url.as_deref(),
+        upstream_command.as_deref(),
+        upstream_args.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn unregister_proxy_server(
+    server_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    db.unregister_proxy_server(&server_id)
+}
+
+#[tauri::command]
+fn get_proxy_servers(
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<ProxyServer>, String> {
+    db.get_proxy_servers()
+}
+
+#[tauri::command]
+fn get_proxy_server(
+    server_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<Option<ProxyServer>, String> {
+    db.get_proxy_server(&server_id)
+}
+
+#[tauri::command]
+fn install_proxy_to_tool(
+    tool_id: String,
+    server_id: String,
+    config_key: String,
+    db: tauri::State<'_, Database>,
+) -> Result<InstallResult, String> {
+    let _ = config::backup::backup_config(&tool_id);
+    let result = config::writer::install_proxy_server(&tool_id, &server_id, &config_key)?;
+    if result.success {
+        db.record_proxy_install(&server_id, &tool_id)?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn uninstall_proxy_from_tool(
+    tool_id: String,
+    server_id: String,
+    config_key: String,
+    db: tauri::State<'_, Database>,
+) -> Result<InstallResult, String> {
+    let result = config::writer::uninstall_server(&tool_id, &config_key)?;
+    if result.success {
+        db.remove_proxy_install(&server_id, &tool_id)?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn get_proxy_installs(
+    server_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<String>, String> {
+    db.get_proxy_installs(&server_id)
+}
+
+#[tauri::command]
+fn get_tool_filter(
+    server_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<ToolFilterEntry>, String> {
+    db.get_tool_filter(&server_id)
+}
+
+#[tauri::command]
+fn set_tool_filter(
+    server_id: String,
+    tool_name: String,
+    enabled: bool,
+    token_estimate: u32,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    db.set_tool_filter(&server_id, &tool_name, enabled, token_estimate)
+}
+
+#[tauri::command]
+fn set_tool_filter_bulk(
+    server_id: String,
+    enabled_tools: Vec<String>,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    db.set_tool_filter_bulk(&server_id, &enabled_tools)
+}
+
+#[tauri::command]
+fn get_cached_tools(
+    server_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<CachedTool>, String> {
+    db.get_cached_tools(&server_id)
+}
+
+#[tauri::command]
+fn cache_tool_schema(
+    server_id: String,
+    tool_name: String,
+    description: String,
+    input_schema: String,
+    token_estimate: u32,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    db.cache_tool_schema(&server_id, &tool_name, &description, &input_schema, token_estimate)
+}
+
+// --- OAuth Flow ---
+
+#[tauri::command]
+async fn start_oauth_flow(
+    server_id: String,
+    server_url: String,
+    client_id: Option<String>,
+    db: tauri::State<'_, Database>,
+    flow_states: tauri::State<'_, oauth::flow::OAuthFlowStates>,
+) -> Result<oauth::types::OAuthFlowInfo, String> {
+    oauth::flow::start_flow(
+        &server_id,
+        &server_url,
+        client_id.as_deref(),
+        &db,
+        &flow_states,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn complete_oauth_callback(
+    state: String,
+    code: Option<String>,
+    flow_states: tauri::State<'_, oauth::flow::OAuthFlowStates>,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    oauth::flow::complete_flow(&state, code.as_deref(), &flow_states, &db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn discover_oauth_server(
+    server_url: String,
+) -> Result<oauth::types::OAuthServerMetadata, String> {
+    oauth::discovery::discover_oauth_metadata(&server_url)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_oauth_status(
+    server_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<oauth::types::OAuthStatus, String> {
+    Ok(oauth::flow::get_status(&server_id, &db))
+}
+
+#[tauri::command]
+fn disconnect_oauth(
+    server_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    oauth::flow::disconnect(&server_id, &db).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn refresh_oauth_token(
+    server_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    let token_json = db
+        .get_oauth_token_set(&server_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("No OAuth tokens for {}", server_id))?;
+
+    let token_set: oauth::types::OAuthTokenSet =
+        serde_json::from_str(&token_json).map_err(|e| format!("Bad token data: {}", e))?;
+
+    let new_set = oauth::refresh::refresh_token(&token_set)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let new_json = serde_json::to_string(&new_set).map_err(|e| e.to_string())?;
+    db.store_oauth_token_set(&server_id, &new_json)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+// --- API Key Management ---
+
+#[tauri::command]
+fn store_api_key(
+    server_id: String,
+    env: HashMap<String, String>,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    db.store_api_key(&server_id, &env)
+}
+
+#[tauri::command]
+fn get_api_key(
+    server_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<Option<ProxyApiKey>, String> {
+    db.get_api_key(&server_id)
+}
+
+#[tauri::command]
+fn delete_api_key(
+    server_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    db.delete_api_key(&server_id)
+}
+
+#[tauri::command]
+fn get_all_api_keys(
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<ProxyApiKey>, String> {
+    db.get_all_api_keys()
+}
+
+// --- Daemon Lifecycle ---
+
+/// Status info returned by daemon_status.
+#[derive(serde::Serialize, Clone)]
+struct DaemonStatusInfo {
+    running: bool,
+    pid: Option<u32>,
+    uptime_secs: Option<u64>,
+    daemon_version: Option<String>,
+}
+
+/// Get the data directory used by the daemon.
+fn daemon_data_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("Library/Application Support/com.brightwing.mcp-manager")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"))
+            .join("Brightwing")
+    }
+}
+
+fn daemon_socket_path() -> std::path::PathBuf {
+    daemon_data_dir().join("authd.sock")
+}
+
+fn daemon_pid_path() -> std::path::PathBuf {
+    daemon_data_dir().join("authd.pid")
+}
+
+/// Try to ping the daemon via IPC and get uptime info.
+async fn ping_daemon() -> Option<(u64, String)> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use proxy_common::ipc::{IpcRequest, IpcResponse, encode_message, decode_message};
+
+    let socket = daemon_socket_path();
+    let stream = tokio::net::UnixStream::connect(&socket).await.ok()?;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let ping = encode_message(&IpcRequest::Ping).ok()?;
+    writer.write_all(&ping).await.ok()?;
+
+    let line = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        lines.next_line(),
+    ).await.ok()?.ok()??;
+
+    let resp: IpcResponse = decode_message(line.as_bytes()).ok()?;
+    match resp {
+        IpcResponse::Pong { uptime_secs, daemon_version } => Some((uptime_secs, daemon_version)),
+        _ => None,
+    }
+}
+
+/// Read PID from PID file if process is alive.
+fn read_daemon_pid() -> Option<u32> {
+    let pid_path = daemon_pid_path();
+    let contents = std::fs::read_to_string(&pid_path).ok()?;
+    let pid = contents.trim().parse::<u32>().ok()?;
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        if result == 0 { Some(pid) } else { None }
+    }
+    #[cfg(not(unix))]
+    {
+        Some(pid)
+    }
+}
+
+#[tauri::command]
+async fn daemon_status() -> Result<DaemonStatusInfo, String> {
+    // First try PID file
+    let pid = read_daemon_pid();
+    if pid.is_none() {
+        return Ok(DaemonStatusInfo {
+            running: false,
+            pid: None,
+            uptime_secs: None,
+            daemon_version: None,
+        });
+    }
+
+    // Try to ping for uptime
+    match ping_daemon().await {
+        Some((uptime, version)) => Ok(DaemonStatusInfo {
+            running: true,
+            pid,
+            uptime_secs: Some(uptime),
+            daemon_version: Some(version),
+        }),
+        None => Ok(DaemonStatusInfo {
+            running: pid.is_some(),
+            pid,
+            uptime_secs: None,
+            daemon_version: None,
+        }),
+    }
+}
+
+#[tauri::command]
+async fn start_daemon(app: tauri::AppHandle) -> Result<DaemonStatusInfo, String> {
+    // Check if already running
+    if read_daemon_pid().is_some() {
+        return daemon_status().await;
+    }
+
+    // Find the daemon binary
+    let binary = find_bundled_binary(&app, "brightwing-authd")
+        .or_else(|| {
+            let install_dir = binaries_install_dir().ok()?;
+            let path = install_dir.join("brightwing-authd");
+            if path.exists() { Some(path) } else { None }
+        })
+        .ok_or("brightwing-authd binary not found")?;
+
+    // Spawn daemon as a detached process
+    std::process::Command::new(&binary)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start daemon: {}", e))?;
+
+    // Wait briefly for it to start up
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    daemon_status().await
+}
+
+#[tauri::command]
+async fn stop_daemon() -> Result<DaemonStatusInfo, String> {
+    let pid = read_daemon_pid();
+    if let Some(pid) = pid {
+        #[cfg(unix)]
+        {
+            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .output();
+        }
+
+        // Wait for cleanup
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    Ok(DaemonStatusInfo {
+        running: false,
+        pid: None,
+        uptime_secs: None,
+        daemon_version: None,
+    })
+}
+
+/// Launchd plist path for macOS auto-start.
+#[cfg(target_os = "macos")]
+fn launchd_plist_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("Library/LaunchAgents/com.brightwing.authd.plist")
+}
+
+#[tauri::command]
+fn is_autostart_enabled() -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(launchd_plist_path().exists())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let path = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            .join("systemd/user/brightwing-authd.service");
+        Ok(path.exists())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Ok(false) // TODO: Windows registry auto-start
+    }
+}
+
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let binary = find_bundled_binary(&app, "brightwing-authd")
+        .or_else(|| {
+            let install_dir = binaries_install_dir().ok()?;
+            let path = install_dir.join("brightwing-authd");
+            if path.exists() { Some(path) } else { None }
+        })
+        .ok_or("brightwing-authd binary not found")?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = launchd_plist_path();
+        if enabled {
+            let plist = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brightwing.authd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>{}/authd.log</string>
+</dict>
+</plist>"#,
+                binary.display(),
+                daemon_data_dir().display(),
+            );
+            if let Some(parent) = plist_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create LaunchAgents dir: {}", e))?;
+            }
+            std::fs::write(&plist_path, plist)
+                .map_err(|e| format!("Failed to write plist: {}", e))?;
+
+            // Load the agent
+            let _ = std::process::Command::new("launchctl")
+                .args(["load", &plist_path.to_string_lossy()])
+                .output();
+        } else {
+            if plist_path.exists() {
+                // Unload first
+                let _ = std::process::Command::new("launchctl")
+                    .args(["unload", &plist_path.to_string_lossy()])
+                    .output();
+                std::fs::remove_file(&plist_path)
+                    .map_err(|e| format!("Failed to remove plist: {}", e))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let service_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            .join("systemd/user");
+        let service_path = service_dir.join("brightwing-authd.service");
+
+        if enabled {
+            let unit = format!(
+                r#"[Unit]
+Description=Brightwing Auth Daemon
+After=default.target
+
+[Service]
+ExecStart={}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"#,
+                binary.display(),
+            );
+            std::fs::create_dir_all(&service_dir)
+                .map_err(|e| format!("Failed to create systemd dir: {}", e))?;
+            std::fs::write(&service_path, unit)
+                .map_err(|e| format!("Failed to write service file: {}", e))?;
+
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "enable", "--now", "brightwing-authd"])
+                .output();
+        } else {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "disable", "--now", "brightwing-authd"])
+                .output();
+            if service_path.exists() {
+                let _ = std::fs::remove_file(&service_path);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (binary, enabled);
+        Err("Auto-start not yet implemented on Windows".to_string())
+    }
+}
+
+// --- Binary Distribution ---
+
+/// Get the path where Brightwing binaries should be installed.
+fn binaries_install_dir() -> Result<std::path::PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    Ok(home.join(".local/bin"))
+}
+
+/// Find a binary in the app's resource directory or next to the app binary.
+fn find_bundled_binary(app: &tauri::AppHandle, name: &str) -> Option<std::path::PathBuf> {
+    // Check next to the app binary first (development builds)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let candidate = exe_dir.join(name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    // Check Tauri resource directory
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let candidate = resource_dir.join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[tauri::command]
+fn distribute_binaries(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let install_dir = binaries_install_dir()?;
+    std::fs::create_dir_all(&install_dir)
+        .map_err(|e| format!("Failed to create {}: {}", install_dir.display(), e))?;
+
+    let binaries = ["brightwing-proxy", "brightwing-authd", "bw"];
+    let mut installed = Vec::new();
+
+    for name in &binaries {
+        if let Some(src) = find_bundled_binary(&app, name) {
+            let dest = install_dir.join(name);
+            std::fs::copy(&src, &dest)
+                .map_err(|e| format!("Failed to copy {} to {}: {}", name, dest.display(), e))?;
+            // Make executable on Unix
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|e| format!("Failed to set permissions on {}: {}", name, e))?;
+            }
+            installed.push(name.to_string());
+        }
+    }
+
+    Ok(installed)
+}
+
+#[tauri::command]
+fn get_binary_versions() -> Result<HashMap<String, String>, String> {
+    let install_dir = binaries_install_dir()?;
+    let mut versions = HashMap::new();
+
+    for name in &["brightwing-proxy", "brightwing-authd", "bw"] {
+        let path = install_dir.join(name);
+        if path.exists() {
+            // Try running --version
+            if let Ok(output) = std::process::Command::new(&path).arg("--version").output() {
+                if output.status.success() {
+                    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    versions.insert(name.to_string(), version);
+                } else {
+                    versions.insert(name.to_string(), "installed".to_string());
+                }
+            } else {
+                versions.insert(name.to_string(), "installed".to_string());
+            }
+        }
+    }
+
+    Ok(versions)
+}
+
 // --- API Proxy (bypasses CORS) ---
 
 const API_BASE: &str = "https://mcpscoreboard.com/api/v1";
@@ -479,6 +1114,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(db)
         .manage(deep_link_state)
+        .manage(oauth::flow::OAuthFlowStates::new())
         .invoke_handler(tauri::generate_handler![
             scan_tools,
             scan_configured_servers,
@@ -502,6 +1138,40 @@ pub fn run() {
             restart_tool,
             fetch_cli_server_config,
             add_server_to_tool,
+            // Proxy server management
+            register_proxy_server,
+            unregister_proxy_server,
+            get_proxy_servers,
+            get_proxy_server,
+            install_proxy_to_tool,
+            uninstall_proxy_from_tool,
+            get_proxy_installs,
+            get_tool_filter,
+            set_tool_filter,
+            set_tool_filter_bulk,
+            get_cached_tools,
+            cache_tool_schema,
+            // OAuth
+            start_oauth_flow,
+            complete_oauth_callback,
+            discover_oauth_server,
+            get_oauth_status,
+            disconnect_oauth,
+            refresh_oauth_token,
+            // API key management
+            store_api_key,
+            get_api_key,
+            delete_api_key,
+            get_all_api_keys,
+            // Binary distribution
+            distribute_binaries,
+            get_binary_versions,
+            // Daemon lifecycle
+            daemon_status,
+            start_daemon,
+            stop_daemon,
+            is_autostart_enabled,
+            set_autostart,
         ])
         .setup(|app| {
             // Handle deep links (open-url event from tauri-plugin-deep-link)

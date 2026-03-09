@@ -35,6 +35,7 @@ export interface ServerInstallConfig {
   args: string[];
   env: Record<string, string>;
   transport: string;
+  url: string;
 }
 
 export interface InstallResult {
@@ -117,4 +118,59 @@ export interface ApiInstallConfig {
   verified: boolean;
 }
 
-export type View = "dashboard" | "search" | "favorites" | "install" | "add-server" | "about";
+export type View = "dashboard" | "search" | "favorites" | "install" | "add-server" | "proxy" | "api-keys" | "about";
+
+// --- Proxy Server Types ---
+
+export interface ProxyServer {
+  server_id: string;
+  display_name: string;
+  auth_type: "oauth" | "api_key" | "none";
+  upstream_url: string | null;
+  upstream_command: string | null;
+  upstream_args: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ToolFilterEntry {
+  tool_name: string;
+  enabled: boolean;
+  token_estimate: number;
+}
+
+export interface CachedTool {
+  tool_name: string;
+  description: string;
+  input_schema: string;
+  token_estimate: number;
+  cached_at: string;
+}
+
+export interface ProxyApiKey {
+  server_id: string;
+  env: Record<string, string>;
+  updated_at: string;
+}
+
+// --- OAuth Types ---
+
+export interface OAuthFlowInfo {
+  auth_url: string;
+  state: string;
+}
+
+export interface OAuthStatus {
+  status: "disconnected" | "connected" | "expired" | "error";
+  expires_at: string | null;
+  error_message: string | null;
+}
+
+// --- Daemon Types ---
+
+export interface DaemonStatusInfo {
+  running: boolean;
+  pid: number | null;
+  uptime_secs: number | null;
+  daemon_version: string | null;
+}

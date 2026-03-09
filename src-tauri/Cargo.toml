@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/proxy-common"]
+
 [package]
 name = "brightwing-mcp-manager"
 version = "0.2.0"
@@ -8,6 +11,18 @@ edition = "2021"
 [lib]
 name = "brightwing_mcp_manager_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "brightwing-proxy"
+path = "src/bin/brightwing_proxy.rs"
+
+[[bin]]
+name = "brightwing-authd"
+path = "src/bin/brightwing_authd.rs"
+
+[[bin]]
+name = "bw"
+path = "src/bin/bw.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -31,3 +46,9 @@ chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 urlencoding = "2"
+proxy-common = { path = "crates/proxy-common" }
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+libc = "0.2"

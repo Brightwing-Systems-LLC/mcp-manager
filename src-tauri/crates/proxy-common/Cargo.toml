@@ -1,0 +1,22 @@
+[package]
+name = "proxy-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared types for Brightwing proxy, daemon, and CLI shim"
+
+[features]
+default = []
+stronghold = ["dep:iota_stronghold", "dep:tokio", "dep:zeroize", "dep:sha2"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+iota_stronghold = { version = "2.1", optional = true }
+tokio = { version = "1", features = ["sync"], optional = true }
+zeroize = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

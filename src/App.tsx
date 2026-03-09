@@ -8,12 +8,14 @@ import Favorites from "./components/Favorites";
 import InstallDialog from "./components/InstallDialog";
 import AddServer from "./components/AddServer";
 import About from "./components/About";
+import ProxyServers from "./components/ProxyServers";
+import ApiKeysPanel from "./components/ApiKeysPanel";
 import Toast from "./components/Toast";
 import RestartBanner from "./components/RestartBanner";
 import type { DeepLinkAction } from "./lib/types";
 
 export default function App() {
-  const { view, refreshTools, refreshInstallations, refreshFavorites, checkPendingDeepLink, setPendingDeepLink, setView } =
+  const { view, refreshTools, refreshInstallations, refreshFavorites, refreshProxyServers, checkPendingDeepLink, setPendingDeepLink, setView } =
     useStore();
 
   useEffect(() => {
@@ -21,6 +23,7 @@ export default function App() {
     refreshTools();
     refreshInstallations();
     refreshFavorites();
+    refreshProxyServers();
     checkPendingDeepLink();
 
     // Listen for deep link events from Tauri
@@ -44,6 +47,8 @@ export default function App() {
         {view === "favorites" && <Favorites />}
         {view === "install" && <InstallDialog />}
         {view === "add-server" && <AddServer />}
+        {view === "proxy" && <ProxyServers />}
+        {view === "api-keys" && <ApiKeysPanel />}
         {view === "about" && <About />}
       </main>
       <Toast />

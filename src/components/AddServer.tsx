@@ -10,6 +10,7 @@ export default function AddServer() {
   const [configKey, setConfigKey] = useState("");
   const [command, setCommand] = useState("");
   const [args, setArgs] = useState("");
+  const [url, setUrl] = useState("");
   const [transport, setTransport] = useState<"stdio" | "http">("stdio");
   const [envRows, setEnvRows] = useState<{ key: string; value: string }[]>([]);
   const [selectedTools, setSelectedTools] = useState<Set<string>>(new Set());
@@ -47,13 +48,22 @@ export default function AddServer() {
     setSelectedTools(next);
   };
 
+  const isStdio = transport === "stdio";
+  const canInstall = configKey.trim() &&
+    selectedTools.size > 0 &&
+    (isStdio ? command.trim() : url.trim());
+
   const handleInstall = async () => {
     if (!configKey.trim()) {
       showToast("Server name is required", "error");
       return;
     }
-    if (!command.trim()) {
-      showToast("Command is required", "error");
+    if (isStdio && !command.trim()) {
+      showToast("Command is required for stdio transport", "error");
+      return;
+    }
+    if (!isStdio && !url.trim()) {
+      showToast("URL is required for HTTP transport", "error");
       return;
     }
     if (selectedTools.size === 0) {
@@ -76,8 +86,9 @@ export default function AddServer() {
     const serverConfig: ServerInstallConfig = {
       server_name: configKey.trim(),
       config_key: configKey.trim(),
-      command: command.trim(),
-      args: parsedArgs,
+      command: isStdio ? command.trim() : "",
+      args: isStdio ? parsedArgs : [],
+      url: isStdio ? "" : url.trim(),
       env,
       transport,
     };
@@ -111,6 +122,7 @@ export default function AddServer() {
       setConfigKey("");
       setCommand("");
       setArgs("");
+      setUrl("");
       setEnvRows([]);
       setSelectedTools(new Set());
       refreshConfiguredServers();
@@ -149,38 +161,6 @@ export default function AddServer() {
           </p>
         </div>
 
-        {/* Command */}
-        <div>
-          <label className="block text-xs text-brightwing-gray-400 mb-1">
-            Command
-            <span className="text-red-400 ml-1">*</span>
-          </label>
-          <input
-            type="text"
-            placeholder="npx"
-            value={command}
-            onChange={(e) => setCommand(e.target.value)}
-            className="w-full px-3 py-2 bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-md text-sm font-mono placeholder-brightwing-gray-600 focus:outline-none focus:border-brightwing-blue focus:ring-1 focus:ring-brightwing-blue"
-          />
-        </div>
-
-        {/* Args */}
-        <div>
-          <label className="block text-xs text-brightwing-gray-400 mb-1">
-            Arguments
-          </label>
-          <input
-            type="text"
-            placeholder="-y @my-org/my-mcp-server"
-            value={args}
-            onChange={(e) => setArgs(e.target.value)}
-            className="w-full px-3 py-2 bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-md text-sm font-mono placeholder-brightwing-gray-600 focus:outline-none focus:border-brightwing-blue focus:ring-1 focus:ring-brightwing-blue"
-          />
-          <p className="text-xs text-brightwing-gray-600 mt-1">
-            Space-separated arguments
-          </p>
-        </div>
-
         {/* Transport */}
         <div>
           <label className="block text-xs text-brightwing-gray-400 mb-1">
@@ -209,6 +189,58 @@ export default function AddServer() {
             </button>
           </div>
         </div>
+
+        {/* stdio fields */}
+        {isStdio ? (
+          <>
+            <div>
+              <label className="block text-xs text-brightwing-gray-400 mb-1">
+                Command
+                <span className="text-red-400 ml-1">*</span>
+              </label>
+              <input
+                type="text"
+                placeholder="npx"
+                value={command}
+                onChange={(e) => setCommand(e.target.value)}
+                className="w-full px-3 py-2 bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-md text-sm font-mono placeholder-brightwing-gray-600 focus:outline-none focus:border-brightwing-blue focus:ring-1 focus:ring-brightwing-blue"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-brightwing-gray-400 mb-1">
+                Arguments
+              </label>
+              <input
+                type="text"
+                placeholder="-y @my-org/my-mcp-server"
+                value={args}
+                onChange={(e) => setArgs(e.target.value)}
+                className="w-full px-3 py-2 bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-md text-sm font-mono placeholder-brightwing-gray-600 focus:outline-none focus:border-brightwing-blue focus:ring-1 focus:ring-brightwing-blue"
+              />
+              <p className="text-xs text-brightwing-gray-600 mt-1">
+                Space-separated arguments
+              </p>
+            </div>
+          </>
+        ) : (
+          /* HTTP field */
+          <div>
+            <label className="block text-xs text-brightwing-gray-400 mb-1">
+              Server URL
+              <span className="text-red-400 ml-1">*</span>
+            </label>
+            <input
+              type="text"
+              placeholder="https://mcp.example.com/sse"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              className="w-full px-3 py-2 bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-md text-sm font-mono placeholder-brightwing-gray-600 focus:outline-none focus:border-brightwing-blue focus:ring-1 focus:ring-brightwing-blue"
+            />
+            <p className="text-xs text-brightwing-gray-600 mt-1">
+              The MCP server endpoint URL
+            </p>
+          </div>
+        )}
 
         {/* Environment Variables */}
         <div>
@@ -321,14 +353,16 @@ export default function AddServer() {
           </div>
         </div>
 
-        {/* Command preview */}
-        {command.trim() && (
+        {/* Config preview */}
+        {(isStdio ? command.trim() : url.trim()) && (
           <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
             <p className="text-xs text-brightwing-gray-500 mb-1">
               Config Preview
             </p>
-            <code className="text-sm text-brightwing-gray-200 font-mono">
-              {command.trim()} {args.trim()}
+            <code className="text-sm text-brightwing-gray-200 font-mono break-all">
+              {isStdio
+                ? `${command.trim()} ${args.trim()}`
+                : url.trim()}
             </code>
           </div>
         )}
@@ -336,7 +370,7 @@ export default function AddServer() {
         {/* Install button */}
         <button
           onClick={handleInstall}
-          disabled={installing || !configKey.trim() || !command.trim() || selectedTools.size === 0}
+          disabled={installing || !canInstall}
           className="w-full py-2.5 text-sm bg-brightwing-blue hover:bg-brightwing-blue-dark text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {installing

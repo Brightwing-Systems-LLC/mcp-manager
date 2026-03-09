@@ -13,6 +13,8 @@ pub struct ServerInstallConfig {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub transport: String, // "stdio" or "http"
+    #[serde(default)]
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,18 +53,28 @@ pub fn uninstall_server(tool_id: &str, config_key: &str) -> Result<InstallResult
 fn build_server_entry(def: &crate::tools::definitions::ToolDefinition, config: &ServerInstallConfig) -> JsonValue {
     let mut entry = serde_json::Map::new();
 
-    if def.needs_type_field {
-        entry.insert("type".to_string(), JsonValue::String(config.transport.clone()));
+    if config.transport == "http" || config.transport == "sse" {
+        // HTTP/SSE transport — use URL
+        if def.needs_type_field {
+            entry.insert("type".to_string(), JsonValue::String(config.transport.clone()));
+        }
+        // Use tool-specific URL key if defined, otherwise "url"
+        let url_key = def.remote_url_key.unwrap_or("url");
+        entry.insert(url_key.to_string(), JsonValue::String(config.url.clone()));
+    } else {
+        // stdio transport — use command/args
+        if def.needs_type_field {
+            entry.insert("type".to_string(), JsonValue::String(config.transport.clone()));
+        }
+        entry.insert(
+            "command".to_string(),
+            JsonValue::String(config.command.clone()),
+        );
+        entry.insert(
+            "args".to_string(),
+            JsonValue::Array(config.args.iter().map(|a| JsonValue::String(a.clone())).collect()),
+        );
     }
-
-    entry.insert(
-        "command".to_string(),
-        JsonValue::String(config.command.clone()),
-    );
-    entry.insert(
-        "args".to_string(),
-        JsonValue::Array(config.args.iter().map(|a| JsonValue::String(a.clone())).collect()),
-    );
 
     if !config.env.is_empty() {
         let env_obj: serde_json::Map<String, JsonValue> = config
@@ -169,13 +181,18 @@ fn install_toml(
         .ok_or("mcp_servers is not a table")?;
 
     let mut entry = toml_edit::Table::new();
-    entry.insert("command", toml_edit::value(&config.command));
 
-    let mut args_arr = toml_edit::Array::new();
-    for arg in &config.args {
-        args_arr.push(arg.as_str());
+    if config.transport == "http" || config.transport == "sse" {
+        let url_key = def.remote_url_key.unwrap_or("url");
+        entry.insert(url_key, toml_edit::value(&config.url));
+    } else {
+        entry.insert("command", toml_edit::value(&config.command));
+        let mut args_arr = toml_edit::Array::new();
+        for arg in &config.args {
+            args_arr.push(arg.as_str());
+        }
+        entry.insert("args", toml_edit::value(args_arr));
     }
-    entry.insert("args", toml_edit::value(args_arr));
 
     if !config.env.is_empty() {
         let mut env_table = toml_edit::InlineTable::new();
@@ -277,6 +294,46 @@ pub fn sanitize_server_name(name: &str) -> String {
         }
     }
     result.trim_matches('_').to_lowercase()
+}
+
+/// Build the path to the brightwing-proxy binary.
+/// Checks ~/.local/bin first, then falls back to the cargo target directory.
+pub fn proxy_binary_path() -> std::path::PathBuf {
+    // Primary: user's local bin (where Brightwing copies binaries)
+    if let Some(home) = dirs::home_dir() {
+        let local_bin = home.join(".local/bin/brightwing-proxy");
+        if local_bin.exists() {
+            return local_bin;
+        }
+    }
+    // Fallback: check PATH
+    if let Ok(path) = which::which("brightwing-proxy") {
+        return path;
+    }
+    // Last resort: assume it'll be at ~/.local/bin (pre-distribution)
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/bin"))
+        .join(".local/bin/brightwing-proxy")
+}
+
+/// Install a server in "proxy" mode — writes a config that spawns brightwing-proxy
+/// instead of the original server command. The proxy handles auth via the daemon.
+pub fn install_proxy_server(
+    tool_id: &str,
+    server_id: &str,
+    config_key: &str,
+) -> Result<InstallResult, String> {
+    let proxy_bin = proxy_binary_path();
+    let proxy_config = ServerInstallConfig {
+        server_name: config_key.to_string(),
+        config_key: config_key.to_string(),
+        command: proxy_bin.to_string_lossy().to_string(),
+        args: vec!["--server".to_string(), server_id.to_string()],
+        env: HashMap::new(),
+        transport: "stdio".to_string(),
+        url: String::new(),
+    };
+    install_server(tool_id, &proxy_config)
 }
 
 /// Check if a server name needs sanitizing (contains non-identifier chars).

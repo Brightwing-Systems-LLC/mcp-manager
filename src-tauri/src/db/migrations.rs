@@ -68,6 +68,77 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
             disabled_at TEXT DEFAULT (datetime('now')),
             UNIQUE(tool_id, server_name)
         );
+
+        -- Proxy servers registered in the auth daemon
+        CREATE TABLE IF NOT EXISTS proxy_servers (
+            server_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            auth_type TEXT NOT NULL DEFAULT 'none',
+            upstream_url TEXT,
+            upstream_command TEXT,
+            upstream_args TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        -- Per-server tool filter state (which tools are enabled/disabled)
+        CREATE TABLE IF NOT EXISTS proxy_tool_filter (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            token_estimate INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(server_id, tool_name),
+            FOREIGN KEY (server_id) REFERENCES proxy_servers(server_id) ON DELETE CASCADE
+        );
+
+        -- Tool schema cache (tools/list responses cached from upstream)
+        CREATE TABLE IF NOT EXISTS proxy_tool_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            input_schema TEXT NOT NULL DEFAULT '{}',
+            token_estimate INTEGER NOT NULL DEFAULT 0,
+            cached_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(server_id, tool_name),
+            FOREIGN KEY (server_id) REFERENCES proxy_servers(server_id) ON DELETE CASCADE
+        );
+
+        -- OAuth server metadata cache (discovery results)
+        CREATE TABLE IF NOT EXISTS oauth_server_meta (
+            server_id TEXT PRIMARY KEY,
+            server_url TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            discovered_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (server_id) REFERENCES proxy_servers(server_id) ON DELETE CASCADE
+        );
+
+        -- OAuth token sets (full token data for refresh)
+        CREATE TABLE IF NOT EXISTS oauth_token_sets (
+            server_id TEXT PRIMARY KEY,
+            token_json TEXT NOT NULL,
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (server_id) REFERENCES proxy_servers(server_id) ON DELETE CASCADE
+        );
+
+        -- API key credentials for proxy servers (env vars as JSON)
+        CREATE TABLE IF NOT EXISTS proxy_api_keys (
+            server_id TEXT PRIMARY KEY,
+            env_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (server_id) REFERENCES proxy_servers(server_id) ON DELETE CASCADE
+        );
+
+        -- Track which tools have proxy server installs (tool_id = claude_desktop, cursor, etc.)
+        CREATE TABLE IF NOT EXISTS proxy_tool_installs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id TEXT NOT NULL,
+            tool_id TEXT NOT NULL,
+            installed_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(server_id, tool_id),
+            FOREIGN KEY (server_id) REFERENCES proxy_servers(server_id) ON DELETE CASCADE
+        );
         ",
     )
     .map_err(|e| format!("Migration failed: {}", e))?;

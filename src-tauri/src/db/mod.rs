@@ -28,6 +28,16 @@ impl Database {
         })
     }
 
+    /// Create an in-memory database for testing.
+    pub fn new_in_memory() -> Result<Self, String> {
+        let conn = Connection::open_in_memory()
+            .map_err(|e| format!("Failed to open in-memory database: {}", e))?;
+        migrations::run_migrations(&conn)?;
+        Ok(Database {
+            conn: Mutex::new(conn),
+        })
+    }
+
     fn db_path() -> Result<PathBuf, String> {
         let data_dir = dirs::data_dir()
             .ok_or("Could not determine data directory")?;
