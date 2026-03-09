@@ -23,6 +23,7 @@ jobs:
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             label: Windows-x64
+            ext: .exe
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             label: Linux-x64
@@ -50,6 +51,31 @@ jobs:
 
       - name: Install npm dependencies
         run: npm ci
+
+      - name: Build sidecar binaries
+        run: |
+          TARGET=${{ matrix.target }}
+          EXT=${{ matrix.ext }}
+          BINARIES_DIR=src-tauri/binaries
+          mkdir -p "$BINARIES_DIR"
+
+          # Create placeholders so build.rs doesn't fail during first pass
+          for name in brightwing-authd brightwing-proxy bw; do
+            touch "$BINARIES_DIR/${name}-${TARGET}${EXT}"
+            chmod +x "$BINARIES_DIR/${name}-${TARGET}${EXT}" 2>/dev/null || true
+          done
+
+          # Build the sidecar binaries for the target
+          cd src-tauri
+          cargo build --release --target "$TARGET" --bin brightwing-authd --bin brightwing-proxy --bin bw
+          cd ..
+
+          # Copy built binaries over placeholders
+          for name in brightwing-authd brightwing-proxy bw; do
+            cp "src-tauri/target/${TARGET}/release/${name}${EXT}" "$BINARIES_DIR/${name}-${TARGET}${EXT}"
+            chmod +x "$BINARIES_DIR/${name}-${TARGET}${EXT}" 2>/dev/null || true
+          done
+        shell: bash
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
