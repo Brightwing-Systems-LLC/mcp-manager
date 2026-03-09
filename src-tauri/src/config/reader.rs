@@ -20,8 +20,26 @@ pub fn read_all_configured_servers() -> Vec<ConfiguredServer> {
 
     for def in TOOL_DEFINITIONS {
         if def.is_cli_only {
-            // For Claude Code, try to parse `claude mcp list` output
-            if let Some(cmd) = def.cli_command {
+            if def.id == "claude_code" {
+                // Read ~/.claude.json directly for both user-level and project-scoped servers
+                match read_claude_code_servers() {
+                    Ok(entries) => {
+                        log::info!("Found {} servers from Claude Code config", entries.len());
+                        for entry in entries {
+                            servers.push(ConfiguredServer {
+                                tool_id: def.id.to_string(),
+                                tool_short_name: def.short_name.to_string(),
+                                server_name: entry.name,
+                                config_json: entry.config_json,
+                                is_cli_only: true,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to read Claude Code servers: {}", e);
+                    }
+                }
+            } else if let Some(cmd) = def.cli_command {
                 match read_cli_servers(cmd) {
                     Ok(entries) => {
                         log::info!(
@@ -80,6 +98,57 @@ pub fn read_all_configured_servers() -> Vec<ConfiguredServer> {
 struct CliServerEntry {
     name: String,
     config_json: Option<String>,
+}
+
+/// Read Claude Code MCP servers directly from ~/.claude.json.
+/// Reads both user-level (top-level mcpServers) and project-scoped
+/// (projects.*.mcpServers) entries, deduplicating by name.
+fn read_claude_code_servers() -> Result<Vec<CliServerEntry>, String> {
+    let config_path = dirs::home_dir()
+        .ok_or("No home directory")?
+        .join(".claude.json");
+
+    if !config_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read ~/.claude.json: {}", e))?;
+    let root: JsonValue = serde_json::from_str(&content)
+        .map_err(|e| format!("Invalid JSON in ~/.claude.json: {}", e))?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+
+    // Helper to extract servers from an mcpServers object
+    let mut collect = |servers_obj: &serde_json::Map<String, JsonValue>| {
+        for (name, config) in servers_obj {
+            if seen.contains(name) {
+                continue;
+            }
+            seen.insert(name.clone());
+            entries.push(CliServerEntry {
+                name: name.clone(),
+                config_json: serde_json::to_string(config).ok(),
+            });
+        }
+    };
+
+    // User-level servers
+    if let Some(JsonValue::Object(servers)) = root.get("mcpServers") {
+        collect(servers);
+    }
+
+    // Project-scoped servers
+    if let Some(JsonValue::Object(projects)) = root.get("projects") {
+        for (_path, project_config) in projects {
+            if let Some(JsonValue::Object(servers)) = project_config.get("mcpServers") {
+                collect(servers);
+            }
+        }
+    }
+
+    Ok(entries)
 }
 
 /// Build an enriched environment for CLI subprocesses.
