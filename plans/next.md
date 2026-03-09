@@ -53,7 +53,8 @@ mcpscoreboard.com (SEO magnet, 24K server pages)
     → MCP Manager desktop app (daily-use tool on developer machines)
         → Auth proxy makes it sticky (always running, managing tokens)
             → CLI shim + tool filtering make it indispensable
-                → PatchworkMCP.com (paid SaaS for server publishers)
+                → Proxy-injected feedback captures agent gaps for ALL installed servers
+                    → PatchworkMCP.com (paid SaaS: feedback clusters, PR automation, quality loop)
 ```
 
 ---
@@ -1612,40 +1613,53 @@ CLAUDE.md/GEMINI.md was solving a problem that doesn't exist once proxy + tool f
 | **Smoketest: bw list** | ✅ | `bw list` runs against live daemon | `smoketest.sh` |
 | **Smoketest: bw list server** | ✅ | `bw list <server>` runs against live daemon | `smoketest.sh` |
 
-### Phase 6: Migration & Polish (Weeks 14-16)
+### Phase 6: Install Flow → Proxy Wiring + Migration (Weeks 14-16)
 
-**Goal:** Migration from direct installs, proxy health monitoring, error recovery, documentation.
+**Goal:** Wire the proxy architecture into the main install flow so users get proxy-based installs by default when auth is involved. Add PatchworkMCP awareness. Migrate existing direct installs.
 
 **Deliverables:**
-1. Migration assistant
+
+1. Install flow → proxy wiring (InstallDialog)
+   - Detect when a Scoreboard server needs auth (sensitive env vars or HTTP transport with OAuth)
+   - When proxy mode is chosen: register with daemon, collect credentials (API key form or OAuth flow), write `brightwing-proxy --server <id>` configs to tools instead of raw upstream config
+   - Auto-start daemon if not running when proxy features are used
+   - Show proxy badge on servers installed via proxy in Dashboard
+2. Manual install → proxy wiring (AddServer)
+   - "Route through Brightwing Proxy" toggle for manual server adds
+   - Same flow: register → authenticate → install proxy configs
+3. PatchworkMCP awareness
+   - Protect `feedback` tool from filtering — `apply_tool_filter` always retains tools named `feedback` regardless of the user's filter settings
+   - Detect PatchworkMCP integration during `discover_upstream_tools` — flag `has_feedback_tool` on proxy server records
+   - Store detection result in DB for future Phase 8 use
+4. Migration assistant
    - Scan existing tool configs for servers with env vars
    - Offer to import into vault and replace with proxy configs
    - Rollback capability on verification failure
-2. Token budget display (enhanced)
+5. Token budget display (enhanced)
    - `bw list` shows total MCP cost vs bw cost
    - Manager UI shows per-server and total budget
-3. Proxy health monitoring
-   - Periodic connectivity checks to upstream servers
-   - Status page showing proxy health per server
-   - Latency metrics
-4. Error recovery
-   - Vault corruption detection and recovery from backup
-5. Documentation
-   - User guide: adding servers, OAuth flow, troubleshooting
-   - Architecture docs for contributors
-   - FAQ: "Why does Brightwing need a background service?"
 
 **Files created/modified:**
+- `src/components/InstallDialog.tsx` (modified — proxy mode toggle, credential collection, daemon auto-start)
+- `src/components/AddServer.tsx` (modified — proxy mode toggle)
 - `src/components/MigrationAssistant.tsx` (new)
+- `src-tauri/src/bin/brightwing_proxy.rs` (modified — always retain `feedback` tool in filter)
+- `src-tauri/src/proxy/discovery.rs` (modified — detect feedback tool)
 - `src-tauri/src/migration.rs` (new)
+- `src/store.ts` (modified — daemon auto-start helper)
+- `src/lib/tauri.ts` (modified — new bindings if needed)
 
 **Testing — Phase 6:**
 
 | Test Type | What to Test | How |
 |-----------|-------------|-----|
+| **Unit: feedback tool protection** | `apply_tool_filter` retains `feedback` even when not in enabled list | `#[cfg(test)]` in `brightwing_proxy.rs` |
+| **Unit: feedback tool detection** | Discovery correctly flags servers with/without `feedback` tool | `#[cfg(test)]` in `discovery.rs` |
 | **Unit: migration detection** | Correctly identifies configs with env vars that could be migrated. Ignores configs without secrets. | `#[cfg(test)]` in `migration.rs` with sample config files |
 | **Unit: migration rollback** | If proxy verification fails after migration, original config is restored exactly | `#[cfg(test)]` with mock config write/restore |
+| **Integration: proxy install flow** | Install server via proxy → verify daemon has credentials → verify tool config has `brightwing-proxy` command → verify upstream reachable | Integration test |
 | **Integration: full migration** | Start with 3 direct-installed servers → run migration → verify vault has keys → verify proxy configs in place → verify tools work | `tests/migration_integration.rs` |
+| **Manual: InstallDialog proxy mode** | Install a Scoreboard server with proxy enabled → verify proxy config in tool → verify upstream access works | Manual checklist |
 | **Manual: migration UX** | Walk through migration UI with real existing configs. Verify import, verify proxy works, verify rollback. | Manual checklist |
 | **Manual: cross-platform** | Full end-to-end test of all features on macOS, Windows, Linux | Manual test matrix |
 
@@ -1680,6 +1694,84 @@ CLAUDE.md/GEMINI.md was solving a problem that doesn't exist once proxy + tool f
 | **Unit: profile application** | Applying a profile correctly updates `proxy_tool_filter` via `set_tool_filter_bulk` | Unit test |
 | **Integration: profile distribution** | Mock Scoreboard API → request profile → verify cached locally → verify `bw --help` uses curated descriptions | Integration test |
 | **Manual: Scoreboard integration** | Verify Context Efficiency score displays correctly. Verify "Available via bw" badge. Verify Budget Calculator. | Manual checklist on staging |
+
+### Phase 8: PatchworkMCP Deep Integration (Separate Track)
+
+**Goal:** Make Brightwing a distribution channel for PatchworkMCP features. Every server installed via Brightwing gets agent feedback capture and health monitoring — even servers whose source code doesn't integrate the PatchworkMCP SDK.
+
+**Context:** PatchworkMCP provides three features that MCP server authors can add to their source:
+1. **Feedback tool** — agents call `feedback()` when they hit limitations (missing tools, incomplete results, wrong formats)
+2. **Health middleware** — background heartbeat every 60s reporting tool_count, tool_names, uptime
+3. **Server instructions** — tells agents to use the feedback tool
+
+When a server has these natively, the proxy passes them through transparently (Phase 6 ensures `feedback` survives filtering). Phase 8 adds these features at the proxy level for servers that *don't* have native integration.
+
+**Deliverables:**
+
+1. Proxy-injected feedback tool
+   - If upstream server doesn't expose a `feedback` tool (detected in Phase 6 discovery), the proxy injects one into `tools/list` responses
+   - When an agent calls the injected `feedback` tool, the proxy handles it locally: POSTs structured feedback to PatchworkMCP API (`/api/v1/feedback/`)
+   - Feedback payload includes: server_id, what_i_needed, what_i_tried, gap_type, suggestion, tools_available, agent_model, session_id
+   - Requires PatchworkMCP account linked in Brightwing (API key or server key)
+
+2. Proxy-injected heartbeat
+   - The proxy sends periodic heartbeats to PatchworkMCP API (`/api/v1/heartbeat/`) for every proxied server
+   - Payload derived from intercepted `tools/list`: server_slug, tool_count, tool_names
+   - Heartbeat interval: 60s (matching SDK default)
+   - Runs as background task in proxy process, fire-and-forget
+
+3. PatchworkMCP account linking
+   - Settings UI for connecting PatchworkMCP account (API key entry)
+   - Store API key securely in credential vault
+   - Map Brightwing proxy servers to PatchworkMCP server slugs (auto-create or manual link)
+   - "Connect to PatchworkMCP" button on proxy server cards
+
+4. Feedback analytics in desktop app
+   - Dashboard widget showing recent feedback across all proxied servers
+   - Per-server feedback count and top gap types
+   - Link to PatchworkMCP web dashboard for full analytics
+
+5. Server instructions injection (optional)
+   - If upstream server doesn't include PatchworkMCP instructions, proxy can inject them into the `initialize` response
+   - Tells agents about the feedback tool availability
+   - Configurable per-server (some users may not want instruction modification)
+
+**Architecture:**
+```
+Agent → stdio → brightwing-proxy
+                    │
+                    ├── tools/list response: inject `feedback` tool if missing
+                    ├── tools/call `feedback`: handle locally → POST to PatchworkMCP API
+                    ├── Background task: heartbeat every 60s → POST to PatchworkMCP API
+                    ├── initialize response: optionally inject instructions
+                    │
+                    └── All other MCP traffic: pass through to upstream
+```
+
+**Key design decisions:**
+- Proxy-injected features are **opt-in per server** — user can toggle "Enable PatchworkMCP" on each proxy server
+- Native PatchworkMCP integration always takes precedence (if upstream has `feedback` tool, proxy doesn't inject a duplicate)
+- Heartbeat is additive — if upstream has its own middleware heartbeat, both run (PatchworkMCP API handles dedup)
+- API key stored once in Brightwing, used across all proxy-injected servers
+
+**Files created/modified:**
+- `src-tauri/src/bin/brightwing_proxy.rs` (modified — feedback tool injection, heartbeat task, instruction injection)
+- `src-tauri/crates/proxy-common/src/patchwork.rs` (new — PatchworkMCP API client, feedback/heartbeat payloads)
+- `src/components/PatchworkSettings.tsx` (new — account linking, per-server toggle)
+- `src/components/ProxyServers.tsx` (modified — PatchworkMCP status badge, connect button)
+- `src-tauri/src/lib.rs` (modified — PatchworkMCP account/settings commands)
+- `src-tauri/src/db/mod.rs` (modified — patchwork_api_key, per-server patchwork_enabled flag)
+
+**Testing — Phase 8:**
+
+| Test Type | What to Test | How |
+|-----------|-------------|-----|
+| **Unit: feedback injection** | `tools/list` response gets `feedback` tool added when missing, not duplicated when present | `#[cfg(test)]` in `brightwing_proxy.rs` |
+| **Unit: feedback handling** | Proxy correctly formats and POSTs feedback payload to PatchworkMCP API | `#[cfg(test)]` with mock HTTP server |
+| **Unit: heartbeat** | Heartbeat payload correctly derived from `tools/list` data | `#[cfg(test)]` in `patchwork.rs` |
+| **Integration: full flow** | Agent calls injected feedback tool → proxy POSTs to mock PatchworkMCP API → verify payload | Integration test with mock upstream + mock PatchworkMCP |
+| **Integration: native passthrough** | Server with native feedback tool → proxy doesn't inject duplicate → agent calls native tool → upstream handles it | Integration test |
+| **Manual: account linking** | Link PatchworkMCP account → enable on server → verify feedback appears in PatchworkMCP dashboard | Manual checklist |
 
 ---
 
@@ -1885,12 +1977,21 @@ Each checklist includes:
 - ✅ 120 cumulative tests passing (107 cargo + 4 discovery integration + 9 mock), 21/21 smoketest
 
 ### Phase 6 Launch (v1 Release Gate)
+- Install flow writes proxy configs by default for auth-required servers
+- `feedback` tool always survives tool filtering
+- PatchworkMCP integration detected during discovery
 - Migration assistant tested with configs containing 10+ servers
 - Cross-platform end-to-end tests passing
 
 ### Phase 7 (Post-v1, Separate Track)
 - Curated profiles working for 5+ servers
 - Scoreboard integration: one-click "Add + Auth + Install" flow
+
+### Phase 8 (Post-v1, Separate Track)
+- Proxy-injected feedback tool working for non-PatchworkMCP servers
+- Proxy-injected heartbeat reporting to PatchworkMCP API
+- PatchworkMCP account linking flow tested end-to-end
+- 80%+ of proxy-installed servers have PatchworkMCP feedback enabled
 
 ### 1 Month Post-Launch
 - 50%+ of Brightwing users have at least one proxied server

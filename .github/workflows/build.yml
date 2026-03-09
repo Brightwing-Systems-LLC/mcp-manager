@@ -9,7 +9,31 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "MCP Manager ${{ github.ref_name }}" \
+            --notes "$(cat <<'EOF'
+          ## Download
+
+          See [README](https://github.com/Brightwing-Systems-LLC/mcp-manager#readme) for full documentation, platform support, and download links.
+
+          ### Unsigned Build Workarounds
+
+          Builds are not yet code-signed. Your OS will show a warning on first launch. See the README for platform-specific instructions.
+          EOF
+          )"
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -85,52 +109,6 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "MCP Manager ${{ github.ref_name }}"
-          releaseBody: |
-            ## Download
-
-            | Platform | File | Status |
-            |----------|------|--------|
-            | macOS (Apple Silicon) | `Brightwing.MCP.Manager_x.x.x_aarch64.dmg` | Beta |
-            | macOS (Intel) | `Brightwing.MCP.Manager_x.x.x_x64.dmg` | Beta |
-            | Windows (64-bit) | `Brightwing.MCP.Manager_x.x.x_x64-setup-ALPHA.exe` | **Alpha — expect bugs** |
-            | Linux (Debian/Ubuntu) | `Brightwing.MCP.Manager_x.x.x_amd64.deb` | Beta |
-            | Linux (AppImage) | `Brightwing.MCP.Manager_x.x.x_amd64.AppImage` | Beta |
-
-            ### Windows Alpha Notice
-
-            The Windows build compiles and installs but has **not been tested on real hardware**. The core UI and config management should work, but the auth daemon, proxy, and CLI shim are unverified on Windows. Please [report issues](https://github.com/Brightwing-Systems-LLC/mcp-manager/issues) if you encounter problems.
-
-            ### Unsigned Build Workarounds
-
-            Builds are not yet code-signed. Your OS will show a warning on first launch.
-
-            **macOS:** System Settings → Privacy & Security → Open Anyway. Or run `xattr -cr "/Applications/Brightwing MCP Manager.app"` in Terminal.
-
-            **Windows:** SmartScreen → More info → Run anyway.
-
-            **Linux AppImage:** `chmod +x` the file, then run it.
-
-            ---
-
-            See [README](https://github.com/Brightwing-Systems-LLC/mcp-manager#readme) for full documentation.
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }}
-
-      - name: Rename Windows installer to include ALPHA tag
-        if: matrix.platform == 'windows-latest'
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG=${{ github.ref_name }}
-          VERSION=${TAG#v}
-          OLD_NAME="Brightwing.MCP.Manager_${VERSION}_x64-setup.exe"
-          NEW_NAME="Brightwing.MCP.Manager_${VERSION}_x64-setup-ALPHA.exe"
-          # Download, rename, re-upload
-          gh release download "$TAG" --pattern "$OLD_NAME" --dir /tmp --clobber || true
-          if [ -f "/tmp/$OLD_NAME" ]; then
-            mv "/tmp/$OLD_NAME" "/tmp/$NEW_NAME"
-            gh release upload "$TAG" "/tmp/$NEW_NAME" --clobber
-            gh release delete-asset "$TAG" "$OLD_NAME" --yes
-          fi
