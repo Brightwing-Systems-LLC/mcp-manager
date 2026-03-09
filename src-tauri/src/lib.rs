@@ -764,27 +764,35 @@ fn daemon_pid_path() -> std::path::PathBuf {
 }
 
 /// Try to ping the daemon via IPC and get uptime info.
+/// Unix sockets are not available on Windows, so this is a no-op there.
 async fn ping_daemon() -> Option<(u64, String)> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use proxy_common::ipc::{IpcRequest, IpcResponse, encode_message, decode_message};
+    #[cfg(unix)]
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use proxy_common::ipc::{IpcRequest, IpcResponse, encode_message, decode_message};
 
-    let socket = daemon_socket_path();
-    let stream = tokio::net::UnixStream::connect(&socket).await.ok()?;
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+        let socket = daemon_socket_path();
+        let stream = tokio::net::UnixStream::connect(&socket).await.ok()?;
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
 
-    let ping = encode_message(&IpcRequest::Ping).ok()?;
-    writer.write_all(&ping).await.ok()?;
+        let ping = encode_message(&IpcRequest::Ping).ok()?;
+        writer.write_all(&ping).await.ok()?;
 
-    let line = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        lines.next_line(),
-    ).await.ok()?.ok()??;
+        let line = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            lines.next_line(),
+        ).await.ok()?.ok()??;
 
-    let resp: IpcResponse = decode_message(line.as_bytes()).ok()?;
-    match resp {
-        IpcResponse::Pong { uptime_secs, daemon_version } => Some((uptime_secs, daemon_version)),
-        _ => None,
+        let resp: IpcResponse = decode_message(line.as_bytes()).ok()?;
+        match resp {
+            IpcResponse::Pong { uptime_secs, daemon_version } => Some((uptime_secs, daemon_version)),
+            _ => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
     }
 }
 
