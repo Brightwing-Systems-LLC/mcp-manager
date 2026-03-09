@@ -3,7 +3,7 @@ members = [".", "crates/proxy-common"]
 
 [package]
 name = "brightwing-mcp-manager"
-version = "0.3.2"
+version = "0.3.3"
 description = "Brightwing MCP Manager - Universal MCP server installer"
 authors = ["Brightwing Systems"]
 edition = "2021"
