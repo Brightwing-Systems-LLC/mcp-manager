@@ -16,6 +16,7 @@ use proxy_common::ipc::{
 use proxy_common::IPC_PROTOCOL_VERSION;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 // ─── Parsed command ──────────────────────────────────────────────────────────
@@ -331,11 +332,13 @@ fn default_socket_path() -> PathBuf {
     }
 }
 
+#[cfg(unix)]
 struct DaemonClient {
     writer: tokio::io::WriteHalf<UnixStream>,
     reader: tokio::io::Lines<BufReader<tokio::io::ReadHalf<UnixStream>>>,
 }
 
+#[cfg(unix)]
 impl DaemonClient {
     async fn connect() -> Result<Self, String> {
         let socket_path = default_socket_path();
@@ -404,6 +407,13 @@ fn print_help() {
     eprintln!("    bw github search_repos --query \"mcp\" # Call a tool");
 }
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("bw is not yet available on Windows.");
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

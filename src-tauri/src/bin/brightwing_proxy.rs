@@ -15,6 +15,7 @@ use proxy_common::IPC_PROTOCOL_VERSION;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 // ─── CLI args ────────────────────────────────────────────────────────────────
@@ -98,11 +99,13 @@ fn default_socket_path() -> PathBuf {
 
 // ─── Daemon IPC client ──────────────────────────────────────────────────────
 
+#[cfg(unix)]
 struct DaemonClient {
     writer: tokio::io::WriteHalf<UnixStream>,
     reader: tokio::io::Lines<BufReader<tokio::io::ReadHalf<UnixStream>>>,
 }
 
+#[cfg(unix)]
 impl DaemonClient {
     async fn connect(socket_path: &PathBuf) -> Result<Self, String> {
         let stream = UnixStream::connect(socket_path)
@@ -212,6 +215,7 @@ async fn send_upstream(
 
 /// Forward MCP traffic between stdin/stdout and an upstream HTTP MCP server.
 /// On 401, re-fetches credentials from the daemon and retries once.
+#[cfg(unix)]
 async fn run_http_proxy(
     args: &ProxyArgs,
     upstream_url: &str,
@@ -514,6 +518,13 @@ async fn run_stdio_proxy(
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("brightwing-proxy is not yet available on Windows.");
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
 #[tokio::main]
 async fn main() {
     let args = match parse_args() {

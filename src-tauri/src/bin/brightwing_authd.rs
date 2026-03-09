@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 
 /// Daemon state shared across all client connections.
@@ -851,6 +852,7 @@ fn is_daemon_running(pid_path: &PathBuf) -> Option<u32> {
 }
 
 /// Handle a single client connection.
+#[cfg(unix)]
 async fn handle_client(
     stream: tokio::net::UnixStream,
     state: Arc<DaemonState>,
@@ -886,6 +888,13 @@ async fn handle_client(
     }
 }
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("brightwing-authd is not yet available on Windows.");
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = std::env::args()
