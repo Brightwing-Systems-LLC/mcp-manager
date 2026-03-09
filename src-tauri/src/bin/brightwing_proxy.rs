@@ -8,15 +8,13 @@
 
 use proxy_common::credentials::Credential;
 use proxy_common::ipc::{
-    ClientType, HandshakeRequest, IpcRequest, IpcResponse, decode_message, encode_message,
+    ClientType, IpcRequest, IpcResponse,
 };
-use proxy_common::IPC_PROTOCOL_VERSION;
+use proxy_common::transport::DaemonClient;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::UnixStream;
 
 // ─── CLI args ────────────────────────────────────────────────────────────────
 
@@ -78,122 +76,33 @@ fn parse_args() -> Result<ProxyArgs, String> {
 }
 
 fn default_socket_path() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("Library/Application Support/com.brightwing.mcp-manager/authd.sock")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-            .join("brightwing-authd.sock")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        PathBuf::from(r"\\.\pipe\brightwing-authd")
+    proxy_common::transport::default_socket_path()
+}
+
+// ─── Daemon IPC helpers ─────────────────────────────────────────────────────
+
+async fn get_credentials(daemon: &mut DaemonClient, server_id: &str) -> Result<Credential, String> {
+    daemon.send(&IpcRequest::GetCredentials {
+        server_id: server_id.to_string(),
+    }).await?;
+
+    match daemon.recv().await? {
+        IpcResponse::Credentials { credential, .. } => Ok(credential),
+        IpcResponse::CredentialError { error, .. } => {
+            Err(format!("{:?}: {}", error.code, error.message))
+        }
+        other => Err(format!("Unexpected response: {:?}", other)),
     }
 }
 
-// ─── Daemon IPC client ──────────────────────────────────────────────────────
+async fn get_tool_filter(daemon: &mut DaemonClient, server_id: &str) -> Result<Vec<String>, String> {
+    daemon.send(&IpcRequest::GetToolFilter {
+        server_id: server_id.to_string(),
+    }).await?;
 
-#[cfg(unix)]
-struct DaemonClient {
-    writer: tokio::io::WriteHalf<UnixStream>,
-    reader: tokio::io::Lines<BufReader<tokio::io::ReadHalf<UnixStream>>>,
-}
-
-#[cfg(unix)]
-impl DaemonClient {
-    async fn connect(socket_path: &PathBuf) -> Result<Self, String> {
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|e| format!(
-                "Cannot connect to Brightwing daemon at {}: {}. Is brightwing-authd running?",
-                socket_path.display(), e
-            ))?;
-
-        let (reader, writer) = tokio::io::split(stream);
-        let reader = BufReader::new(reader).lines();
-
-        Ok(Self { writer, reader })
-    }
-
-    async fn send(&mut self, request: &IpcRequest) -> Result<(), String> {
-        let bytes = encode_message(request).map_err(|e| format!("Serialize error: {}", e))?;
-        self.writer
-            .write_all(&bytes)
-            .await
-            .map_err(|e| format!("Write error: {}", e))
-    }
-
-    async fn recv(&mut self) -> Result<IpcResponse, String> {
-        let line = self
-            .reader
-            .next_line()
-            .await
-            .map_err(|e| format!("Read error: {}", e))?
-            .ok_or_else(|| "Daemon closed connection".to_string())?;
-        decode_message(line.as_bytes()).map_err(|e| format!("Parse error: {}", e))
-    }
-
-    async fn handshake(&mut self) -> Result<(), String> {
-        self.send(&IpcRequest::Handshake(HandshakeRequest {
-            client: ClientType::Proxy,
-            version: IPC_PROTOCOL_VERSION.to_string(),
-        }))
-        .await?;
-
-        match self.recv().await? {
-            IpcResponse::HandshakeOk { .. } => Ok(()),
-            IpcResponse::HandshakeError { message, .. } => Err(message),
-            other => Err(format!("Unexpected handshake response: {:?}", other)),
-        }
-    }
-
-    async fn get_credentials(&mut self, server_id: &str) -> Result<Credential, String> {
-        self.send(&IpcRequest::GetCredentials {
-            server_id: server_id.to_string(),
-        })
-        .await?;
-
-        match self.recv().await? {
-            IpcResponse::Credentials { credential, .. } => Ok(credential),
-            IpcResponse::CredentialError { error, .. } => {
-                Err(format!("{}: {}", error.code.as_str(), error.message))
-            }
-            other => Err(format!("Unexpected response: {:?}", other)),
-        }
-    }
-
-    async fn get_tool_filter(&mut self, server_id: &str) -> Result<Vec<String>, String> {
-        self.send(&IpcRequest::GetToolFilter {
-            server_id: server_id.to_string(),
-        })
-        .await?;
-
-        match self.recv().await? {
-            IpcResponse::ToolFilter { enabled_tools, .. } => Ok(enabled_tools),
-            other => Err(format!("Unexpected response: {:?}", other)),
-        }
-    }
-}
-
-/// Helper to get string representation of credential error codes.
-trait CredentialErrorCodeExt {
-    fn as_str(&self) -> &str;
-}
-
-impl CredentialErrorCodeExt for proxy_common::credentials::CredentialErrorCode {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::NotFound => "not_found",
-            Self::AuthExpired => "auth_expired",
-            Self::VaultError => "vault_error",
-            Self::Internal => "internal",
-        }
+    match daemon.recv().await? {
+        IpcResponse::ToolFilter { enabled_tools, .. } => Ok(enabled_tools),
+        other => Err(format!("Unexpected response: {:?}", other)),
     }
 }
 
@@ -215,7 +124,6 @@ async fn send_upstream(
 
 /// Forward MCP traffic between stdin/stdout and an upstream HTTP MCP server.
 /// On 401, re-fetches credentials from the daemon and retries once.
-#[cfg(unix)]
 async fn run_http_proxy(
     args: &ProxyArgs,
     upstream_url: &str,
@@ -285,7 +193,7 @@ async fn run_http_proxy(
             if args.verbose {
                 eprintln!("brightwing-proxy: got 401, re-fetching credentials from daemon");
             }
-            match daemon.get_credentials(&args.server_id).await {
+            match get_credentials(daemon, &args.server_id).await {
                 Ok(new_cred) => {
                     let new_auth = auth_header_from_credential(&new_cred);
                     auth_header = new_auth.clone();
@@ -518,13 +426,6 @@ async fn run_stdio_proxy(
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-#[cfg(not(unix))]
-fn main() {
-    eprintln!("brightwing-proxy is not yet available on Windows.");
-    std::process::exit(1);
-}
-
-#[cfg(unix)]
 #[tokio::main]
 async fn main() {
     let args = match parse_args() {
@@ -556,7 +457,7 @@ async fn main() {
     };
 
     // Handshake
-    if let Err(e) = daemon.handshake().await {
+    if let Err(e) = daemon.handshake(ClientType::Proxy).await {
         eprintln!("brightwing-proxy: handshake failed: {}", e);
         std::process::exit(1);
     }
@@ -566,7 +467,7 @@ async fn main() {
     }
 
     // Get credentials
-    let credential = match daemon.get_credentials(&args.server_id).await {
+    let credential = match get_credentials(&mut daemon, &args.server_id).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("brightwing-proxy: credential error: {}", e);
@@ -575,8 +476,7 @@ async fn main() {
     };
 
     // Get tool filter
-    let tool_filter = daemon
-        .get_tool_filter(&args.server_id)
+    let tool_filter = get_tool_filter(&mut daemon, &args.server_id)
         .await
         .unwrap_or_default();
 

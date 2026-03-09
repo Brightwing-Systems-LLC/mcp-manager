@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "brightwing-mcp-manager"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3702,6 +3702,7 @@ name = "proxy-common"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dirs 6.0.0",
  "iota_stronghold",
  "serde",
  "serde_json",

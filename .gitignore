@@ -16,3 +16,4 @@ Thumbs.db
 # Env
 .env
 .env.*
+src-tauri/binaries/

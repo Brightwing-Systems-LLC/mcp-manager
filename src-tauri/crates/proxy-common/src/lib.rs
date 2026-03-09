@@ -1,6 +1,7 @@
 pub mod credentials;
 pub mod ipc;
 pub mod tokens;
+pub mod transport;
 pub mod vault;
 
 #[cfg(feature = "stronghold")]

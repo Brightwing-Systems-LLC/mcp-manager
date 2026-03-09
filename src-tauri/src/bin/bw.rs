@@ -8,16 +8,11 @@
 //!   bw <server> <tool> --key value --json # Raw JSON output
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use proxy_common::ipc::{
-    ClientType, HandshakeRequest, IpcRequest, IpcResponse, decode_message, encode_message,
+    ClientType, IpcRequest, IpcResponse,
 };
-use proxy_common::IPC_PROTOCOL_VERSION;
-
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::UnixStream;
+use proxy_common::transport::DaemonClient;
 
 // ─── Parsed command ──────────────────────────────────────────────────────────
 
@@ -312,78 +307,7 @@ fn format_tool_help(
 
 // ─── Daemon IPC client ──────────────────────────────────────────────────────
 
-fn default_socket_path() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("Library/Application Support/com.brightwing.mcp-manager/authd.sock")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-            .join("brightwing-authd.sock")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        PathBuf::from(r"\\.\pipe\brightwing-authd")
-    }
-}
 
-#[cfg(unix)]
-struct DaemonClient {
-    writer: tokio::io::WriteHalf<UnixStream>,
-    reader: tokio::io::Lines<BufReader<tokio::io::ReadHalf<UnixStream>>>,
-}
-
-#[cfg(unix)]
-impl DaemonClient {
-    async fn connect() -> Result<Self, String> {
-        let socket_path = default_socket_path();
-        let stream = UnixStream::connect(&socket_path)
-            .await
-            .map_err(|e| format!(
-                "Cannot connect to Brightwing daemon at {}: {}\nIs brightwing-authd running?",
-                socket_path.display(), e
-            ))?;
-
-        let (reader, writer) = tokio::io::split(stream);
-        let reader = BufReader::new(reader).lines();
-        Ok(Self { writer, reader })
-    }
-
-    async fn send(&mut self, request: &IpcRequest) -> Result<(), String> {
-        let bytes = encode_message(request).map_err(|e| format!("Serialize error: {}", e))?;
-        self.writer.write_all(&bytes).await.map_err(|e| format!("Write error: {}", e))
-    }
-
-    async fn recv(&mut self) -> Result<IpcResponse, String> {
-        let line = self.reader.next_line().await
-            .map_err(|e| format!("Read error: {}", e))?
-            .ok_or_else(|| "Daemon closed connection".to_string())?;
-        decode_message(line.as_bytes()).map_err(|e| format!("Parse error: {}", e))
-    }
-
-    async fn handshake(&mut self) -> Result<(), String> {
-        self.send(&IpcRequest::Handshake(HandshakeRequest {
-            client: ClientType::CliShim,
-            version: IPC_PROTOCOL_VERSION.to_string(),
-        })).await?;
-
-        match self.recv().await? {
-            IpcResponse::HandshakeOk { .. } => Ok(()),
-            IpcResponse::HandshakeError { message, .. } => Err(message),
-            other => Err(format!("Unexpected handshake response: {:?}", other)),
-        }
-    }
-
-    async fn request(&mut self, req: &IpcRequest) -> Result<IpcResponse, String> {
-        self.send(req).await?;
-        self.recv().await
-    }
-}
 
 fn print_help() {
     eprintln!("bw — Brightwing Tool Broker CLI");
@@ -407,13 +331,6 @@ fn print_help() {
     eprintln!("    bw github search_repos --query \"mcp\" # Call a tool");
 }
 
-#[cfg(not(unix))]
-fn main() {
-    eprintln!("bw is not yet available on Windows.");
-    std::process::exit(1);
-}
-
-#[cfg(unix)]
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -436,7 +353,7 @@ async fn main() {
     }
 
     // Connect to daemon
-    let mut daemon = match DaemonClient::connect().await {
+    let mut daemon = match DaemonClient::connect_default().await {
         Ok(d) => d,
         Err(e) => {
             eprintln!("bw: {}", e);
@@ -444,7 +361,7 @@ async fn main() {
         }
     };
 
-    if let Err(e) = daemon.handshake().await {
+    if let Err(e) = daemon.handshake(ClientType::CliShim).await {
         eprintln!("bw: handshake failed: {}", e);
         std::process::exit(1);
     }

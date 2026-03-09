@@ -26,9 +26,8 @@ use brightwing_mcp_manager_lib::oauth::refresh::refresh_token;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::UnixListener;
+use tokio::io::AsyncWriteExt;
+use proxy_common::transport::{IpcListener, IpcServerStream};
 
 /// Daemon state shared across all client connections.
 struct DaemonState {
@@ -776,39 +775,12 @@ async fn token_refresh_loop(db: Arc<Database>) {
 
 // ─── Daemon Lifecycle ────────────────────────────────────────────────────────
 
-/// Get the default data directory for the current platform.
 fn default_data_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("Library/Application Support/com.brightwing.mcp-manager")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"))
-            .join("Brightwing")
-    }
+    proxy_common::transport::default_data_dir()
 }
 
-/// Get the default socket path for the current platform.
 fn default_socket_path() -> PathBuf {
-    let dir = default_data_dir();
-    #[cfg(not(target_os = "windows"))]
-    {
-        dir.join("authd.sock")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        PathBuf::from(r"\\.\pipe\brightwing-authd")
-    }
+    proxy_common::transport::default_socket_path()
 }
 
 /// Get the default PID file path.
@@ -852,13 +824,11 @@ fn is_daemon_running(pid_path: &PathBuf) -> Option<u32> {
 }
 
 /// Handle a single client connection.
-#[cfg(unix)]
 async fn handle_client(
-    stream: tokio::net::UnixStream,
+    stream: IpcServerStream,
     state: Arc<DaemonState>,
 ) {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let (mut lines, mut writer) = stream.into_split();
 
     while let Ok(Some(line)) = lines.next_line().await {
         let request: IpcRequest = match decode_message(line.as_bytes()) {
@@ -888,13 +858,6 @@ async fn handle_client(
     }
 }
 
-#[cfg(not(unix))]
-fn main() {
-    eprintln!("brightwing-authd is not yet available on Windows.");
-    std::process::exit(1);
-}
-
-#[cfg(unix)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = std::env::args()
@@ -913,12 +876,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Ensure parent directory exists
+    // Ensure parent directory exists (not applicable for Windows named pipes)
+    #[cfg(not(windows))]
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    #[cfg(windows)]
+    {
+        let data_dir = default_data_dir();
+        std::fs::create_dir_all(&data_dir)?;
+    }
 
-    // Remove stale socket file
+    // Remove stale socket file (Unix only — named pipes don't leave files)
+    #[cfg(not(windows))]
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
     }
@@ -930,9 +900,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Arc::new(Database::new().expect("Failed to open database"));
     let state = Arc::new(DaemonState::new(Arc::clone(&db)));
 
-    let listener = UnixListener::bind(&socket_path)?;
+    let mut listener = IpcListener::bind(&socket_path)?;
 
-    // Set socket permissions to owner-only (0600)
+    // Set socket permissions to owner-only (Unix only)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -978,6 +948,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         eprintln!("brightwing-authd: shutting down gracefully...");
+        #[cfg(not(windows))]
         let _ = std::fs::remove_file(&socket_path_clone);
         remove_pid_file(&pid_path_clone);
         std::process::exit(0);
@@ -985,7 +956,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok(stream) => {
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     handle_client(stream, state).await;
