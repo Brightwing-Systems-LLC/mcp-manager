@@ -110,6 +110,6 @@ jobs:
             ---
 
             See [README](https://github.com/Brightwing-Systems-LLC/mcp-manager#readme) for full documentation.
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }}
