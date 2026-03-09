@@ -242,6 +242,48 @@ impl Database {
         Ok(result)
     }
 
+    /// Delete all traces of a server: installations, favorites, disabled entries.
+    /// Returns the list of tool_ids where it was installed (for caller to uninstall from configs).
+    pub fn delete_server_records(&self, server_name: &str) -> Result<Vec<(String, String)>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+
+        // Collect installations so caller can remove from app configs
+        let mut stmt = conn
+            .prepare("SELECT tool_id, config_key FROM installations WHERE server_name = ?1")
+            .map_err(|e| format!("Failed to query installations: {}", e))?;
+        let installs: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params![server_name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Query failed: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Also check by normalized name (server_uuid often equals server_name)
+        conn.execute(
+            "DELETE FROM installations WHERE server_name = ?1",
+            rusqlite::params![server_name],
+        ).map_err(|e| format!("Failed to delete installations: {}", e))?;
+
+        // Also try by server_uuid in case it differs
+        conn.execute(
+            "DELETE FROM installations WHERE server_uuid = ?1",
+            rusqlite::params![server_name],
+        ).map_err(|e| format!("Failed to delete installations by uuid: {}", e))?;
+
+        conn.execute(
+            "DELETE FROM favorites WHERE server_name = ?1 OR server_uuid = ?1",
+            rusqlite::params![server_name],
+        ).map_err(|e| format!("Failed to delete favorite: {}", e))?;
+
+        conn.execute(
+            "DELETE FROM disabled_servers WHERE server_name = ?1",
+            rusqlite::params![server_name],
+        ).map_err(|e| format!("Failed to delete disabled entries: {}", e))?;
+
+        Ok(installs)
+    }
+
     pub fn save_config_backup(
         &self,
         tool_id: &str,

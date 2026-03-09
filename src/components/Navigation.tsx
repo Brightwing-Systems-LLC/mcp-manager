@@ -1,6 +1,9 @@
+import { useEffect } from "react";
 import { useStore } from "../store";
 import type { View } from "../lib/types";
 import birdIcon from "../assets-logo-bird.png";
+
+const APP_VERSION = "0.3.0";
 
 const navItems: { id: View; label: string; icon: string }[] = [
   { id: "dashboard", label: "Dashboard", icon: "grid" },
@@ -51,7 +54,14 @@ const icons: Record<string, JSX.Element> = {
 };
 
 export default function Navigation() {
-  const { view, setView } = useStore();
+  const { view, setView, updateAvailable, updateDownloading, installUpdate, checkForUpdate } = useStore();
+
+  // Check for updates on mount and every 4 hours
+  useEffect(() => {
+    checkForUpdate();
+    const interval = setInterval(checkForUpdate, 4 * 60 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [checkForUpdate]);
 
   return (
     <nav className="w-56 bg-brightwing-gray-800 border-r border-brightwing-gray-700 flex flex-col">
@@ -85,7 +95,20 @@ export default function Navigation() {
 
       {/* Footer */}
       <div className="px-4 py-3 border-t border-brightwing-gray-700">
-        <p className="text-xs text-brightwing-gray-500">v0.2.0</p>
+        {updateAvailable ? (
+          <button
+            onClick={installUpdate}
+            disabled={updateDownloading}
+            className="w-full flex items-center gap-2 px-2 py-1.5 text-xs font-medium bg-green-600/20 hover:bg-green-600/30 text-green-400 rounded-md transition-colors disabled:opacity-60"
+          >
+            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+            </svg>
+            {updateDownloading ? "Updating..." : `Update to v${updateAvailable.version}`}
+          </button>
+        ) : (
+          <p className="text-xs text-brightwing-gray-500">v{APP_VERSION}</p>
+        )}
       </div>
     </nav>
   );

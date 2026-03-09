@@ -104,6 +104,10 @@ export async function clearPendingDeepLink(): Promise<void> {
   return invoke("clear_pending_deep_link");
 }
 
+export async function deleteServer(serverNames: string[]): Promise<string[]> {
+  return invoke<string[]>("delete_server", { serverNames });
+}
+
 export async function backupToolConfig(toolId: string): Promise<string> {
   return invoke<string>("backup_tool_config", { toolId });
 }
@@ -236,6 +240,12 @@ export async function cacheToolSchema(params: {
   tokenEstimate: number;
 }): Promise<void> {
   return invoke("cache_tool_schema", params);
+}
+
+// --- Tool Discovery ---
+
+export async function discoverUpstreamTools(serverId: string): Promise<CachedTool[]> {
+  return invoke<CachedTool[]>("discover_upstream_tools", { serverId });
 }
 
 // --- API Key Management ---

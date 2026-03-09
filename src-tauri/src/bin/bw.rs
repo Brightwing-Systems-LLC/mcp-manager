@@ -8,6 +8,15 @@
 //!   bw <server> <tool> --key value --json # Raw JSON output
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+
+use proxy_common::ipc::{
+    ClientType, HandshakeRequest, IpcRequest, IpcResponse, decode_message, encode_message,
+};
+use proxy_common::IPC_PROTOCOL_VERSION;
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 // ─── Parsed command ──────────────────────────────────────────────────────────
 
@@ -300,6 +309,79 @@ fn format_tool_help(
     out
 }
 
+// ─── Daemon IPC client ──────────────────────────────────────────────────────
+
+fn default_socket_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("Library/Application Support/com.brightwing.mcp-manager/authd.sock")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .join("brightwing-authd.sock")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(r"\\.\pipe\brightwing-authd")
+    }
+}
+
+struct DaemonClient {
+    writer: tokio::io::WriteHalf<UnixStream>,
+    reader: tokio::io::Lines<BufReader<tokio::io::ReadHalf<UnixStream>>>,
+}
+
+impl DaemonClient {
+    async fn connect() -> Result<Self, String> {
+        let socket_path = default_socket_path();
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .map_err(|e| format!(
+                "Cannot connect to Brightwing daemon at {}: {}\nIs brightwing-authd running?",
+                socket_path.display(), e
+            ))?;
+
+        let (reader, writer) = tokio::io::split(stream);
+        let reader = BufReader::new(reader).lines();
+        Ok(Self { writer, reader })
+    }
+
+    async fn send(&mut self, request: &IpcRequest) -> Result<(), String> {
+        let bytes = encode_message(request).map_err(|e| format!("Serialize error: {}", e))?;
+        self.writer.write_all(&bytes).await.map_err(|e| format!("Write error: {}", e))
+    }
+
+    async fn recv(&mut self) -> Result<IpcResponse, String> {
+        let line = self.reader.next_line().await
+            .map_err(|e| format!("Read error: {}", e))?
+            .ok_or_else(|| "Daemon closed connection".to_string())?;
+        decode_message(line.as_bytes()).map_err(|e| format!("Parse error: {}", e))
+    }
+
+    async fn handshake(&mut self) -> Result<(), String> {
+        self.send(&IpcRequest::Handshake(HandshakeRequest {
+            client: ClientType::CliShim,
+            version: IPC_PROTOCOL_VERSION.to_string(),
+        })).await?;
+
+        match self.recv().await? {
+            IpcResponse::HandshakeOk { .. } => Ok(()),
+            IpcResponse::HandshakeError { message, .. } => Err(message),
+            other => Err(format!("Unexpected handshake response: {:?}", other)),
+        }
+    }
+
+    async fn request(&mut self, req: &IpcRequest) -> Result<IpcResponse, String> {
+        self.send(req).await?;
+        self.recv().await
+    }
+}
+
 fn print_help() {
     eprintln!("bw — Brightwing Tool Broker CLI");
     eprintln!();
@@ -322,7 +404,8 @@ fn print_help() {
     eprintln!("    bw github search_repos --query \"mcp\" # Call a tool");
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let command = match parse_command(&args) {
@@ -339,12 +422,162 @@ fn main() {
             print_help();
             std::process::exit(0);
         }
-        _ => {
-            // IPC wiring will be added in Phase 5.
-            // For now, print a message indicating the daemon connection is needed.
-            eprintln!("bw: daemon connection not yet implemented.");
-            eprintln!("Parsed command: {:?}", command);
+        _ => {}
+    }
+
+    // Connect to daemon
+    let mut daemon = match DaemonClient::connect().await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("bw: {}", e);
             std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = daemon.handshake().await {
+        eprintln!("bw: handshake failed: {}", e);
+        std::process::exit(1);
+    }
+
+    match command {
+        Command::Help => unreachable!(),
+
+        Command::List { server_id: None } => {
+            match daemon.request(&IpcRequest::ListServers).await {
+                Ok(IpcResponse::ServerList { servers }) => {
+                    let json_servers: Vec<serde_json::Value> = servers.into_iter().map(|s| {
+                        serde_json::json!({
+                            "server_id": s.server_id,
+                            "tool_count": s.tool_count,
+                            "auth_type": s.auth_type,
+                            "auth_status": s.auth_status,
+                            "token_estimate": s.token_estimate,
+                        })
+                    }).collect();
+                    print!("{}", format_server_list(&json_servers));
+                }
+                Ok(IpcResponse::Error { message, .. }) => {
+                    eprintln!("bw: {}", message);
+                    std::process::exit(1);
+                }
+                Ok(other) => {
+                    eprintln!("bw: unexpected response: {:?}", other);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("bw: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Command::List { server_id: Some(ref id) } => {
+            match daemon.request(&IpcRequest::ListTools { server_id: id.clone() }).await {
+                Ok(IpcResponse::ToolList { server_id, tools }) => {
+                    let json_tools: Vec<serde_json::Value> = tools.into_iter().map(|t| {
+                        serde_json::json!({
+                            "name": t.name,
+                            "description": t.description,
+                        })
+                    }).collect();
+                    print!("{}", format_tool_list(&server_id, &json_tools));
+                }
+                Ok(IpcResponse::Error { message, .. }) => {
+                    eprintln!("bw: {}", message);
+                    std::process::exit(1);
+                }
+                Ok(other) => {
+                    eprintln!("bw: unexpected response: {:?}", other);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("bw: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Command::ToolHelp { ref server_id, ref tool_name } => {
+            match daemon.request(&IpcRequest::GetToolSchema {
+                server_id: server_id.clone(),
+                tool_name: tool_name.clone(),
+            }).await {
+                Ok(IpcResponse::ToolSchema { name: _, description, parameters }) => {
+                    let json_params: Vec<serde_json::Value> = parameters.into_iter().map(|p| {
+                        serde_json::json!({
+                            "name": p.name,
+                            "description": p.description,
+                            "required": p.required,
+                            "default": p.default,
+                        })
+                    }).collect();
+                    print!("{}", format_tool_help(server_id, tool_name, &description, &json_params));
+                }
+                Ok(IpcResponse::Error { message, .. }) => {
+                    eprintln!("bw: {}", message);
+                    std::process::exit(1);
+                }
+                Ok(other) => {
+                    eprintln!("bw: unexpected response: {:?}", other);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("bw: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Command::CallTool { ref server_id, ref tool_name, ref arguments, json_output, verbose } => {
+            let start = std::time::Instant::now();
+
+            match daemon.request(&IpcRequest::CallTool {
+                server_id: server_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments: serde_json::to_value(arguments).unwrap_or_default(),
+            }).await {
+                Ok(IpcResponse::ToolResult { content, is_error, latency_ms }) => {
+                    if verbose {
+                        let latency = latency_ms.unwrap_or(0);
+                        let total = start.elapsed().as_millis();
+                        eprintln!("bw: upstream={}ms total={}ms", latency, total);
+                    }
+
+                    if json_output {
+                        let output = serde_json::json!({
+                            "content": content.iter().map(|c| {
+                                serde_json::json!({ "type": c.content_type, "text": c.text })
+                            }).collect::<Vec<_>>(),
+                            "isError": is_error,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+                    } else {
+                        let json_content: Vec<serde_json::Value> = content.iter().map(|c| {
+                            serde_json::json!({ "type": c.content_type, "text": c.text })
+                        }).collect();
+                        let output = format_tool_result(&json_content, is_error);
+                        if !output.is_empty() {
+                            println!("{}", output);
+                        }
+                    }
+
+                    if is_error {
+                        std::process::exit(1);
+                    }
+                }
+                Ok(IpcResponse::Error { message, .. }) => {
+                    eprintln!("bw: {}", message);
+                    std::process::exit(1);
+                }
+                Ok(other) => {
+                    eprintln!("bw: unexpected response: {:?}", other);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("bw: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

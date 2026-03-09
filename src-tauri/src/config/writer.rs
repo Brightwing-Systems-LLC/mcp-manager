@@ -595,6 +595,12 @@ fn uninstall_cli(
     def: &crate::tools::definitions::ToolDefinition,
     config_key: &str,
 ) -> Result<InstallResult, String> {
+    // For Claude Code, edit ~/.claude.json directly instead of shelling out to
+    // `claude mcp remove`, which can hang or fail when Claude Code is running.
+    if def.id == "claude_code" {
+        return uninstall_claude_code_direct(config_key);
+    }
+
     let cli_cmd = def
         .cli_command
         .ok_or_else(|| format!("No CLI command for {}", def.id))?;
@@ -623,4 +629,62 @@ fn uninstall_cli(
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("{} mcp remove failed: {}", cli_cmd, stderr))
     }
+}
+
+/// Remove an MCP server from ~/.claude.json by editing the file directly.
+/// This avoids `claude mcp remove` which can hang when Claude Code is running.
+fn uninstall_claude_code_direct(config_key: &str) -> Result<InstallResult, String> {
+    let config_path = dirs::home_dir()
+        .ok_or("No home directory")?
+        .join(".claude.json");
+
+    if !config_path.exists() {
+        return Ok(InstallResult {
+            success: true,
+            message: format!("{} not found in Claude Code (no config file)", config_key),
+            needs_restart: false,
+        });
+    }
+
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read ~/.claude.json: {}", e))?;
+    let mut root: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Invalid JSON in ~/.claude.json: {}", e))?;
+
+    let mut removed = false;
+
+    // Remove from top-level mcpServers
+    if let Some(serde_json::Value::Object(servers)) = root.get_mut("mcpServers") {
+        if servers.remove(config_key).is_some() {
+            removed = true;
+        }
+    }
+
+    // Remove from project-scoped mcpServers
+    if let Some(serde_json::Value::Object(projects)) = root.get_mut("projects") {
+        for (_path, project_config) in projects.iter_mut() {
+            if let Some(serde_json::Value::Object(servers)) = project_config.get_mut("mcpServers") {
+                if servers.remove(config_key).is_some() {
+                    removed = true;
+                }
+            }
+        }
+    }
+
+    if removed {
+        let updated = serde_json::to_string_pretty(&root)
+            .map_err(|e| format!("Failed to serialize ~/.claude.json: {}", e))?;
+        std::fs::write(&config_path, updated)
+            .map_err(|e| format!("Failed to write ~/.claude.json: {}", e))?;
+    }
+
+    Ok(InstallResult {
+        success: true,
+        message: if removed {
+            format!("Removed {} from Claude Code", config_key)
+        } else {
+            format!("{} not found in Claude Code config", config_key)
+        },
+        needs_restart: false,
+    })
 }

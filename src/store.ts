@@ -100,6 +100,13 @@ interface AppState {
   stopDaemon: () => Promise<void>;
   toggleAutostart: () => Promise<void>;
 
+  // App updates
+  updateAvailable: { version: string; notes: string } | null;
+  updateDownloading: boolean;
+  updateProgress: number;
+  checkForUpdate: () => Promise<void>;
+  installUpdate: () => Promise<void>;
+
   // Notifications
   toast: { message: string; type: "success" | "error" } | null;
   showToast: (message: string, type: "success" | "error") => void;
@@ -421,6 +428,58 @@ export const useStore = create<AppState>((set, get) => ({
       );
     } catch (e) {
       get().showToast(`Failed to toggle auto-start: ${e}`, "error");
+    }
+  },
+
+  // App updates
+  updateAvailable: null,
+  updateDownloading: false,
+  updateProgress: 0,
+  checkForUpdate: async () => {
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const update = await check();
+      if (update) {
+        set({
+          updateAvailable: {
+            version: update.version,
+            notes: update.body || "",
+          },
+        });
+        // Store the update object for later install
+        (get() as unknown as Record<string, unknown>)._updateObj = update;
+      }
+    } catch (e) {
+      console.error("Update check failed:", e);
+    }
+  },
+  installUpdate: async () => {
+    const updateObj = (get() as unknown as Record<string, unknown>)._updateObj as
+      | { downloadAndInstall: (cb?: (event: { event: string; data: { contentLength?: number; chunkLength?: number } }) => void) => Promise<void> }
+      | undefined;
+    if (!updateObj) return;
+    set({ updateDownloading: true, updateProgress: 0 });
+    try {
+      let downloaded = 0;
+      await updateObj.downloadAndInstall((event) => {
+        if (event.event === "Started" && event.data.contentLength) {
+          downloaded = 0;
+        } else if (event.event === "Progress" && event.data.chunkLength) {
+          downloaded += event.data.chunkLength;
+        } else if (event.event === "Finished") {
+          set({ updateProgress: 100 });
+        }
+        // Estimate progress if we have content length
+        if (downloaded > 0) {
+          set({ updateProgress: Math.min(99, Math.round(downloaded / 1024 / 1024)) });
+        }
+      });
+      // Relaunch the app
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (e) {
+      get().showToast(`Update failed: ${e}`, "error");
+      set({ updateDownloading: false });
     }
   },
 

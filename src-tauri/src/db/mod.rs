@@ -21,6 +21,10 @@ impl Database {
         let conn = Connection::open(&db_path)
             .map_err(|e| format!("Failed to open database: {}", e))?;
 
+        // WAL mode allows concurrent reads from GUI and daemon processes
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .map_err(|e| format!("Failed to set WAL mode: {}", e))?;
+
         migrations::run_migrations(&conn)?;
 
         Ok(Database {

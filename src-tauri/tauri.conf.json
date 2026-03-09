@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/nicedoc/schemas/main/tauri/tauri.conf.v2.json",
   "productName": "Brightwing MCP Manager",
   "identifier": "com.brightwing.mcp-manager",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -28,6 +28,12 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
+    "externalBin": [
+      "binaries/brightwing-authd",
+      "binaries/brightwing-proxy",
+      "binaries/bw"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/192x192.png",
@@ -41,6 +47,12 @@
       "desktop": {
         "schemes": ["brightwing"]
       }
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhEMTA0RkRCNzA3OTEwNTQKUldSVUVIbHcyMDhRalY4elVQR0pjM1JpckN3NzNmRHphckxtS1ZBbWQrRzlrbjZHblZJL3RrNjYK",
+      "endpoints": [
+        "https://github.com/Brightwing-Systems-LLC/mcp-manager/releases/latest/download/latest.json"
+      ]
     }
   }
 }

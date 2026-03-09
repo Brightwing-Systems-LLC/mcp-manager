@@ -12,6 +12,7 @@ use proxy_common::ipc::{
 };
 use proxy_common::IPC_PROTOCOL_VERSION;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -383,6 +384,134 @@ fn apply_tool_filter(response: &mut serde_json::Value, enabled_tools: &[String])
     }
 }
 
+/// Forward MCP traffic between stdin/stdout and an upstream stdio child process.
+/// Injects env vars from the credential store and applies tool filtering.
+async fn run_stdio_proxy(
+    args: &ProxyArgs,
+    command: &str,
+    child_args: &[String],
+    env: &HashMap<String, String>,
+    tool_filter: Vec<String>,
+) -> Result<(), String> {
+    use tokio::process::Command;
+
+    if args.verbose {
+        eprintln!(
+            "brightwing-proxy: stdio mode: {} {}",
+            command,
+            child_args.join(" ")
+        );
+    }
+
+    // Spawn the upstream process with injected env vars
+    let mut child = Command::new(command)
+        .args(child_args)
+        .envs(env.iter())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn '{}': {}", command, e))?;
+
+    let child_stdin = child.stdin.take().ok_or("Failed to open child stdin")?;
+    let child_stdout = child.stdout.take().ok_or("Failed to open child stdout")?;
+
+    let mut our_stdin = BufReader::new(tokio::io::stdin()).lines();
+    let mut child_reader = BufReader::new(child_stdout).lines();
+    let mut child_writer = child_stdin;
+    let mut our_stdout = tokio::io::stdout();
+
+    loop {
+        tokio::select! {
+            // Read from our stdin (AI tool) → write to child stdin
+            line = our_stdin.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() { continue; }
+                        if args.verbose {
+                            if let Ok(req) = serde_json::from_str::<serde_json::Value>(&line) {
+                                if let Some(method) = req.get("method").and_then(|m| m.as_str()) {
+                                    eprintln!("brightwing-proxy: → {}", method);
+                                }
+                            }
+                        }
+                        let mut bytes = line.into_bytes();
+                        bytes.push(b'\n');
+                        if child_writer.write_all(&bytes).await.is_err() {
+                            break; // Child closed stdin
+                        }
+                    }
+                    Ok(None) => {
+                        // AI tool closed stdin — kill child
+                        child.kill().await.ok();
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Read from child stdout → write to our stdout (AI tool)
+            line = child_reader.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        let mut response: serde_json::Value = match serde_json::from_str(&line) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                // Pass through non-JSON lines
+                                let mut bytes = line.into_bytes();
+                                bytes.push(b'\n');
+                                let _ = our_stdout.write_all(&bytes).await;
+                                continue;
+                            }
+                        };
+
+                        // Apply tool filter to tools/list responses
+                        if !tool_filter.is_empty() {
+                            // We need to match against the request method, but for stdio
+                            // we can detect tools/list responses by their shape
+                            if response.get("result").and_then(|r| r.get("tools")).is_some() {
+                                apply_tool_filter(&mut response, &tool_filter);
+                            }
+                        }
+
+                        if args.verbose {
+                            eprintln!("brightwing-proxy: ← response");
+                        }
+
+                        let mut out = serde_json::to_vec(&response).unwrap_or_default();
+                        out.push(b'\n');
+                        if our_stdout.write_all(&out).await.is_err() {
+                            child.kill().await.ok();
+                            break;
+                        }
+                    }
+                    Ok(None) => break, // Child closed stdout
+                    Err(_) => break,
+                }
+            }
+            // Child process exited
+            status = child.wait() => {
+                match status {
+                    Ok(s) => {
+                        if args.verbose {
+                            eprintln!("brightwing-proxy: child exited with {}", s);
+                        }
+                        if !s.success() {
+                            std::process::exit(s.code().unwrap_or(1));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("brightwing-proxy: child wait error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -440,18 +569,45 @@ async fn main() {
         .await
         .unwrap_or_default();
 
-    // Extract upstream URL and auth header
-    let (upstream_url, auth_header) = match &credential {
+    // Determine proxy mode: HTTP or stdio
+    match &credential {
         Credential::OAuth(oauth) => {
-            (oauth.url.clone(), Some(format!("Bearer {}", oauth.access_token)))
+            let result = run_http_proxy(
+                &args,
+                &oauth.url,
+                Some(format!("Bearer {}", oauth.access_token)),
+                tool_filter,
+                &mut daemon,
+            ).await;
+            if let Err(e) = result {
+                eprintln!("brightwing-proxy: {}", e);
+                std::process::exit(1);
+            }
         }
         Credential::ApiKey(api_key) => {
             if let Some(ref url) = api_key.url {
                 let auth = api_key.env.values().next().map(|v| format!("Bearer {}", v));
-                (url.clone(), auth)
+                let result = run_http_proxy(&args, url, auth, tool_filter, &mut daemon).await;
+                if let Err(e) = result {
+                    eprintln!("brightwing-proxy: {}", e);
+                    std::process::exit(1);
+                }
+            } else if let Some(ref command) = api_key.command {
+                let child_args = api_key.args.clone().unwrap_or_default();
+                let result = run_stdio_proxy(
+                    &args,
+                    command,
+                    &child_args,
+                    &api_key.env,
+                    tool_filter,
+                ).await;
+                if let Err(e) = result {
+                    eprintln!("brightwing-proxy: {}", e);
+                    std::process::exit(1);
+                }
             } else {
                 eprintln!(
-                    "brightwing-proxy: stdio upstream proxy not yet implemented for {}",
+                    "brightwing-proxy: server {} has no URL or command configured",
                     args.server_id
                 );
                 std::process::exit(1);
@@ -464,14 +620,6 @@ async fn main() {
             );
             std::process::exit(1);
         }
-    };
-
-    // Start proxying (daemon stays connected for 401 re-auth)
-    let result = run_http_proxy(&args, &upstream_url, auth_header, tool_filter, &mut daemon).await;
-
-    if let Err(e) = result {
-        eprintln!("brightwing-proxy: {}", e);
-        std::process::exit(1);
     }
 }
 

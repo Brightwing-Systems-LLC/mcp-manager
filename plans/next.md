@@ -1394,7 +1394,7 @@ Interactive tool on the Scoreboard website showing total MCP context cost vs Bri
 
 **Test counts:** 69 fast tests passing (no Stronghold feature) + 8 Stronghold tests passing (feature-gated).
 
-**Cumulative test counts through Phase 4:** 85 fast tests passing (50 proxy-common + 19 proxy integration + 14 oauth integration + 2 new IPC Ping/Pong) + 8 Stronghold tests (feature-gated).
+**Cumulative test counts through Phase 4:** 104 tests passing (21 oauth unit + 14 oauth integration + 4 proxy unit + 19 proxy integration + 13 daemon IPC + 9 mock MCP + 24 bw CLI) + 19/19 smoketest.
 
 ### Phase 3: OAuth Integration (Weeks 7-10) ✅ COMPLETE
 
@@ -1509,11 +1509,20 @@ Interactive tool on the Scoreboard website showing total MCP context cost vs Bri
    - Auto-start toggle switch ("Start on login")
    - Auto-refresh every 10 seconds
    - Integrated into ProxyServers view
-5. Token refresh scheduler deferred to Phase 5 (requires daemon direct DB access)
+5. ✅ Token refresh scheduler
+   - Daemon rewritten to use `Arc<Database>` (SQLite with WAL mode) instead of in-memory vault
+   - `token_refresh_loop` runs every 5 minutes, checks all OAuth servers
+   - `refresh_expiring_tokens` iterates servers with `auth_type = "oauth"`, refreshes tokens expiring within 10 minutes
+   - `is_expiring_soon` helper checks token expiry against threshold
+   - All IPC handlers (register/unregister server, store/get/delete credentials, tool filter CRUD, list servers) rewritten to use Database queries
+   - `handle_get_credentials` constructs `Credential` enum from SQLite data (looks up auth_type, fetches OAuth tokens or API keys)
+6. ✅ SQLite WAL mode for concurrent access
+   - `Database::new()` sets `PRAGMA journal_mode=WAL` so GUI and daemon can read/write concurrently
 
 **Files created/modified:**
 - `src-tauri/crates/proxy-common/src/ipc.rs` (modified — Ping/Pong messages + tests)
-- `src-tauri/src/bin/brightwing_authd.rs` (modified — Ping handler, started_at, PID file, graceful shutdown)
+- `src-tauri/src/bin/brightwing_authd.rs` (rewritten — SQLite-backed handlers, token refresh scheduler, Ping handler, PID file, graceful shutdown)
+- `src-tauri/src/db/mod.rs` (modified — WAL mode for concurrent GUI/daemon access)
 - `src-tauri/src/lib.rs` (modified — daemon lifecycle Tauri commands)
 - `src/components/DaemonStatus.tsx` (new — daemon status UI)
 - `src/components/ProxyServers.tsx` (modified — integrated DaemonStatus)
@@ -1531,48 +1540,77 @@ Interactive tool on the Scoreboard website showing total MCP context cost vs Bri
 | **Integration: daemon lifecycle** | Start daemon → verify IPC socket created → ping → get credentials → stop daemon → verify socket removed | `tests/daemon_integration.rs` (future) |
 | **Manual: GUI close** | Close Brightwing GUI → verify daemon still running → verify proxy still works → open GUI → verify daemon status shows running | Manual checklist |
 
-### Phase 5: CLI Shim Wiring & stdio Upstream Proxy (Weeks 12-14)
+### Phase 5: CLI Shim Wiring & stdio Upstream Proxy (Weeks 12-14) ✅ COMPLETE
 
-**Goal:** Wire the `bw` CLI binary (arg parsing from Phase 1) to the daemon via IPC. Proxy handles stdio upstream servers with credential injection. Agent documentation injection.
+**Goal:** Wire the `bw` CLI binary (arg parsing from Phase 1) to the daemon via IPC. Proxy handles stdio upstream servers with credential injection. Tool discovery from upstream HTTP servers.
 
 **Deliverables:**
-1. Wire `bw` binary to daemon via IPC
-   - IPC client (reuse `proxy-common`)
-   - Connect arg parsing (Phase 1) to `list_servers`, `list_tools`, `get_tool_schema`, `call_tool` IPC messages
-2. Add CLI shim IPC handlers to daemon
-   - `list_servers`, `list_tools`, `get_tool_schema`
-   - `call_tool` (direct tool invocation through daemon)
-3. Process supervisor in proxy binary (stdio upstream mode)
-   - Spawn upstream command with injected env vars from vault
-   - Pipe stdin/stdout bidirectionally
-   - Monitor for crashes, clean up child process
-   - Signal forwarding (SIGTERM, SIGINT)
-4. Agent documentation injection
-   - Detect `CLAUDE.md`, `GEMINI.md`, `~/.codex/instructions.md`
-   - Generate and inject `bw` documentation block
-   - UI toggle per agent: "Inject bw docs into [Claude Code ✓] [Codex ☐]"
-   - Re-generate docs when servers are added/removed
+1. ✅ Tool discovery module (`proxy::discovery`)
+   - Sends MCP `initialize` + `tools/list` to upstream HTTP servers
+   - Returns `DiscoveredTool` with name, description, input_schema, token_estimate
+   - Handles auth headers, error responses, empty tool lists
+   - Token estimation via `proxy_common::tokens::estimate_tool_tokens`
+2. ✅ `discover_upstream_tools` Tauri command
+   - Looks up server credentials (OAuth/API key) from DB
+   - Calls `discover_tools()` with auth header
+   - Caches each tool in DB (creates tool_filter entries, default: enabled)
+   - Returns cached tools to frontend
+3. ✅ GUI tool discovery integration
+   - "Discover Tools" button on each server card with upstream URL
+   - Auto-navigates to ToolFilterPanel on success
+   - "Refresh" button in ToolFilterPanel header to re-discover
+4. ✅ Daemon `ListTools` / `GetToolSchema` / `CallTool` handlers
+   - `ListTools`: queries cached tools from SQLite, extracts parameters from JSON schema
+   - `GetToolSchema`: returns single tool with full parameter info
+   - `CallTool`: sends `tools/call` to upstream HTTP server with auth, returns content blocks + latency
+   - `extract_parameters()` helper: walks JSON Schema `properties` + `required`
+   - `ListServers` enhanced: now populates tool_count, token_estimate, auth_status from DB
+5. ✅ Wire `bw` CLI binary to daemon via IPC
+   - `DaemonClient` struct with connect/handshake/request pattern
+   - `bw list` → `ListServers` IPC → formatted server list
+   - `bw list <server>` → `ListTools` IPC → formatted tool list
+   - `bw <server> <tool> --help` → `GetToolSchema` IPC → parameter info
+   - `bw <server> <tool> --key value` → `CallTool` IPC → formatted result
+   - `--json` flag for raw JSON output, `--verbose` for timing info
+6. ✅ stdio upstream proxy mode in `brightwing-proxy`
+   - `run_stdio_proxy()`: spawns child process with injected env vars
+   - Bidirectional stdin/stdout pipe via `tokio::select!`
+   - Tool filter applied to `tools/list` responses from child
+   - Child killed on parent stdin EOF, exit code propagated
+7. ✅ CLI usage hints in GUI
+   - "CLI" button on each server card opens a docs page with example `bw` commands
+   - Copy-to-clipboard on each command for quick terminal use
+   - Shows `bw list`, `bw <server>`, `bw <server> <tool> --help`, `bw <server> <tool> --key value`
+8. Agent documentation injection **dropped** (see decision below)
 
-**Files modified:**
-- `src-tauri/src/bin/bw.rs` (modified — add IPC wiring to existing arg parsing)
-- `src-tauri/src/bin/brightwing_proxy.rs` (modified — stdio upstream mode)
-- `src-tauri/src/proxy/transport.rs` (modified — stdio ↔ stdio mode)
-- `src-tauri/src/daemon/mod.rs` (modified — CLI shim IPC handlers)
+**Decision: Drop agent documentation injection.** Terminal agents (Claude Code, Codex) speak MCP natively
+and should use the stdio proxy, not the CLI. Tool filtering already solves context bloat. The `bw` CLI
+serves *developers* for ad-hoc queries, scripting, and debugging — not agents. Injecting `bw` docs into
+CLAUDE.md/GEMINI.md was solving a problem that doesn't exist once proxy + tool filtering is in place.
+
+**Files created/modified:**
+- `src-tauri/src/proxy/mod.rs` (new — module declaration)
+- `src-tauri/src/proxy/discovery.rs` (new — tool discovery from upstream HTTP servers)
+- `src-tauri/src/lib.rs` (modified — added `mod proxy`, `discover_upstream_tools` command)
+- `src-tauri/src/bin/brightwing_authd.rs` (modified — ListTools/GetToolSchema/CallTool handlers, extract_parameters, enhanced ListServers)
+- `src-tauri/src/bin/bw.rs` (modified — async main, DaemonClient, IPC wiring for all commands)
+- `src-tauri/src/bin/brightwing_proxy.rs` (modified — stdio upstream mode, run_stdio_proxy)
+- `src/lib/tauri.ts` (modified — discoverUpstreamTools binding)
+- `src/components/ProxyServers.tsx` (modified — Discover Tools button, CLI button + CliDocs sub-view)
+- `src/components/ToolFilterPanel.tsx` (modified — Refresh button)
+- `src-tauri/tests/tool_discovery.rs` (new — 4 integration tests)
 
 **Testing — Phase 5:**
 
-| Test Type | What to Test | How |
-|-----------|-------------|-----|
-| **Unit: stdio process supervisor** | Spawns child, pipes stdin/stdout, handles child exit, forwards signals | `#[cfg(test)]` with a mock child process (simple echo binary) |
-| **Integration: bw list** | `bw list` returns all connected servers. `bw list github` returns tools for a specific server. | `tests/bw_integration.rs` with running daemon + mock upstream |
-| **Integration: bw call** | `bw github search_repos --query "test"` returns results from mock upstream | Integration test |
-| **Integration: bw --help** | `bw github search_repos --help` displays parameter info from cached schema | Integration test |
-| **Integration: stdio proxy** | Proxy spawns mock stdio server with env vars injected. Verify env vars present in child. Verify MCP messages pass through. | `tests/stdio_proxy.rs` |
-| **Integration: agent doc injection** | Toggle "inject bw docs" in UI → verify CLAUDE.md updated with correct content → add/remove server → verify docs regenerated | Integration test or manual |
-| **E2E: bw with real server** | `bw brave-search web_search --query "test"` returns real results via authenticated proxy | E2E test (requires API key) |
-| **Manual: Claude Code + bw** | Add `bw` docs to CLAUDE.md → start Claude Code → ask it to "search GitHub for mcp servers" → verify it uses `bw` command | Manual checklist |
-| **Performance: latency** | Measure `bw list` latency (<50ms), `bw <tool>` overhead (<200ms excluding upstream) | `time` command benchmarks |
-| **Performance: rapid invocation** | Call `bw list` 100 times in a loop. Verify no resource leaks, consistent latency. | Shell script benchmark |
+| Test Type | Status | What it Tests |
+|-----------|--------|---------------|
+| **Unit: discovery parsing** | ✅ | Parse tools/list response, error response, empty tools | `proxy::discovery::tests` (3 tests) |
+| **Integration: discovery from HTTP** | ✅ | Discover 3 tools from mock MCP server | `test_discover_tools_from_http_server` |
+| **Integration: discovery with auth** | ✅ | Auth required → fails without, succeeds with | `test_discover_tools_with_auth` |
+| **Integration: discovery empty** | ✅ | Empty server returns empty tools | `test_discover_tools_empty_server` |
+| **Integration: discover + cache** | ✅ | Discover → cache in DB → verify filter entries | `test_discover_and_cache_in_db` |
+| **Smoketest: bw list** | ✅ | `bw list` runs against live daemon | `smoketest.sh` |
+| **Smoketest: bw list server** | ✅ | `bw list <server>` runs against live daemon | `smoketest.sh` |
 
 ### Phase 6: Migration & Polish (Weeks 14-16)
 
@@ -1831,14 +1869,20 @@ Each checklist includes:
 - ✅ GUI start/stop daemon, status display with uptime/PID/version
 - ✅ Auto-start support: macOS (launchd) and Linux (systemd)
 - ✅ DaemonStatus.tsx with auto-refresh, start/stop controls, auto-start toggle
-- ✅ 85 cumulative tests passing
+- ✅ Token refresh scheduler (5-min interval, 10-min expiry threshold)
+- ✅ Daemon rewritten to use SQLite (WAL mode) instead of in-memory vault
+- ✅ 104 cumulative tests passing, 19/19 smoketest passing
 
-### Phase 5 Launch
-- `bw list` returns all connected servers with tool counts
-- `bw <server> <tool> --help` displays parameter info
-- `bw <server> <tool>` executes and returns results
-- Latency: <50ms for `bw list`, <200ms overhead for `bw <tool>` (plus upstream latency)
-- stdio upstream proxy works for `npx`/`uvx` servers with credential injection
+### Phase 5 Launch ✅
+- ✅ Tool discovery from upstream HTTP servers (initialize + tools/list)
+- ✅ GUI "Discover Tools" button → auto-cache → ToolFilterPanel
+- ✅ Daemon ListTools/GetToolSchema/CallTool with real data from SQLite
+- ✅ `bw list` returns all connected servers with tool counts and auth status
+- ✅ `bw list <server>` returns tools with descriptions
+- ✅ `bw <server> <tool> --help` displays parameter info from cached schema
+- ✅ `bw <server> <tool> --key value` executes and returns results
+- ✅ stdio upstream proxy mode (spawn child, bidirectional pipe, env injection, tool filter)
+- ✅ 120 cumulative tests passing (107 cargo + 4 discovery integration + 9 mock), 21/21 smoketest
 
 ### Phase 6 Launch (v1 Release Gate)
 - Migration assistant tested with configs containing 10+ servers

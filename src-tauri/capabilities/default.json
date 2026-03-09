@@ -14,6 +14,9 @@
     "fs:allow-mkdir",
     "http:default",
     "notification:default",
-    "deep-link:default"
+    "deep-link:default",
+    "updater:default",
+    "process:allow-restart",
+    "process:allow-exit"
   ]
 }

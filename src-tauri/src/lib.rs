@@ -2,6 +2,7 @@ mod config;
 pub mod db;
 mod deeplink;
 pub mod oauth;
+pub mod proxy;
 mod tools;
 
 use config::reader::ConfiguredServer;
@@ -184,6 +185,61 @@ fn get_disabled_servers(
     db: tauri::State<'_, Database>,
 ) -> Result<Vec<DisabledServer>, String> {
     db.get_disabled_servers()
+}
+
+/// Completely delete a server: uninstall from all app configs, remove all DB records.
+/// Accepts multiple name variants (the same server may have different names across tools).
+/// Returns the list of tool IDs where the server was removed.
+#[tauri::command]
+fn delete_server(
+    server_names: Vec<String>,
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<String>, String> {
+    let mut removed_from = Vec::new();
+
+    // 1. Delete DB records for all name variants
+    for name in &server_names {
+        if let Ok(installs) = db.delete_server_records(name) {
+            // 2. Uninstall from each tool's config file
+            for (tool_id, config_key) in &installs {
+                if removed_from.contains(tool_id) {
+                    continue;
+                }
+                let _ = config::backup::backup_config(tool_id);
+                match config::writer::uninstall_server(tool_id, config_key) {
+                    Ok(result) if result.success => {
+                        removed_from.push(tool_id.clone());
+                    }
+                    _ => {
+                        // Also try with server_name as config_key
+                        if let Ok(result) = config::writer::uninstall_server(tool_id, name) {
+                            if result.success {
+                                removed_from.push(tool_id.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Scan live configs as a safety net — catch anything not in the DB
+    let configured = config::reader::read_all_configured_servers();
+    for cs in &configured {
+        if removed_from.contains(&cs.tool_id) {
+            continue;
+        }
+        if server_names.iter().any(|n| n == &cs.server_name) {
+            let _ = config::backup::backup_config(&cs.tool_id);
+            if let Ok(result) = config::writer::uninstall_server(&cs.tool_id, &cs.server_name) {
+                if result.success {
+                    removed_from.push(cs.tool_id.clone());
+                }
+            }
+        }
+    }
+
+    Ok(removed_from)
 }
 
 #[tauri::command]
@@ -488,6 +544,65 @@ fn cache_tool_schema(
     db: tauri::State<'_, Database>,
 ) -> Result<(), String> {
     db.cache_tool_schema(&server_id, &tool_name, &description, &input_schema, token_estimate)
+}
+
+// --- Tool Discovery ---
+
+#[tauri::command]
+async fn discover_upstream_tools(
+    server_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<CachedTool>, String> {
+    // 1. Look up server
+    let server = db
+        .get_proxy_server(&server_id)?
+        .ok_or_else(|| format!("Server '{}' not found", server_id))?;
+
+    let upstream_url = server
+        .upstream_url
+        .as_ref()
+        .ok_or("Server has no upstream URL configured")?;
+
+    // 2. Build auth header from credentials
+    let auth_header = match server.auth_type.as_str() {
+        "oauth" => {
+            if let Ok(Some(token_json)) = db.get_oauth_token_set(&server_id) {
+                if let Ok(ts) = serde_json::from_str::<oauth::types::OAuthTokenSet>(&token_json) {
+                    Some(format!("Bearer {}", ts.access_token))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        "api_key" => {
+            if let Ok(Some(key)) = db.get_api_key(&server_id) {
+                key.env.values().next().map(|v| format!("Bearer {}", v))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    // 3. Discover tools from upstream
+    let tools = proxy::discovery::discover_tools(upstream_url, auth_header.as_deref()).await?;
+
+    // 4. Cache each tool in DB (also creates tool_filter entries)
+    for tool in &tools {
+        let schema_str = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+        db.cache_tool_schema(
+            &server_id,
+            &tool.name,
+            &tool.description,
+            &schema_str,
+            tool.token_estimate,
+        )?;
+    }
+
+    // 5. Return cached tools
+    db.get_cached_tools(&server_id)
 }
 
 // --- OAuth Flow ---
@@ -1112,6 +1227,8 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(db)
         .manage(deep_link_state)
         .manage(oauth::flow::OAuthFlowStates::new())
@@ -1130,6 +1247,7 @@ pub fn run() {
             disable_server,
             enable_server,
             get_disabled_servers,
+            delete_server,
             backup_tool_config,
             api_search_servers,
             api_get_install_config,
@@ -1151,6 +1269,7 @@ pub fn run() {
             set_tool_filter_bulk,
             get_cached_tools,
             cache_tool_schema,
+            discover_upstream_tools,
             // OAuth
             start_oauth_flow,
             complete_oauth_callback,

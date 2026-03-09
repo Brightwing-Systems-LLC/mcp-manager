@@ -1,5 +1,6 @@
 import { useEffect, useState, useMemo } from "react";
 import { useStore } from "../store";
+import * as tauri from "../lib/tauri";
 import type { ProxyServer, ToolFilterEntry } from "../lib/types";
 
 interface Props {
@@ -11,6 +12,7 @@ export default function ToolFilterPanel({ server, onBack }: Props) {
   const { activeFilter, activeFilterLoading, loadToolFilter, toggleToolFilter, showToast } =
     useStore();
   const [search, setSearch] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     loadToolFilter(server.server_id);
@@ -65,10 +67,29 @@ export default function ToolFilterPanel({ server, onBack }: Props) {
             <path strokeLinecap="round" strokeLinejoin="round" d="M10.5 19.5 3 12m0 0 7.5-7.5M3 12h18" />
           </svg>
         </button>
-        <div>
+        <div className="flex-1">
           <h1 className="text-xl font-semibold">{server.display_name}</h1>
           <p className="text-sm text-brightwing-gray-400">Tool Filter</p>
         </div>
+        {server.upstream_url && (
+          <button
+            onClick={async () => {
+              setRefreshing(true);
+              try {
+                const tools = await tauri.discoverUpstreamTools(server.server_id);
+                showToast(`Refreshed: ${tools.length} tools`, "success");
+                loadToolFilter(server.server_id);
+              } catch (e) {
+                showToast(`Refresh failed: ${e}`, "error");
+              }
+              setRefreshing(false);
+            }}
+            disabled={refreshing}
+            className="px-3 py-1.5 text-xs bg-brightwing-gray-700 hover:bg-brightwing-gray-600 rounded-md transition-colors disabled:opacity-50"
+          >
+            {refreshing ? "Refreshing..." : "Refresh"}
+          </button>
+        )}
       </div>
 
       {/* Token budget bar */}

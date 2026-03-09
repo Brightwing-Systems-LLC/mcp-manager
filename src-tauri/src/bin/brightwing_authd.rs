@@ -2,22 +2,26 @@
 //!
 //! Listens on a Unix domain socket (macOS/Linux) or named pipe (Windows) and handles:
 //! - Version handshake
-//! - Credential retrieval from VaultBackend
+//! - Credential retrieval from SQLite (shared with the Tauri GUI)
 //! - Tool filter queries
 //! - Server/tool listing for the `bw` CLI shim
-//! - Tool calls forwarded to upstream MCP servers
 //! - Ping/Pong health checks
 //! - PID file management and graceful shutdown
+//! - Background token refresh scheduler
 
 use proxy_common::ipc::{
     ClientType, HandshakeRequest, IpcRequest, IpcResponse,
     decode_message, encode_message,
 };
 use proxy_common::credentials::{
-    Credential, CredentialError, CredentialErrorCode,
+    Credential, OAuthCredential, ApiKeyCredential,
+    CredentialError, CredentialErrorCode,
 };
-use proxy_common::vault::{InMemoryVaultBackend, VaultBackend};
 use proxy_common::{IPC_PROTOCOL_VERSION, versions_compatible};
+
+use brightwing_mcp_manager_lib::db::Database;
+use brightwing_mcp_manager_lib::oauth::types::OAuthTokenSet;
+use brightwing_mcp_manager_lib::oauth::refresh::refresh_token;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,15 +31,15 @@ use tokio::net::UnixListener;
 
 /// Daemon state shared across all client connections.
 struct DaemonState {
-    vault: Arc<dyn VaultBackend>,
+    db: Arc<Database>,
     version: String,
     started_at: Instant,
 }
 
 impl DaemonState {
-    fn new(vault: Arc<dyn VaultBackend>) -> Self {
+    fn new(db: Arc<Database>) -> Self {
         Self {
-            vault,
+            db,
             version: IPC_PROTOCOL_VERSION.to_string(),
             started_at: Instant::now(),
         }
@@ -47,62 +51,51 @@ impl DaemonState {
             IpcRequest::Handshake(hs) => self.handle_handshake(hs),
 
             IpcRequest::GetCredentials { server_id } => {
-                self.handle_get_credentials(&server_id).await
+                self.handle_get_credentials(&server_id)
             }
 
             IpcRequest::StoreCredentials { server_id, credential } => {
-                self.handle_store_credentials(&server_id, &credential).await
+                self.handle_store_credentials(&server_id, &credential)
             }
 
             IpcRequest::DeleteCredentials { server_id } => {
-                self.handle_delete_credentials(&server_id).await
+                self.handle_delete_credentials(&server_id)
             }
 
             IpcRequest::GetToolFilter { server_id } => {
-                self.handle_get_tool_filter(&server_id).await
+                self.handle_get_tool_filter(&server_id)
             }
 
             IpcRequest::SetToolFilter { server_id, tool_name, enabled } => {
-                self.handle_set_tool_filter(&server_id, &tool_name, enabled).await
+                self.handle_set_tool_filter(&server_id, &tool_name, enabled)
             }
 
             IpcRequest::SetToolFilterBulk { server_id, enabled_tools } => {
-                self.handle_set_tool_filter_bulk(&server_id, &enabled_tools).await
+                self.handle_set_tool_filter_bulk(&server_id, &enabled_tools)
             }
 
             IpcRequest::RegisterServer { server_id, display_name, auth_type, upstream_url } => {
-                self.handle_register_server(&server_id, &display_name, &auth_type, upstream_url.as_deref()).await
+                self.handle_register_server(&server_id, &display_name, &auth_type, upstream_url.as_deref())
             }
 
             IpcRequest::UnregisterServer { server_id } => {
-                self.handle_unregister_server(&server_id).await
+                self.handle_unregister_server(&server_id)
             }
 
             IpcRequest::ListServers => {
-                self.handle_list_servers().await
+                self.handle_list_servers()
             }
 
             IpcRequest::ListTools { server_id } => {
-                // Stub: Phase 5 will populate from cached tool schemas
-                IpcResponse::ToolList {
-                    server_id,
-                    tools: vec![],
-                }
+                self.handle_list_tools(&server_id)
             }
 
             IpcRequest::GetToolSchema { server_id, tool_name } => {
-                IpcResponse::Error {
-                    code: "not_found".to_string(),
-                    message: format!("Tool {}/{} not found", server_id, tool_name),
-                }
+                self.handle_get_tool_schema(&server_id, &tool_name)
             }
 
-            IpcRequest::CallTool { server_id, tool_name, .. } => {
-                // Stub: Phase 5 will implement upstream forwarding
-                IpcResponse::Error {
-                    code: "not_implemented".to_string(),
-                    message: format!("call_tool for {}/{} not yet implemented", server_id, tool_name),
-                }
+            IpcRequest::CallTool { server_id, tool_name, arguments } => {
+                self.handle_call_tool(&server_id, &tool_name, &arguments).await
             }
 
             IpcRequest::Ping => {
@@ -139,256 +132,648 @@ impl DaemonState {
         }
     }
 
-    async fn handle_get_credentials(&self, server_id: &str) -> IpcResponse {
-        let key = format!("credential:{}", server_id);
-        match self.vault.retrieve(&key).await {
-            Ok(Some(data)) => {
-                match serde_json::from_slice::<Credential>(&data) {
-                    Ok(credential) => IpcResponse::Credentials {
-                        server_id: server_id.to_string(),
-                        credential,
-                    },
-                    Err(e) => IpcResponse::CredentialError {
-                        server_id: server_id.to_string(),
-                        error: CredentialError {
-                            code: CredentialErrorCode::Internal,
-                            message: format!("Failed to deserialize credential: {}", e),
-                        },
-                    },
-                }
-            }
-            Ok(None) => IpcResponse::CredentialError {
-                server_id: server_id.to_string(),
-                error: CredentialError {
-                    code: CredentialErrorCode::NotFound,
-                    message: format!("Server '{}' not registered in Brightwing", server_id),
-                },
-            },
-            Err(e) => IpcResponse::CredentialError {
-                server_id: server_id.to_string(),
-                error: CredentialError {
-                    code: CredentialErrorCode::VaultError,
-                    message: format!("Vault error: {}", e),
-                },
-            },
-        }
-    }
-
-    async fn handle_store_credentials(&self, server_id: &str, credential: &Credential) -> IpcResponse {
-        let key = format!("credential:{}", server_id);
-        let data = match serde_json::to_vec(credential) {
-            Ok(d) => d,
-            Err(e) => return IpcResponse::Error {
-                code: "serialize_error".to_string(),
-                message: format!("Failed to serialize credential: {}", e),
-            },
-        };
-        match self.vault.store(&key, &data).await {
-            Ok(()) => IpcResponse::Ok {
-                message: Some(format!("Credentials stored for '{}'", server_id)),
-            },
-            Err(e) => IpcResponse::Error {
-                code: "vault_error".to_string(),
-                message: format!("Failed to store credentials: {}", e),
-            },
-        }
-    }
-
-    async fn handle_delete_credentials(&self, server_id: &str) -> IpcResponse {
-        let key = format!("credential:{}", server_id);
-        match self.vault.delete(&key).await {
-            Ok(()) => IpcResponse::Ok {
-                message: Some(format!("Credentials deleted for '{}'", server_id)),
-            },
-            Err(e) => IpcResponse::Error {
-                code: "vault_error".to_string(),
-                message: format!("Failed to delete credentials: {}", e),
-            },
-        }
-    }
-
-    async fn handle_get_tool_filter(&self, server_id: &str) -> IpcResponse {
-        let key = format!("filter:{}", server_id);
-        match self.vault.retrieve(&key).await {
-            Ok(Some(data)) => {
-                // Filter stored as JSON: { "enabled_tools": [...], "total_tools": N, ... }
-                match serde_json::from_slice::<ToolFilterData>(&data) {
-                    Ok(filter) => IpcResponse::ToolFilter {
-                        server_id: server_id.to_string(),
-                        enabled_tools: filter.enabled_tools,
-                        total_tools: filter.total_tools,
-                        token_estimate_filtered: filter.token_estimate_filtered,
-                        token_estimate_full: filter.token_estimate_full,
-                    },
-                    Err(_) => IpcResponse::ToolFilter {
-                        server_id: server_id.to_string(),
-                        enabled_tools: vec![],
-                        total_tools: 0,
-                        token_estimate_filtered: 0,
-                        token_estimate_full: 0,
-                    },
-                }
-            }
+    fn handle_get_credentials(&self, server_id: &str) -> IpcResponse {
+        // Look up proxy server to determine auth type
+        let server = match self.db.get_proxy_server(server_id) {
+            Ok(Some(s)) => s,
             Ok(None) => {
-                // No filter set — return empty (all tools enabled by default)
+                return IpcResponse::CredentialError {
+                    server_id: server_id.to_string(),
+                    error: CredentialError {
+                        code: CredentialErrorCode::NotFound,
+                        message: format!("Server '{}' not registered in Brightwing", server_id),
+                    },
+                };
+            }
+            Err(e) => {
+                return IpcResponse::CredentialError {
+                    server_id: server_id.to_string(),
+                    error: CredentialError {
+                        code: CredentialErrorCode::Internal,
+                        message: format!("Database error: {}", e),
+                    },
+                };
+            }
+        };
+
+        let credential = match server.auth_type.as_str() {
+            "oauth" => {
+                match self.db.get_oauth_token_set(server_id) {
+                    Ok(Some(token_json)) => {
+                        match serde_json::from_str::<OAuthTokenSet>(&token_json) {
+                            Ok(ts) => {
+                                // Check if token is expired
+                                if let Some(ref expires_at) = ts.expires_at {
+                                    if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
+                                        if exp < chrono::Utc::now() {
+                                            return IpcResponse::CredentialError {
+                                                server_id: server_id.to_string(),
+                                                error: CredentialError {
+                                                    code: CredentialErrorCode::AuthExpired,
+                                                    message: "OAuth token expired. Please re-authenticate in Brightwing.".to_string(),
+                                                },
+                                            };
+                                        }
+                                    }
+                                }
+                                Credential::OAuth(OAuthCredential {
+                                    access_token: ts.access_token,
+                                    url: server.upstream_url.unwrap_or(ts.server_url),
+                                    expires_at: ts.expires_at,
+                                })
+                            }
+                            Err(e) => {
+                                return IpcResponse::CredentialError {
+                                    server_id: server_id.to_string(),
+                                    error: CredentialError {
+                                        code: CredentialErrorCode::Internal,
+                                        message: format!("Failed to parse token data: {}", e),
+                                    },
+                                };
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        return IpcResponse::CredentialError {
+                            server_id: server_id.to_string(),
+                            error: CredentialError {
+                                code: CredentialErrorCode::AuthExpired,
+                                message: "No OAuth tokens found. Please authenticate in Brightwing.".to_string(),
+                            },
+                        };
+                    }
+                    Err(e) => {
+                        return IpcResponse::CredentialError {
+                            server_id: server_id.to_string(),
+                            error: CredentialError {
+                                code: CredentialErrorCode::Internal,
+                                message: format!("Database error: {}", e),
+                            },
+                        };
+                    }
+                }
+            }
+            "api_key" => {
+                match self.db.get_api_key(server_id) {
+                    Ok(Some(key)) => {
+                        Credential::ApiKey(ApiKeyCredential {
+                            env: key.env,
+                            command: server.upstream_command.clone(),
+                            args: server.upstream_args.as_ref().map(|a| {
+                                a.split_whitespace().map(String::from).collect()
+                            }),
+                            url: server.upstream_url.clone(),
+                        })
+                    }
+                    Ok(None) => {
+                        return IpcResponse::CredentialError {
+                            server_id: server_id.to_string(),
+                            error: CredentialError {
+                                code: CredentialErrorCode::NotFound,
+                                message: "No API key stored. Please add one in Brightwing.".to_string(),
+                            },
+                        };
+                    }
+                    Err(e) => {
+                        return IpcResponse::CredentialError {
+                            server_id: server_id.to_string(),
+                            error: CredentialError {
+                                code: CredentialErrorCode::Internal,
+                                message: format!("Database error: {}", e),
+                            },
+                        };
+                    }
+                }
+            }
+            "none" => Credential::None,
+            other => {
+                return IpcResponse::CredentialError {
+                    server_id: server_id.to_string(),
+                    error: CredentialError {
+                        code: CredentialErrorCode::Internal,
+                        message: format!("Unknown auth type: {}", other),
+                    },
+                };
+            }
+        };
+
+        IpcResponse::Credentials {
+            server_id: server_id.to_string(),
+            credential,
+        }
+    }
+
+    fn handle_store_credentials(&self, server_id: &str, credential: &Credential) -> IpcResponse {
+        match credential {
+            Credential::OAuth(oauth) => {
+                // We can't reconstruct a full OAuthTokenSet from just OAuthCredential,
+                // so store as-is in a simplified format. In practice, the GUI stores
+                // full token sets directly — this path is for IPC-based stores.
+                let token_set = serde_json::json!({
+                    "access_token": oauth.access_token,
+                    "token_type": "Bearer",
+                    "server_url": oauth.url,
+                    "token_endpoint": "",
+                    "client_id": "",
+                    "expires_at": oauth.expires_at,
+                });
+                match self.db.store_oauth_token_set(server_id, &token_set.to_string()) {
+                    Ok(()) => IpcResponse::Ok {
+                        message: Some(format!("OAuth credentials stored for '{}'", server_id)),
+                    },
+                    Err(e) => IpcResponse::Error {
+                        code: "db_error".to_string(),
+                        message: format!("Failed to store credentials: {}", e),
+                    },
+                }
+            }
+            Credential::ApiKey(api_key) => {
+                match self.db.store_api_key(server_id, &api_key.env) {
+                    Ok(()) => IpcResponse::Ok {
+                        message: Some(format!("API key stored for '{}'", server_id)),
+                    },
+                    Err(e) => IpcResponse::Error {
+                        code: "db_error".to_string(),
+                        message: format!("Failed to store credentials: {}", e),
+                    },
+                }
+            }
+            Credential::None => {
+                IpcResponse::Ok {
+                    message: Some(format!("No credentials to store for '{}'", server_id)),
+                }
+            }
+        }
+    }
+
+    fn handle_delete_credentials(&self, server_id: &str) -> IpcResponse {
+        // Delete both OAuth tokens and API keys
+        let _ = self.db.delete_oauth_token_set(server_id);
+        let _ = self.db.delete_api_key(server_id);
+        IpcResponse::Ok {
+            message: Some(format!("Credentials deleted for '{}'", server_id)),
+        }
+    }
+
+    fn handle_get_tool_filter(&self, server_id: &str) -> IpcResponse {
+        match self.db.get_tool_filter(server_id) {
+            Ok(entries) => {
+                let enabled_tools: Vec<String> = entries
+                    .iter()
+                    .filter(|e| e.enabled)
+                    .map(|e| e.tool_name.clone())
+                    .collect();
+                let total_tools = entries.len() as u32;
+                let token_filtered: u32 = entries.iter().filter(|e| e.enabled).map(|e| e.token_estimate as u32).sum();
+                let token_full: u32 = entries.iter().map(|e| e.token_estimate as u32).sum();
                 IpcResponse::ToolFilter {
                     server_id: server_id.to_string(),
-                    enabled_tools: vec![],
-                    total_tools: 0,
-                    token_estimate_filtered: 0,
-                    token_estimate_full: 0,
+                    enabled_tools,
+                    total_tools,
+                    token_estimate_filtered: token_filtered,
+                    token_estimate_full: token_full,
                 }
             }
             Err(e) => IpcResponse::Error {
-                code: "vault_error".to_string(),
+                code: "db_error".to_string(),
                 message: format!("Failed to retrieve tool filter: {}", e),
             },
         }
     }
 
-    async fn handle_set_tool_filter(&self, server_id: &str, tool_name: &str, enabled: bool) -> IpcResponse {
-        let key = format!("filter:{}", server_id);
-
-        // Read existing filter or create new
-        let mut filter = match self.vault.retrieve(&key).await {
-            Ok(Some(data)) => serde_json::from_slice::<ToolFilterData>(&data).unwrap_or_default(),
-            _ => ToolFilterData::default(),
-        };
-
-        if enabled {
-            if !filter.enabled_tools.contains(&tool_name.to_string()) {
-                filter.enabled_tools.push(tool_name.to_string());
-            }
-        } else {
-            filter.enabled_tools.retain(|t| t != tool_name);
-        }
-
-        let data = serde_json::to_vec(&filter).unwrap();
-        match self.vault.store(&key, &data).await {
+    fn handle_set_tool_filter(&self, server_id: &str, tool_name: &str, enabled: bool) -> IpcResponse {
+        match self.db.set_tool_filter(server_id, tool_name, enabled, 0) {
             Ok(()) => IpcResponse::Ok { message: None },
             Err(e) => IpcResponse::Error {
-                code: "vault_error".to_string(),
+                code: "db_error".to_string(),
                 message: format!("Failed to update tool filter: {}", e),
             },
         }
     }
 
-    async fn handle_set_tool_filter_bulk(&self, server_id: &str, enabled_tools: &[String]) -> IpcResponse {
-        let key = format!("filter:{}", server_id);
-
-        // Read existing filter to preserve totals
-        let mut filter = match self.vault.retrieve(&key).await {
-            Ok(Some(data)) => serde_json::from_slice::<ToolFilterData>(&data).unwrap_or_default(),
-            _ => ToolFilterData::default(),
-        };
-
-        filter.enabled_tools = enabled_tools.to_vec();
-
-        let data = serde_json::to_vec(&filter).unwrap();
-        match self.vault.store(&key, &data).await {
+    fn handle_set_tool_filter_bulk(&self, server_id: &str, enabled_tools: &[String]) -> IpcResponse {
+        match self.db.set_tool_filter_bulk(server_id, enabled_tools) {
             Ok(()) => IpcResponse::Ok { message: None },
             Err(e) => IpcResponse::Error {
-                code: "vault_error".to_string(),
+                code: "db_error".to_string(),
                 message: format!("Failed to update tool filter: {}", e),
             },
         }
     }
 
-    async fn handle_register_server(
+    fn handle_register_server(
         &self,
         server_id: &str,
         display_name: &str,
         auth_type: &str,
         upstream_url: Option<&str>,
     ) -> IpcResponse {
-        // Store server metadata in vault
-        let key = format!("server:{}", server_id);
-        let meta = ServerMeta {
-            server_id: server_id.to_string(),
-            display_name: display_name.to_string(),
-            auth_type: auth_type.to_string(),
-            upstream_url: upstream_url.map(String::from),
-        };
-        let data = serde_json::to_vec(&meta).unwrap();
-        match self.vault.store(&key, &data).await {
+        match self.db.register_proxy_server(server_id, display_name, auth_type, upstream_url, None, None) {
             Ok(()) => IpcResponse::Ok {
                 message: Some(format!("Server '{}' registered", server_id)),
             },
             Err(e) => IpcResponse::Error {
-                code: "vault_error".to_string(),
+                code: "db_error".to_string(),
                 message: format!("Failed to register server: {}", e),
             },
         }
     }
 
-    async fn handle_unregister_server(&self, server_id: &str) -> IpcResponse {
-        // Remove server metadata, credentials, and filter from vault
-        let keys = [
-            format!("server:{}", server_id),
-            format!("credential:{}", server_id),
-            format!("filter:{}", server_id),
-        ];
-        for key in &keys {
-            if let Err(e) = self.vault.delete(key).await {
-                return IpcResponse::Error {
-                    code: "vault_error".to_string(),
-                    message: format!("Failed to clean up server data: {}", e),
-                };
-            }
-        }
-        IpcResponse::Ok {
-            message: Some(format!("Server '{}' unregistered", server_id)),
+    fn handle_unregister_server(&self, server_id: &str) -> IpcResponse {
+        match self.db.unregister_proxy_server(server_id) {
+            Ok(()) => IpcResponse::Ok {
+                message: Some(format!("Server '{}' unregistered", server_id)),
+            },
+            Err(e) => IpcResponse::Error {
+                code: "db_error".to_string(),
+                message: format!("Failed to unregister server: {}", e),
+            },
         }
     }
 
-    async fn handle_list_servers(&self) -> IpcResponse {
-        // List all registered servers from vault
-        match self.vault.list_keys("server:").await {
-            Ok(keys) => {
-                let mut servers = Vec::new();
-                for key in keys {
-                    if let Ok(Some(data)) = self.vault.retrieve(&key).await {
-                        if let Ok(meta) = serde_json::from_slice::<ServerMeta>(&data) {
-                            servers.push(proxy_common::ipc::ServerInfo {
-                                server_id: meta.server_id,
-                                display_name: meta.display_name,
-                                tool_count: 0, // TODO: populate from cache
-                                auth_type: meta.auth_type,
-                                auth_status: "unknown".to_string(), // TODO: check credential status
-                                token_estimate: 0,
-                            });
+    fn handle_list_servers(&self) -> IpcResponse {
+        match self.db.get_proxy_servers() {
+            Ok(servers) => {
+                let infos: Vec<proxy_common::ipc::ServerInfo> = servers.into_iter().map(|s| {
+                    let filter = self.db.get_tool_filter(&s.server_id).unwrap_or_default();
+                    let enabled: Vec<_> = filter.iter().filter(|e| e.enabled).collect();
+                    let token_estimate: u32 = enabled.iter().map(|e| e.token_estimate).sum();
+
+                    // Determine auth status
+                    let auth_status = match s.auth_type.as_str() {
+                        "oauth" => {
+                            match self.db.get_oauth_token_set(&s.server_id) {
+                                Ok(Some(json)) => {
+                                    if let Ok(ts) = serde_json::from_str::<OAuthTokenSet>(&json) {
+                                        if is_expiring_soon(&ts, 0) {
+                                            "expired".to_string()
+                                        } else {
+                                            "connected".to_string()
+                                        }
+                                    } else {
+                                        "pending".to_string()
+                                    }
+                                }
+                                _ => "pending".to_string(),
+                            }
                         }
+                        "api_key" => {
+                            match self.db.get_api_key(&s.server_id) {
+                                Ok(Some(_)) => "connected".to_string(),
+                                _ => "pending".to_string(),
+                            }
+                        }
+                        "none" => "connected".to_string(),
+                        _ => "unknown".to_string(),
+                    };
+
+                    proxy_common::ipc::ServerInfo {
+                        server_id: s.server_id,
+                        display_name: s.display_name,
+                        tool_count: filter.len() as u32,
+                        auth_type: s.auth_type,
+                        auth_status,
+                        token_estimate,
                     }
-                }
-                IpcResponse::ServerList { servers }
+                }).collect();
+                IpcResponse::ServerList { servers: infos }
             }
             Err(e) => IpcResponse::Error {
-                code: "vault_error".to_string(),
+                code: "db_error".to_string(),
                 message: format!("Failed to list servers: {}", e),
             },
         }
     }
+
+    fn handle_list_tools(&self, server_id: &str) -> IpcResponse {
+        match self.db.get_cached_tools(server_id) {
+            Ok(cached) => {
+                let tools: Vec<proxy_common::ipc::ToolInfo> = cached.into_iter().map(|ct| {
+                    let schema: serde_json::Value = serde_json::from_str(&ct.input_schema).unwrap_or_default();
+                    let parameters = extract_parameters(&schema);
+                    proxy_common::ipc::ToolInfo {
+                        name: ct.tool_name,
+                        description: ct.description,
+                        parameters,
+                    }
+                }).collect();
+                IpcResponse::ToolList {
+                    server_id: server_id.to_string(),
+                    tools,
+                }
+            }
+            Err(e) => IpcResponse::Error {
+                code: "db_error".to_string(),
+                message: format!("Failed to list tools: {}", e),
+            },
+        }
+    }
+
+    fn handle_get_tool_schema(&self, server_id: &str, tool_name: &str) -> IpcResponse {
+        match self.db.get_cached_tools(server_id) {
+            Ok(cached) => {
+                if let Some(ct) = cached.iter().find(|t| t.tool_name == tool_name) {
+                    let schema: serde_json::Value = serde_json::from_str(&ct.input_schema).unwrap_or_default();
+                    let parameters = extract_parameters(&schema);
+                    IpcResponse::ToolSchema {
+                        name: ct.tool_name.clone(),
+                        description: ct.description.clone(),
+                        parameters,
+                    }
+                } else {
+                    IpcResponse::Error {
+                        code: "not_found".to_string(),
+                        message: format!("Tool '{}/{}' not found in cache", server_id, tool_name),
+                    }
+                }
+            }
+            Err(e) => IpcResponse::Error {
+                code: "db_error".to_string(),
+                message: format!("Failed to get tool schema: {}", e),
+            },
+        }
+    }
+
+    async fn handle_call_tool(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> IpcResponse {
+        let start = Instant::now();
+
+        // Get server info
+        let server = match self.db.get_proxy_server(server_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return IpcResponse::Error {
+                    code: "not_found".to_string(),
+                    message: format!("Server '{}' not registered", server_id),
+                };
+            }
+            Err(e) => {
+                return IpcResponse::Error {
+                    code: "db_error".to_string(),
+                    message: format!("Database error: {}", e),
+                };
+            }
+        };
+
+        let upstream_url = match &server.upstream_url {
+            Some(url) => url.clone(),
+            None => {
+                return IpcResponse::Error {
+                    code: "not_supported".to_string(),
+                    message: "call_tool only supports HTTP upstream servers".to_string(),
+                };
+            }
+        };
+
+        // Build auth header
+        let auth_header = match server.auth_type.as_str() {
+            "oauth" => {
+                match self.db.get_oauth_token_set(server_id) {
+                    Ok(Some(json)) => {
+                        match serde_json::from_str::<OAuthTokenSet>(&json) {
+                            Ok(ts) => Some(format!("Bearer {}", ts.access_token)),
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            "api_key" => {
+                match self.db.get_api_key(server_id) {
+                    Ok(Some(key)) => key.env.values().next().map(|v| format!("Bearer {}", v)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        // Send tools/call via JSON-RPC
+        let rpc_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let mut req = client.post(&upstream_url).json(&rpc_request);
+        if let Some(auth) = &auth_header {
+            req = req.header("Authorization", auth.as_str());
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return IpcResponse::ToolResult {
+                    content: vec![proxy_common::ipc::ContentBlock {
+                        content_type: "text".to_string(),
+                        text: format!("Upstream request failed: {}", e),
+                    }],
+                    is_error: true,
+                    latency_ms: Some(start.elapsed().as_millis() as u64),
+                };
+            }
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return IpcResponse::ToolResult {
+                    content: vec![proxy_common::ipc::ContentBlock {
+                        content_type: "text".to_string(),
+                        text: format!("Failed to parse response: {}", e),
+                    }],
+                    is_error: true,
+                    latency_ms: Some(start.elapsed().as_millis() as u64),
+                };
+            }
+        };
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        // Check for JSON-RPC error
+        if let Some(error) = body.get("error") {
+            let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+            return IpcResponse::ToolResult {
+                content: vec![proxy_common::ipc::ContentBlock {
+                    content_type: "text".to_string(),
+                    text: msg.to_string(),
+                }],
+                is_error: true,
+                latency_ms: Some(latency_ms),
+            };
+        }
+
+        // Parse result.content
+        let result = body.get("result").cloned().unwrap_or_default();
+        let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+        let content_blocks = result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|block| {
+                        proxy_common::ipc::ContentBlock {
+                            content_type: block.get("type").and_then(|t| t.as_str()).unwrap_or("text").to_string(),
+                            text: block.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                // Fallback: wrap the entire result as text
+                vec![proxy_common::ipc::ContentBlock {
+                    content_type: "text".to_string(),
+                    text: serde_json::to_string_pretty(&result).unwrap_or_default(),
+                }]
+            });
+
+        IpcResponse::ToolResult {
+            content: content_blocks,
+            is_error,
+            latency_ms: Some(latency_ms),
+        }
+    }
 }
 
-/// Internal types for vault storage.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-struct ToolFilterData {
-    enabled_tools: Vec<String>,
-    #[serde(default)]
-    total_tools: u32,
-    #[serde(default)]
-    token_estimate_filtered: u32,
-    #[serde(default)]
-    token_estimate_full: u32,
+// ─── Parameter extraction ────────────────────────────────────────────────────
+
+/// Extract parameter info from a JSON Schema object.
+fn extract_parameters(schema: &serde_json::Value) -> Vec<proxy_common::ipc::ParameterInfo> {
+    let mut params = Vec::new();
+    let required: Vec<String> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+        for (name, prop) in properties {
+            let param_type = prop
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("string")
+                .to_string();
+            let description = prop
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+            let default = prop
+                .get("default")
+                .map(|d| d.to_string());
+
+            params.push(proxy_common::ipc::ParameterInfo {
+                name: name.clone(),
+                param_type,
+                description,
+                required: required.contains(name),
+                default,
+            });
+        }
+    }
+
+    // Sort: required first, then alphabetical
+    params.sort_by(|a, b| {
+        b.required.cmp(&a.required).then(a.name.cmp(&b.name))
+    });
+
+    params
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct ServerMeta {
-    server_id: String,
-    display_name: String,
-    auth_type: String,
-    upstream_url: Option<String>,
+// ─── Token Refresh Scheduler ─────────────────────────────────────────────────
+
+/// Check if an OAuth token expires within the given threshold.
+fn is_expiring_soon(token_set: &OAuthTokenSet, threshold_minutes: i64) -> bool {
+    match &token_set.expires_at {
+        Some(expires_at_str) => {
+            if let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expires_at_str) {
+                let threshold = chrono::Utc::now() + chrono::Duration::minutes(threshold_minutes);
+                expires_at < threshold
+            } else {
+                false
+            }
+        }
+        None => false,
+    }
 }
+
+/// Refresh all OAuth tokens that are expiring soon.
+async fn refresh_expiring_tokens(db: &Database) {
+    let servers = match db.get_proxy_servers() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("brightwing-authd: refresh scheduler: failed to list servers: {}", e);
+            return;
+        }
+    };
+
+    for server in servers {
+        if server.auth_type != "oauth" {
+            continue;
+        }
+
+        let token_json = match db.get_oauth_token_set(&server.server_id) {
+            Ok(Some(json)) => json,
+            _ => continue,
+        };
+
+        let token_set: OAuthTokenSet = match serde_json::from_str(&token_json) {
+            Ok(ts) => ts,
+            Err(_) => continue,
+        };
+
+        // Skip if no refresh token
+        if token_set.refresh_token.is_none() {
+            continue;
+        }
+
+        // Refresh if expiring within 10 minutes
+        if !is_expiring_soon(&token_set, 10) {
+            continue;
+        }
+
+        eprintln!("brightwing-authd: refreshing token for {}", server.server_id);
+
+        match refresh_token(&token_set).await {
+            Ok(new_set) => {
+                let new_json = match serde_json::to_string(&new_set) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("brightwing-authd: failed to serialize refreshed token for {}: {}", server.server_id, e);
+                        continue;
+                    }
+                };
+                if let Err(e) = db.store_oauth_token_set(&server.server_id, &new_json) {
+                    eprintln!("brightwing-authd: failed to store refreshed token for {}: {}", server.server_id, e);
+                } else {
+                    eprintln!("brightwing-authd: refreshed token for {}", server.server_id);
+                }
+            }
+            Err(e) => {
+                eprintln!("brightwing-authd: failed to refresh token for {}: {}", server.server_id, e);
+            }
+        }
+    }
+}
+
+/// Background task that periodically checks and refreshes expiring tokens.
+async fn token_refresh_loop(db: Arc<Database>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // 5 minutes
+    loop {
+        interval.tick().await;
+        refresh_expiring_tokens(&db).await;
+    }
+}
+
+// ─── Daemon Lifecycle ────────────────────────────────────────────────────────
 
 /// Get the default data directory for the current platform.
 fn default_data_dir() -> PathBuf {
@@ -430,7 +815,7 @@ fn default_pid_path() -> PathBuf {
     default_data_dir().join("authd.pid")
 }
 
-/// Write PID file. Returns the path written.
+/// Write PID file.
 fn write_pid_file(path: &PathBuf) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -454,20 +839,13 @@ fn is_daemon_running(pid_path: &PathBuf) -> Option<u32> {
     let contents = std::fs::read_to_string(pid_path).ok()?;
     let pid = contents.trim().parse::<u32>().ok()?;
 
-    // Check if process is alive (signal 0 = check existence)
     #[cfg(unix)]
     {
-        // kill -0 checks if process exists without sending a signal
         let result = unsafe { libc::kill(pid as i32, 0) };
-        if result == 0 {
-            Some(pid)
-        } else {
-            None
-        }
+        if result == 0 { Some(pid) } else { None }
     }
     #[cfg(not(unix))]
     {
-        // On non-Unix, assume alive if PID file exists
         Some(pid)
     }
 }
@@ -539,9 +917,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write PID file
     write_pid_file(&pid_path)?;
 
-    // For Phase 1, use in-memory vault. Phase 2 swaps to StrongholdBackend.
-    let vault: Arc<dyn VaultBackend> = Arc::new(InMemoryVaultBackend::new());
-    let state = Arc::new(DaemonState::new(vault));
+    // Open the shared SQLite database
+    let db = Arc::new(Database::new().expect("Failed to open database"));
+    let state = Arc::new(DaemonState::new(Arc::clone(&db)));
 
     let listener = UnixListener::bind(&socket_path)?;
 
@@ -558,6 +936,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         socket_path.display(),
         std::process::id()
     );
+
+    // Spawn token refresh background task
+    {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            token_refresh_loop(db).await;
+        });
+    }
 
     // Graceful shutdown on SIGTERM / ctrl-c
     let socket_path_clone = socket_path.clone();
@@ -583,7 +969,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         eprintln!("brightwing-authd: shutting down gracefully...");
-        // Clean up socket and PID file
         let _ = std::fs::remove_file(&socket_path_clone);
         remove_pid_file(&pid_path_clone);
         std::process::exit(0);
