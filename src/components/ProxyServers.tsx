@@ -5,6 +5,7 @@ import * as tauri from "../lib/tauri";
 import ToolFilterPanel from "./ToolFilterPanel";
 import OAuthConnect from "./OAuthConnect";
 import DaemonStatus from "./DaemonStatus";
+import MigrationAssistant from "./MigrationAssistant";
 
 type SubView = "list" | "filter" | "add" | "cli-docs";
 
@@ -320,6 +321,8 @@ export default function ProxyServers() {
       <div className="mb-6">
         <DaemonStatus />
       </div>
+
+      <MigrationAssistant />
 
       {proxyServersLoading ? (
         <p className="text-brightwing-gray-500 text-sm">Loading...</p>

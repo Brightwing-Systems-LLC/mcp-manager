@@ -475,6 +475,31 @@ export default function Dashboard() {
               );
             })}
           </div>
+          {/* Aggregate token budget summary */}
+          {(() => {
+            const summaries = Object.values(proxyFilterSummaries);
+            if (summaries.length === 0) return null;
+            const totalEnabled = summaries.reduce((s, v) => s + v.enabledTokens, 0);
+            const totalAll = summaries.reduce((s, v) => s + v.totalTokens, 0);
+            const totalTools = summaries.reduce((s, v) => s + v.enabled, 0);
+            const totalToolsAll = summaries.reduce((s, v) => s + v.total, 0);
+            if (totalAll === 0) return null;
+            const saved = totalAll - totalEnabled;
+            const pct = ((saved / totalAll) * 100).toFixed(0);
+            return (
+              <div className="mt-3 bg-brightwing-gray-800/60 border border-brightwing-gray-700/50 rounded-lg px-4 py-3 flex items-center justify-between">
+                <div className="text-xs text-brightwing-gray-400">
+                  <span className="font-medium text-brightwing-gray-300">{totalTools}/{totalToolsAll}</span> tools enabled across {proxyServers.length} proxy server{proxyServers.length > 1 ? "s" : ""}
+                </div>
+                <div className="text-xs text-right">
+                  <span className="font-mono text-brightwing-gray-300">~{totalEnabled.toLocaleString()} tok</span>
+                  {saved > 0 && (
+                    <span className="text-green-400 ml-2">({pct}% saved)</span>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
         </section>
       )}
 

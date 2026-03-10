@@ -279,7 +279,13 @@ fn auth_header_from_credential(credential: &Credential) -> Option<String> {
     }
 }
 
+/// Tool names that are always retained regardless of filter settings.
+/// The PatchworkMCP `feedback` tool must survive filtering so agents can
+/// report gaps even when the user has narrowed the tool set.
+const PROTECTED_TOOLS: &[&str] = &["feedback"];
+
 /// Filter tools/list response to only include enabled tools.
+/// Tools in PROTECTED_TOOLS are always retained.
 fn apply_tool_filter(response: &mut serde_json::Value, enabled_tools: &[String]) {
     if let Some(result) = response.get_mut("result") {
         if let Some(tools) = result.get_mut("tools") {
@@ -289,7 +295,8 @@ fn apply_tool_filter(response: &mut serde_json::Value, enabled_tools: &[String])
                         .get("name")
                         .and_then(|n| n.as_str())
                         .unwrap_or("");
-                    enabled_tools.iter().any(|t| t == name)
+                    PROTECTED_TOOLS.contains(&name)
+                        || enabled_tools.iter().any(|t| t == name)
                 });
             }
         }
@@ -593,6 +600,30 @@ mod tests {
         let enabled = vec!["search_repos".to_string()];
         // Should not panic on error responses
         apply_tool_filter(&mut response, &enabled);
+    }
+
+    #[test]
+    fn test_apply_tool_filter_retains_feedback_tool() {
+        let mut response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [
+                    { "name": "search_repos", "description": "Search" },
+                    { "name": "feedback", "description": "Report limitations" },
+                    { "name": "create_issue", "description": "Create" }
+                ]
+            }
+        });
+
+        // Only enable search_repos — feedback should survive anyway
+        let enabled = vec!["search_repos".to_string()];
+        apply_tool_filter(&mut response, &enabled);
+
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "search_repos");
+        assert_eq!(tools[1]["name"], "feedback");
     }
 
     #[test]

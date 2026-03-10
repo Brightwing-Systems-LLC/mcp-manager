@@ -1,10 +1,17 @@
 import { useState } from "react";
 import { useStore } from "../store";
-import { installServer } from "../lib/tauri";
+import {
+  installServer,
+  registerProxyServer,
+  storeApiKey,
+  installProxyToTool,
+  daemonStatus,
+  startDaemon,
+} from "../lib/tauri";
 import type { ServerInstallConfig } from "../lib/types";
 
 export default function AddServer() {
-  const { tools, refreshConfiguredServers, refreshDisabledServers, showToast, addPendingRestart } =
+  const { tools, refreshConfiguredServers, refreshDisabledServers, refreshProxyServers, showToast, addPendingRestart } =
     useStore();
 
   const [configKey, setConfigKey] = useState("");
@@ -15,6 +22,7 @@ export default function AddServer() {
   const [envRows, setEnvRows] = useState<{ key: string; value: string }[]>([]);
   const [selectedTools, setSelectedTools] = useState<Set<string>>(new Set());
   const [installing, setInstalling] = useState(false);
+  const [proxyMode, setProxyMode] = useState(false);
 
   // Filter out tools that don't support programmatic config updates
   const UNSUPPORTED_TOOL_IDS = new Set(["claude_desktop"]);
@@ -49,9 +57,23 @@ export default function AddServer() {
   };
 
   const isStdio = transport === "stdio";
+  const hasEnvVars = envRows.some((r) => r.key.trim() && r.value.trim());
   const canInstall = configKey.trim() &&
     selectedTools.size > 0 &&
     (isStdio ? command.trim() : url.trim());
+
+  /** Ensure the daemon is running, starting it if needed. */
+  const ensureDaemon = async (): Promise<boolean> => {
+    try {
+      const status = await daemonStatus();
+      if (status.running) return true;
+      const started = await startDaemon();
+      return started.running;
+    } catch {
+      showToast("Failed to start auth daemon", "error");
+      return false;
+    }
+  };
 
   const handleInstall = async () => {
     if (!configKey.trim()) {
@@ -78,6 +100,80 @@ export default function AddServer() {
       }
     }
 
+    setInstalling(true);
+
+    if (proxyMode) {
+      await handleProxyInstall(env);
+    } else {
+      await handleDirectInstall(env);
+    }
+
+    setInstalling(false);
+  };
+
+  const handleProxyInstall = async (env: Record<string, string>) => {
+    try {
+      const daemonOk = await ensureDaemon();
+      if (!daemonOk) return;
+
+      const serverId = configKey.trim();
+      const authType = Object.keys(env).length > 0 ? "api_key" : "none";
+
+      await registerProxyServer({
+        serverId,
+        displayName: serverId,
+        authType,
+        upstreamUrl: !isStdio ? url.trim() : undefined,
+        upstreamCommand: isStdio ? command.trim() : undefined,
+        upstreamArgs: isStdio ? args.trim() || undefined : undefined,
+      });
+
+      if (Object.keys(env).length > 0) {
+        await storeApiKey(serverId, env);
+      }
+
+      let successCount = 0;
+      let lastError = "";
+
+      for (const toolId of selectedTools) {
+        try {
+          const result = await installProxyToTool(toolId, serverId, serverId);
+          if (result.success) {
+            successCount++;
+            if (result.needs_restart) addPendingRestart(toolId);
+          } else {
+            lastError = result.message;
+          }
+        } catch (e) {
+          lastError = String(e);
+        }
+      }
+
+      if (successCount === selectedTools.size) {
+        showToast(
+          `Installed ${serverId} into ${successCount} tool${successCount > 1 ? "s" : ""} (via proxy)`,
+          "success"
+        );
+        resetForm();
+        refreshConfiguredServers();
+        refreshDisabledServers();
+        refreshProxyServers();
+      } else if (successCount > 0) {
+        showToast(
+          `Installed into ${successCount}/${selectedTools.size} tools. Last error: ${lastError}`,
+          "error"
+        );
+        refreshConfiguredServers();
+        refreshProxyServers();
+      } else {
+        showToast(`Proxy install failed: ${lastError}`, "error");
+      }
+    } catch (e) {
+      showToast(`Proxy setup failed: ${e}`, "error");
+    }
+  };
+
+  const handleDirectInstall = async (env: Record<string, string>) => {
     const parsedArgs = args
       .trim()
       .split(/\s+/)
@@ -93,7 +189,6 @@ export default function AddServer() {
       transport,
     };
 
-    setInstalling(true);
     let successCount = 0;
     let lastError = "";
 
@@ -111,20 +206,12 @@ export default function AddServer() {
       }
     }
 
-    setInstalling(false);
-
     if (successCount === selectedTools.size) {
       showToast(
         `Installed ${configKey.trim()} into ${successCount} tool${successCount > 1 ? "s" : ""}`,
         "success"
       );
-      // Reset form
-      setConfigKey("");
-      setCommand("");
-      setArgs("");
-      setUrl("");
-      setEnvRows([]);
-      setSelectedTools(new Set());
+      resetForm();
       refreshConfiguredServers();
       refreshDisabledServers();
     } else if (successCount > 0) {
@@ -136,6 +223,16 @@ export default function AddServer() {
     } else {
       showToast(`Install failed: ${lastError}`, "error");
     }
+  };
+
+  const resetForm = () => {
+    setConfigKey("");
+    setCommand("");
+    setArgs("");
+    setUrl("");
+    setEnvRows([]);
+    setSelectedTools(new Set());
+    setProxyMode(false);
   };
 
   return (
@@ -297,6 +394,37 @@ export default function AddServer() {
           )}
         </div>
 
+        {/* Proxy mode toggle — shown when env vars are present */}
+        {hasEnvVars && (
+          <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium">
+                  {proxyMode ? "Proxy Install" : "Direct Install"}
+                </p>
+                <p className="text-xs text-brightwing-gray-500 mt-0.5">
+                  {proxyMode
+                    ? "Credentials stored securely. Tools get a local proxy — no plaintext secrets in config files."
+                    : "Environment variables written directly into each tool's config file."}
+                </p>
+              </div>
+              <button
+                onClick={() => setProxyMode(!proxyMode)}
+                disabled={installing}
+                className={`relative w-11 h-6 rounded-full transition-colors ${
+                  proxyMode ? "bg-brightwing-blue" : "bg-brightwing-gray-600"
+                } disabled:opacity-50`}
+              >
+                <span
+                  className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
+                    proxyMode ? "translate-x-5" : ""
+                  }`}
+                />
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Tool selection */}
         <div>
           <label className="block text-xs text-brightwing-gray-400 uppercase tracking-wider mb-2">
@@ -357,12 +485,14 @@ export default function AddServer() {
         {(isStdio ? command.trim() : url.trim()) && (
           <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
             <p className="text-xs text-brightwing-gray-500 mb-1">
-              Config Preview
+              {proxyMode ? "Proxy Command (written to tool configs)" : "Config Preview"}
             </p>
             <code className="text-sm text-brightwing-gray-200 font-mono break-all">
-              {isStdio
-                ? `${command.trim()} ${args.trim()}`
-                : url.trim()}
+              {proxyMode
+                ? `brightwing-proxy --server ${configKey.trim() || "my-server"}`
+                : isStdio
+                  ? `${command.trim()} ${args.trim()}`
+                  : url.trim()}
             </code>
           </div>
         )}
@@ -374,13 +504,18 @@ export default function AddServer() {
           className="w-full py-2.5 text-sm bg-brightwing-blue hover:bg-brightwing-blue-dark text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {installing
-            ? "Installing..."
-            : `Install into ${selectedTools.size} Tool${selectedTools.size !== 1 ? "s" : ""}`}
+            ? proxyMode
+              ? "Setting up proxy..."
+              : "Installing..."
+            : proxyMode
+              ? `Install into ${selectedTools.size} Tool${selectedTools.size !== 1 ? "s" : ""} (via Proxy)`
+              : `Install into ${selectedTools.size} Tool${selectedTools.size !== 1 ? "s" : ""}`}
         </button>
 
         <p className="text-xs text-brightwing-gray-500">
-          Changes will appear in the restart banner above when tools need
-          restarting.
+          {proxyMode
+            ? "Credentials are stored in Brightwing's secure vault. Tool configs will reference the local proxy."
+            : "Changes will appear in the restart banner above when tools need restarting."}
         </p>
       </div>
     </div>

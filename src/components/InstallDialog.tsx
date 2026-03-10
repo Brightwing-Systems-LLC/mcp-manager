@@ -1,7 +1,24 @@
 import { useState, useEffect } from "react";
 import { useStore } from "../store";
-import { installServer, uninstallServer, apiGetServer } from "../lib/tauri";
+import {
+  installServer,
+  uninstallServer,
+  apiGetServer,
+  registerProxyServer,
+  storeApiKey,
+  installProxyToTool,
+  uninstallProxyFromTool,
+  daemonStatus,
+  startDaemon,
+} from "../lib/tauri";
 import type { ServerInstallConfig, ScoreboardServer } from "../lib/types";
+
+/** Returns true if the install config has any sensitive env vars (API keys, tokens, etc.) */
+function hasSensitiveEnv(
+  envSchema: Record<string, { sensitive: boolean }>
+): boolean {
+  return Object.values(envSchema).some((s) => s.sensitive);
+}
 
 export default function InstallDialog() {
   const {
@@ -15,6 +32,7 @@ export default function InstallDialog() {
     setInstallTarget,
     setPendingDeepLink,
     refreshInstallations,
+    refreshProxyServers,
     showToast,
     addPendingRestart,
   } = useStore();
@@ -24,9 +42,20 @@ export default function InstallDialog() {
   const [envValues, setEnvValues] = useState<Record<string, string>>({});
   const [deepLinkLoading, setDeepLinkLoading] = useState(false);
   const [deepLinkError, setDeepLinkError] = useState<string | null>(null);
+  const [proxyMode, setProxyMode] = useState(false);
+  const [proxyModeInitialized, setProxyModeInitialized] = useState(false);
 
   const server = installTarget;
   const deepLink = pendingDeepLink;
+  const config = installConfig;
+
+  // Auto-detect proxy mode when config loads: default ON if server has sensitive env vars
+  useEffect(() => {
+    if (config && !proxyModeInitialized) {
+      setProxyMode(hasSensitiveEnv(config.env_schema));
+      setProxyModeInitialized(true);
+    }
+  }, [config, proxyModeInitialized]);
 
   // When we have a deep link but no server, fetch the server details
   useEffect(() => {
@@ -119,7 +148,6 @@ export default function InstallDialog() {
 
   if (!server) return null;
 
-  const config = installConfig;
   const hasConfig = config !== null;
 
   const toggleTool = (toolId: string) => {
@@ -141,7 +169,133 @@ export default function InstallDialog() {
   const toRemove = [...installedToolIds].filter((id) => !selectedTools.has(id));
   const hasChanges = toInstall.length > 0 || toRemove.length > 0;
 
-  const handleSave = async () => {
+  /** Ensure the daemon is running, starting it if needed. */
+  const ensureDaemon = async (): Promise<boolean> => {
+    try {
+      const status = await daemonStatus();
+      if (status.running) return true;
+      const started = await startDaemon();
+      return started.running;
+    } catch {
+      showToast("Failed to start auth daemon", "error");
+      return false;
+    }
+  };
+
+  /** Proxy install: register server with daemon, store credentials, install proxy configs. */
+  const handleProxySave = async () => {
+    if (!config) return;
+
+    // Validate required env vars
+    if (toInstall.length > 0) {
+      const missingRequired = Object.entries(config.env_schema)
+        .filter(([, schema]) => schema.required)
+        .filter(([key]) => !envValues[key]?.trim());
+
+      if (missingRequired.length > 0) {
+        showToast(
+          `Missing required: ${missingRequired.map(([k]) => k).join(", ")}`,
+          "error"
+        );
+        return;
+      }
+    }
+
+    setSaving(true);
+
+    try {
+      // 1. Ensure daemon is running
+      const daemonOk = await ensureDaemon();
+      if (!daemonOk) {
+        setSaving(false);
+        return;
+      }
+
+      // 2. Register server with daemon (idempotent — OK to call multiple times)
+      const serverId = config.config_key;
+      const authType = hasSensitiveEnv(config.env_schema) ? "api_key" : "none";
+      await registerProxyServer({
+        serverId,
+        displayName: server.name,
+        authType,
+        upstreamUrl: config.remote_url || undefined,
+        upstreamCommand: config.transport === "stdio" ? config.command : undefined,
+        upstreamArgs:
+          config.transport === "stdio" ? config.args.join(" ") : undefined,
+      });
+
+      // 3. Store credentials if there are sensitive env vars
+      if (hasSensitiveEnv(config.env_schema)) {
+        const env: Record<string, string> = {};
+        for (const [key, schema] of Object.entries(config.env_schema)) {
+          const value = envValues[key]?.trim();
+          if (value) {
+            env[key] = value;
+          } else if (schema.default) {
+            env[key] = schema.default;
+          }
+        }
+        await storeApiKey(serverId, env);
+      }
+
+      // 4. Install/uninstall proxy configs
+      let successCount = 0;
+      let failCount = 0;
+
+      for (const toolId of toInstall) {
+        try {
+          const result = await installProxyToTool(toolId, serverId, config.config_key);
+          if (result.success) {
+            successCount++;
+            if (result.needs_restart) addPendingRestart(toolId);
+          } else {
+            failCount++;
+            showToast(result.message, "error");
+          }
+        } catch (e) {
+          failCount++;
+          showToast(`Proxy install failed: ${e}`, "error");
+        }
+      }
+
+      for (const toolId of toRemove) {
+        try {
+          const result = await uninstallProxyFromTool(toolId, serverId, config.config_key);
+          if (result.success) {
+            successCount++;
+            if (result.needs_restart) addPendingRestart(toolId);
+          } else {
+            failCount++;
+            showToast(result.message, "error");
+          }
+        } catch (e) {
+          failCount++;
+          showToast(`Proxy uninstall failed: ${e}`, "error");
+        }
+      }
+
+      await Promise.all([refreshInstallations(), refreshProxyServers()]);
+
+      if (failCount === 0) {
+        const parts = [];
+        if (toInstall.length > 0)
+          parts.push(`installed into ${toInstall.length}`);
+        if (toRemove.length > 0)
+          parts.push(`removed from ${toRemove.length}`);
+        showToast(
+          `${server.name}: ${parts.join(", ")} tool${successCount !== 1 ? "s" : ""} (via proxy)`,
+          "success"
+        );
+      }
+    } catch (e) {
+      showToast(`Proxy setup failed: ${e}`, "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /** Direct install: write raw server config into tool config files. */
+  const handleDirectSave = async () => {
     if (!config) return;
 
     // Check required env vars if installing into new tools
@@ -176,7 +330,7 @@ export default function InstallDialog() {
           }
         }
 
-        const installConfig: ServerInstallConfig = {
+        const installCfg: ServerInstallConfig = {
           server_name: server.name,
           config_key: config.config_key,
           command: config.command,
@@ -186,7 +340,7 @@ export default function InstallDialog() {
           url: config.remote_url || "",
         };
 
-        const result = await installServer(toolId, installConfig);
+        const result = await installServer(toolId, installCfg);
         if (result.success) {
           successCount++;
           if (result.needs_restart) addPendingRestart(toolId);
@@ -237,11 +391,17 @@ export default function InstallDialog() {
     }
   };
 
+  const handleSave = proxyMode ? handleProxySave : handleDirectSave;
+
   const handleBack = () => {
     setInstallTarget(null);
     setPendingDeepLink(null);
+    setProxyModeInitialized(false);
     setView("dashboard");
   };
+
+  // Whether this config has sensitive env vars that benefit from proxy mode
+  const hasSensitive = config ? hasSensitiveEnv(config.env_schema) : false;
 
   return (
     <div>
@@ -305,19 +465,74 @@ export default function InstallDialog() {
         </div>
       ) : (
         <div className="space-y-5 max-w-xl">
-          {/* Command preview */}
-          <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
-            <p className="text-xs text-brightwing-gray-500 mb-1">Command</p>
-            <code className="text-sm text-brightwing-gray-200 font-mono">
-              {config.command} {config.args.join(" ")}
-            </code>
-          </div>
+          {/* Proxy mode toggle — shown when server has sensitive env vars */}
+          {hasSensitive && (
+            <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium">
+                    {proxyMode ? "Proxy Install" : "Direct Install"}
+                  </p>
+                  <p className="text-xs text-brightwing-gray-500 mt-0.5">
+                    {proxyMode
+                      ? "Credentials stored securely. Tools get a local proxy — no plaintext secrets in config files."
+                      : "API keys written directly into each tool's config file."}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setProxyMode(!proxyMode)}
+                  disabled={saving}
+                  className={`relative w-11 h-6 rounded-full transition-colors ${
+                    proxyMode ? "bg-brightwing-blue" : "bg-brightwing-gray-600"
+                  } disabled:opacity-50`}
+                >
+                  <span
+                    className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
+                      proxyMode ? "translate-x-5" : ""
+                    }`}
+                  />
+                </button>
+              </div>
+              {proxyMode && (
+                <div className="flex items-center gap-2 mt-3 pt-3 border-t border-brightwing-gray-700">
+                  <svg className="w-4 h-4 text-green-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285Z" />
+                  </svg>
+                  <span className="text-xs text-brightwing-gray-400">
+                    Authenticate once, use across all tools. Manage credentials in the Proxy tab.
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Command preview — only shown in direct mode */}
+          {!proxyMode && (
+            <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
+              <p className="text-xs text-brightwing-gray-500 mb-1">Command</p>
+              <code className="text-sm text-brightwing-gray-200 font-mono">
+                {config.command} {config.args.join(" ")}
+              </code>
+            </div>
+          )}
+
+          {/* Proxy command preview — shown in proxy mode */}
+          {proxyMode && (
+            <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
+              <p className="text-xs text-brightwing-gray-500 mb-1">
+                Proxy Command (written to tool configs)
+              </p>
+              <code className="text-sm text-brightwing-gray-200 font-mono">
+                brightwing-proxy --server {config.config_key}
+              </code>
+            </div>
+          )}
 
           {/* Env var form */}
           {Object.keys(config.env_schema).length > 0 && (
             <div>
               <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
-                Configuration
+                {proxyMode ? "Credentials (stored securely)" : "Configuration"}
               </h2>
               <div className="space-y-3">
                 {Object.entries(config.env_schema).map(([key, schema]) => (
@@ -417,15 +632,20 @@ export default function InstallDialog() {
             className="w-full py-2.5 text-sm bg-brightwing-blue hover:bg-brightwing-blue-dark text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {saving
-              ? "Saving..."
+              ? proxyMode
+                ? "Setting up proxy..."
+                : "Saving..."
               : !hasChanges
                 ? "No Changes"
-                : `Save Changes`}
+                : proxyMode
+                  ? "Save Changes (via Proxy)"
+                  : "Save Changes"}
           </button>
 
           <p className="text-xs text-brightwing-gray-500">
-            Changes will appear in the restart banner above when tools need
-            restarting.
+            {proxyMode
+              ? "Credentials are stored in Brightwing's secure vault. Tool configs will reference the local proxy."
+              : "Changes will appear in the restart banner above when tools need restarting."}
           </p>
         </div>
       )}

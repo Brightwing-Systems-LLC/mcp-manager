@@ -129,6 +129,11 @@ pub async fn discover_tools(
     Ok(discovered)
 }
 
+/// Check whether a set of discovered tools includes a PatchworkMCP `feedback` tool.
+pub fn has_patchwork_feedback(tools: &[DiscoveredTool]) -> bool {
+    tools.iter().any(|t| t.name == "feedback")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +195,38 @@ mod tests {
         assert!(error.is_some());
         let msg = error.unwrap().get("message").unwrap().as_str().unwrap();
         assert_eq!(msg, "Method not found");
+    }
+
+    #[test]
+    fn test_has_patchwork_feedback_present() {
+        let tools = vec![
+            DiscoveredTool {
+                name: "search".to_string(),
+                description: "Search".to_string(),
+                input_schema: serde_json::json!({}),
+                token_estimate: 100,
+            },
+            DiscoveredTool {
+                name: "feedback".to_string(),
+                description: "Report limitations".to_string(),
+                input_schema: serde_json::json!({}),
+                token_estimate: 50,
+            },
+        ];
+        assert!(has_patchwork_feedback(&tools));
+    }
+
+    #[test]
+    fn test_has_patchwork_feedback_absent() {
+        let tools = vec![
+            DiscoveredTool {
+                name: "search".to_string(),
+                description: "Search".to_string(),
+                input_schema: serde_json::json!({}),
+                token_estimate: 100,
+            },
+        ];
+        assert!(!has_patchwork_feedback(&tools));
     }
 
     #[test]
