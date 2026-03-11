@@ -64,9 +64,9 @@ All AI tools connect to MCP servers through a local stdio proxy. The proxy handl
 | Tool | Config Format | Status |
 |------|--------------|--------|
 | Claude Desktop | JSON | Full support |
+| Claude Code | JSON (`~/.claude.json`) | Full support |
 | Cursor | JSON | Full support |
 | VS Code (Copilot) | JSON | Full support |
-| Claude Code | CLI (`claude mcp`) | Full support |
 | OpenAI Codex | TOML | Full support |
 | Gemini CLI | JSON | Full support |
 | Windsurf | JSON | Full support |
