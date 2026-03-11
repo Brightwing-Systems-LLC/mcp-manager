@@ -40,6 +40,8 @@ pub struct ProxyServer {
     pub upstream_url: Option<String>,
     pub upstream_command: Option<String>,
     pub upstream_args: Option<String>,
+    #[serde(default)]
+    pub api_key_injection: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -321,12 +323,13 @@ impl Database {
         upstream_url: Option<&str>,
         upstream_command: Option<&str>,
         upstream_args: Option<&str>,
+        api_key_injection: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
-            "INSERT OR REPLACE INTO proxy_servers (server_id, display_name, auth_type, upstream_url, upstream_command, upstream_args, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
-            rusqlite::params![server_id, display_name, auth_type, upstream_url, upstream_command, upstream_args],
+            "INSERT OR REPLACE INTO proxy_servers (server_id, display_name, auth_type, upstream_url, upstream_command, upstream_args, api_key_injection, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))",
+            rusqlite::params![server_id, display_name, auth_type, upstream_url, upstream_command, upstream_args, api_key_injection.unwrap_or("bearer")],
         )
         .map_err(|e| format!("Failed to register proxy server: {}", e))?;
         Ok(())
@@ -347,7 +350,7 @@ impl Database {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT server_id, display_name, auth_type, upstream_url, upstream_command, upstream_args, created_at, updated_at
+                "SELECT server_id, display_name, auth_type, upstream_url, upstream_command, upstream_args, api_key_injection, created_at, updated_at
                  FROM proxy_servers ORDER BY display_name",
             )
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
@@ -361,8 +364,9 @@ impl Database {
                     upstream_url: row.get(3)?,
                     upstream_command: row.get(4)?,
                     upstream_args: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
+                    api_key_injection: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
                 })
             })
             .map_err(|e| format!("Query failed: {}", e))?;
@@ -377,7 +381,7 @@ impl Database {
     pub fn get_proxy_server(&self, server_id: &str) -> Result<Option<ProxyServer>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let result = conn.query_row(
-            "SELECT server_id, display_name, auth_type, upstream_url, upstream_command, upstream_args, created_at, updated_at
+            "SELECT server_id, display_name, auth_type, upstream_url, upstream_command, upstream_args, api_key_injection, created_at, updated_at
              FROM proxy_servers WHERE server_id = ?1",
             rusqlite::params![server_id],
             |row| {
@@ -388,8 +392,9 @@ impl Database {
                     upstream_url: row.get(3)?,
                     upstream_command: row.get(4)?,
                     upstream_args: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
+                    api_key_injection: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
                 })
             },
         );

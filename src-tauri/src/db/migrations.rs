@@ -148,6 +148,28 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
     // Migrate proxy_tool_filter to add tool_id column if needed (v2 schema)
     migrate_tool_filter_v2(conn)?;
 
+    // Add api_key_injection column to proxy_servers if missing
+    migrate_api_key_injection(conn)?;
+
+    Ok(())
+}
+
+/// Add api_key_injection column to proxy_servers for storing how API keys
+/// are injected: "bearer" (default) or "query_param:<paramName>".
+fn migrate_api_key_injection(conn: &Connection) -> Result<(), String> {
+    let has_column = conn
+        .prepare("SELECT api_key_injection FROM proxy_servers LIMIT 0")
+        .is_ok();
+
+    if has_column {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "ALTER TABLE proxy_servers ADD COLUMN api_key_injection TEXT DEFAULT 'bearer';",
+    )
+    .map_err(|e| format!("api_key_injection migration failed: {}", e))?;
+
     Ok(())
 }
 

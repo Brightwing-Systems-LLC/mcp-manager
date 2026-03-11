@@ -4,6 +4,7 @@ mod deeplink;
 pub mod oauth;
 pub mod proxy;
 mod tools;
+pub mod vault_init;
 
 use config::reader::ConfiguredServer;
 use config::writer::{InstallResult, ServerInstallConfig};
@@ -17,6 +18,10 @@ use std::sync::Mutex;
 use std::time::Instant;
 use tauri::{Emitter, Listener, Manager};
 use tools::definitions::DetectedTool;
+use proxy_common::vault::VaultBackend;
+
+/// Wrapper for the encrypted vault, used as Tauri managed state.
+struct VaultState(std::sync::Arc<dyn VaultBackend>);
 
 // --- Installable IDs Cache (5-minute TTL) ---
 
@@ -522,6 +527,7 @@ fn register_proxy_server(
     upstream_url: Option<String>,
     upstream_command: Option<String>,
     upstream_args: Option<String>,
+    api_key_injection: Option<String>,
     db: tauri::State<'_, Database>,
 ) -> Result<(), String> {
     db.register_proxy_server(
@@ -531,6 +537,7 @@ fn register_proxy_server(
         upstream_url.as_deref(),
         upstream_command.as_deref(),
         upstream_args.as_deref(),
+        api_key_injection.as_deref(),
     )
 }
 
@@ -797,38 +804,173 @@ async fn refresh_oauth_token(
     Ok(())
 }
 
-// --- API Key Management ---
+// --- API Key Connection Testing ---
+
+#[derive(Debug, Clone, Serialize)]
+struct ApiKeyTestResult {
+    success: bool,
+    injection_method: Option<String>,
+    error_message: Option<String>,
+}
 
 #[tauri::command]
-fn store_api_key(
+async fn test_api_key_connection(
+    url: String,
+    api_key: String,
+    query_param_name: Option<String>,
+) -> Result<ApiKeyTestResult, String> {
+    let client = reqwest::Client::new();
+    let init_payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "brightwing-test", "version": "1.0" }
+        }
+    });
+
+    // Try Bearer first
+    let bearer_resp = client.post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&init_payload)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if bearer_resp.status().is_success() {
+        return Ok(ApiKeyTestResult {
+            success: true,
+            injection_method: Some("bearer".to_string()),
+            error_message: None,
+        });
+    }
+
+    // Bearer failed — try query_param if we have a param name
+    if let Some(param_name) = &query_param_name {
+        let sep = if url.contains('?') { "&" } else { "?" };
+        let url_with_key = format!("{}{}{}={}", url, sep, param_name, urlencoding::encode(&api_key));
+
+        let qp_resp = client.post(&url_with_key)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .json(&init_payload)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if qp_resp.status().is_success() {
+            return Ok(ApiKeyTestResult {
+                success: true,
+                injection_method: Some(format!("query_param:{}", param_name)),
+                error_message: None,
+            });
+        }
+
+        return Ok(ApiKeyTestResult {
+            success: false,
+            injection_method: None,
+            error_message: Some(format!(
+                "Bearer auth returned {}. Query param '{}' returned {}.",
+                bearer_resp.status().as_u16(),
+                param_name,
+                qp_resp.status().as_u16()
+            )),
+        });
+    }
+
+    Ok(ApiKeyTestResult {
+        success: false,
+        injection_method: None,
+        error_message: Some(format!(
+            "Bearer auth returned {}. Try pasting the full URL with the API key included.",
+            bearer_resp.status().as_u16()
+        )),
+    })
+}
+
+// --- API Key Management (Stronghold-backed encrypted vault) ---
+
+#[tauri::command]
+async fn store_api_key(
     server_id: String,
     env: HashMap<String, String>,
+    vault: tauri::State<'_, VaultState>,
     db: tauri::State<'_, Database>,
 ) -> Result<(), String> {
-    db.store_api_key(&server_id, &env)
+    let vault_key = format!("apikey:{}", server_id);
+    let json = serde_json::to_vec(&env).map_err(|e| format!("Serialize error: {}", e))?;
+    vault.0.store(&vault_key, &json).await.map_err(|e| format!("Vault store error: {}", e))?;
+    // Also store in SQLite for daemon access (daemon reads from vault too, but keep as fallback)
+    let _ = db.store_api_key(&server_id, &env);
+    Ok(())
 }
 
 #[tauri::command]
-fn get_api_key(
+async fn get_api_key(
     server_id: String,
+    vault: tauri::State<'_, VaultState>,
     db: tauri::State<'_, Database>,
 ) -> Result<Option<ProxyApiKey>, String> {
-    db.get_api_key(&server_id)
+    let vault_key = format!("apikey:{}", server_id);
+    match vault.0.retrieve(&vault_key).await {
+        Ok(Some(data)) => {
+            let env: HashMap<String, String> = serde_json::from_slice(&data)
+                .map_err(|e| format!("Deserialize error: {}", e))?;
+            Ok(Some(ProxyApiKey {
+                server_id,
+                env,
+                updated_at: String::new(),
+            }))
+        }
+        Ok(None) => {
+            // Fallback to SQLite (pre-migration keys)
+            db.get_api_key(&server_id)
+        }
+        Err(e) => Err(format!("Vault retrieve error: {}", e)),
+    }
 }
 
 #[tauri::command]
-fn delete_api_key(
+async fn delete_api_key(
     server_id: String,
+    vault: tauri::State<'_, VaultState>,
     db: tauri::State<'_, Database>,
 ) -> Result<(), String> {
-    db.delete_api_key(&server_id)
+    let vault_key = format!("apikey:{}", server_id);
+    vault.0.delete(&vault_key).await.map_err(|e| format!("Vault delete error: {}", e))?;
+    // Also remove from SQLite
+    let _ = db.delete_api_key(&server_id);
+    Ok(())
 }
 
 #[tauri::command]
-fn get_all_api_keys(
+async fn get_all_api_keys(
+    vault: tauri::State<'_, VaultState>,
     db: tauri::State<'_, Database>,
 ) -> Result<Vec<ProxyApiKey>, String> {
-    db.get_all_api_keys()
+    let keys = vault.0.list_keys("apikey:").await.map_err(|e| format!("Vault list error: {}", e))?;
+    let mut result = Vec::new();
+    for key in keys {
+        let server_id = key.strip_prefix("apikey:").unwrap_or(&key).to_string();
+        if let Ok(Some(data)) = vault.0.retrieve(&key).await {
+            if let Ok(env) = serde_json::from_slice::<HashMap<String, String>>(&data) {
+                result.push(ProxyApiKey {
+                    server_id,
+                    env,
+                    updated_at: String::new(),
+                });
+            }
+        }
+    }
+    if result.is_empty() {
+        // Fallback to SQLite if vault is empty (pre-migration)
+        return db.get_all_api_keys();
+    }
+    Ok(result)
 }
 
 // --- Daemon Lifecycle ---
@@ -1196,10 +1338,28 @@ fn distribute_binaries(app: tauri::AppHandle) -> Result<Vec<String>, String> {
 
     let binaries = ["brightwing-proxy", "brightwing-authd", "bw"];
     let mut installed = Vec::new();
+    let mut daemon_updated = false;
 
     for name in &binaries {
         if let Some(src) = find_bundled_binary(&app, name) {
             let dest = install_dir.join(name);
+
+            // Check if binary actually changed (compare file sizes)
+            let needs_update = if dest.exists() {
+                let src_meta = std::fs::metadata(&src).ok();
+                let dest_meta = std::fs::metadata(&dest).ok();
+                match (src_meta, dest_meta) {
+                    (Some(s), Some(d)) => s.len() != d.len(),
+                    _ => true,
+                }
+            } else {
+                true
+            };
+
+            if !needs_update {
+                continue;
+            }
+
             std::fs::copy(&src, &dest)
                 .map_err(|e| format!("Failed to copy {} to {}: {}", name, dest.display(), e))?;
             // Make executable on Unix
@@ -1210,6 +1370,40 @@ fn distribute_binaries(app: tauri::AppHandle) -> Result<Vec<String>, String> {
                     .map_err(|e| format!("Failed to set permissions on {}: {}", name, e))?;
             }
             installed.push(name.to_string());
+
+            if *name == "brightwing-authd" {
+                daemon_updated = true;
+            }
+        }
+    }
+
+    // If the daemon binary was updated and the daemon is currently running,
+    // kill it so it restarts with the new binary on next use.
+    if daemon_updated {
+        if let Some(pid) = read_daemon_pid() {
+            log::info!("Daemon binary updated — restarting daemon (PID {})", pid);
+            #[cfg(unix)]
+            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+            #[cfg(not(unix))]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .output();
+            }
+            // Wait briefly for old daemon to exit
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            // Start the new daemon
+            let daemon_path = install_dir.join("brightwing-authd");
+            if daemon_path.exists() {
+                let _ = std::process::Command::new(&daemon_path)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                // Give it a moment to start
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
         }
     }
 
@@ -1384,6 +1578,24 @@ pub fn run() {
     let db = Database::new().expect("Failed to initialize database");
     let deep_link_state = DeepLinkState::new();
 
+    // Open encrypted vault for API key storage
+    let vault = match vault_init::open_vault() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("WARNING: Failed to open encrypted vault: {}. API keys will use SQLite fallback.", e);
+            // Use in-memory vault as fallback (keys won't persist in vault, but SQLite still works)
+            std::sync::Arc::new(proxy_common::vault::InMemoryVaultBackend::new())
+        }
+    };
+
+    // Migrate API keys from SQLite to vault (one-time, idempotent)
+    {
+        let db_ref = &db;
+        let vault_ref = vault.as_ref();
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for migration");
+        rt.block_on(vault_init::migrate_api_keys_to_vault(db_ref, vault_ref));
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
@@ -1412,6 +1624,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(db)
+        .manage(VaultState(vault))
         .manage(deep_link_state)
         .manage(oauth::flow::OAuthFlowStates::new())
         .invoke_handler(tauri::generate_handler![
@@ -1466,6 +1679,7 @@ pub fn run() {
             get_api_key,
             delete_api_key,
             get_all_api_keys,
+            test_api_key_connection,
             // Binary distribution
             distribute_binaries,
             get_binary_versions,

@@ -13,6 +13,9 @@ MCP Manager is a desktop app that gives you a single control plane for all your 
 ### Auth Proxy
 Every MCP server you install is routed through the Brightwing proxy. OAuth tokens and API keys are injected automatically — your AI tools never see raw credentials, and nothing sensitive lives in config files.
 
+### Encrypted API Key Vault
+API keys are stored in an encrypted [IOTA Stronghold](https://github.com/iotaledger/stronghold.rs) vault — not in plaintext JSON config files where any process on your machine can read them. The vault is encrypted with a machine-derived key and never leaves your device. Existing keys are migrated automatically on first launch.
+
 ### Per-App Tool Filtering
 An MCP server with 89 tools dumps all of them into your AI assistant's context window, eating thousands of tokens before you've even asked a question. MCP Manager lets you control exactly which tools each app sees. Filter out what you don't need, per app, and reclaim that context space.
 
@@ -56,6 +59,7 @@ The built-in search is powered by [MCP Scoreboard](https://patchworkmcp.com/scor
 All AI tools connect to MCP servers through a local stdio proxy. The proxy handles:
 
 - **Auth injection** — OAuth token refresh and API key insertion on every request
+- **Encrypted vault** — API keys stored in Stronghold encrypted storage, never in plaintext
 - **Tool filtering** — Per-app control over which tools are exposed (and how many tokens they cost)
 - **Request logging** — See what's happening between your AI tools and MCP servers
 
@@ -174,7 +178,7 @@ Used by [MCP Scoreboard](https://mcpscoreboard.com) for "Install with Brightwing
 - [x] MCP Streamable HTTP support for tool discovery
 - [x] Proxy request logging
 - [ ] `notifications/tools/list_changed` push to connected clients
-- [ ] Encrypted API key vault (Stronghold)
+- [x] Encrypted API key vault (Stronghold)
 - [ ] Code signing for macOS, Windows, and Linux
 - [ ] Windows platform hardening
 

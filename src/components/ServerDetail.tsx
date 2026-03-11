@@ -159,6 +159,11 @@ export default function ServerDetail() {
 
       const removedFrom = await tauri.deleteServer(Array.from(variants));
 
+      // Also delete any API keys associated with this server
+      if (proxyServer) {
+        await tauri.deleteApiKey(proxyServer.server_id).catch(() => {});
+      }
+
       await Promise.all([
         refreshConfiguredServers(),
         refreshProxyServers(),

@@ -381,25 +381,82 @@ async fn run_http_proxy(
             continue;
         }
 
-        let mut response: serde_json::Value = match upstream_response.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                emit_log(daemon, make_log_event(
-                    &args.server_id, cn, ProxyLogEventType::Error, Some(&method), Some(&http_status),
-                    Some(&format!("Failed to parse response: {}", e)), None,
-                )).await;
-                let error_resp = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": request.get("id"),
-                    "error": {
-                        "code": -32000,
-                        "message": format!("Failed to parse upstream response: {}", e)
+        // Parse response — handle both JSON and SSE (text/event-stream) formats
+        let content_type = upstream_response.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let mut response: serde_json::Value = if content_type.contains("text/event-stream") {
+            // SSE format: look for "data: {...}" lines
+            let body_text = match upstream_response.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    emit_log(daemon, make_log_event(
+                        &args.server_id, cn, ProxyLogEventType::Error, Some(&method), Some(&http_status),
+                        Some(&format!("Failed to read SSE response: {}", e)), None,
+                    )).await;
+                    let error_resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
+                        "error": { "code": -32000, "message": format!("Failed to read upstream SSE response: {}", e) }
+                    });
+                    let mut out = serde_json::to_vec(&error_resp).unwrap_or_default();
+                    out.push(b'\n');
+                    let _ = stdout.write_all(&out).await;
+                    continue;
+                }
+            };
+            // Extract first JSON object from SSE data lines
+            let mut parsed = None;
+            for line in body_text.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    let data = data.trim();
+                    if data.starts_with('{') {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                            parsed = Some(v);
+                            break;
+                        }
                     }
-                });
-                let mut out = serde_json::to_vec(&error_resp).unwrap_or_default();
-                out.push(b'\n');
-                let _ = stdout.write_all(&out).await;
-                continue;
+                }
+            }
+            match parsed {
+                Some(v) => v,
+                None => {
+                    emit_log(daemon, make_log_event(
+                        &args.server_id, cn, ProxyLogEventType::Error, Some(&method), Some(&http_status),
+                        Some("No JSON-RPC message found in SSE response"), None,
+                    )).await;
+                    let error_resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
+                        "error": { "code": -32000, "message": "No JSON-RPC message found in upstream SSE response" }
+                    });
+                    let mut out = serde_json::to_vec(&error_resp).unwrap_or_default();
+                    out.push(b'\n');
+                    let _ = stdout.write_all(&out).await;
+                    continue;
+                }
+            }
+        } else {
+            match upstream_response.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    emit_log(daemon, make_log_event(
+                        &args.server_id, cn, ProxyLogEventType::Error, Some(&method), Some(&http_status),
+                        Some(&format!("Failed to parse response: {}", e)), None,
+                    )).await;
+                    let error_resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
+                        "error": { "code": -32000, "message": format!("Failed to parse upstream response: {}", e) }
+                    });
+                    let mut out = serde_json::to_vec(&error_resp).unwrap_or_default();
+                    out.push(b'\n');
+                    let _ = stdout.write_all(&out).await;
+                    continue;
+                }
             }
         };
 
@@ -454,10 +511,31 @@ fn auth_header_from_credential(credential: &Credential) -> Option<String> {
     match credential {
         Credential::OAuth(oauth) => Some(format!("Bearer {}", oauth.access_token)),
         Credential::ApiKey(api_key) => {
+            // If using query_param injection, don't send a Bearer header
+            if let Some(ref injection) = api_key.api_key_injection {
+                if injection.starts_with("query_param:") {
+                    return None;
+                }
+            }
             api_key.env.values().next().map(|v| format!("Bearer {}", v))
         }
         Credential::None => None,
     }
+}
+
+/// Apply query_param API key injection to a URL.
+fn apply_query_param_auth(url: &str, credential: &Credential) -> String {
+    if let Credential::ApiKey(api_key) = credential {
+        if let Some(ref injection) = api_key.api_key_injection {
+            if let Some(param_name) = injection.strip_prefix("query_param:") {
+                if let Some(key_value) = api_key.env.values().next() {
+                    let sep = if url.contains('?') { "&" } else { "?" };
+                    return format!("{}{}{}={}", url, sep, param_name, urlencoding::encode(key_value));
+                }
+            }
+        }
+    }
+    url.to_string()
 }
 
 /// Tool names that are always retained regardless of filter settings.
@@ -708,8 +786,9 @@ async fn main() {
         }
         Credential::ApiKey(api_key) => {
             if let Some(ref url) = api_key.url {
-                let auth = api_key.env.values().next().map(|v| format!("Bearer {}", v));
-                let result = run_http_proxy(&args, url, auth, tool_filter, &mut daemon).await;
+                let effective_url = apply_query_param_auth(url, &credential);
+                let auth = auth_header_from_credential(&credential);
+                let result = run_http_proxy(&args, &effective_url, auth, tool_filter, &mut daemon).await;
                 if let Err(e) = result {
                     eprintln!("brightwing-proxy: {}", e);
                     std::process::exit(1);

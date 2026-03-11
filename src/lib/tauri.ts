@@ -179,8 +179,21 @@ export async function registerProxyServer(params: {
   upstreamUrl?: string;
   upstreamCommand?: string;
   upstreamArgs?: string;
+  apiKeyInjection?: string;
 }): Promise<void> {
   return invoke("register_proxy_server", params);
+}
+
+export async function testApiKeyConnection(
+  url: string,
+  apiKey: string,
+  queryParamName?: string
+): Promise<import("./types").ApiKeyTestResult> {
+  return invoke("test_api_key_connection", {
+    url,
+    apiKey,
+    queryParamName: queryParamName || null,
+  });
 }
 
 export async function unregisterProxyServer(serverId: string): Promise<void> {

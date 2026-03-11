@@ -386,7 +386,7 @@ async fn simulate_browser_callback(auth_url: &str, code: &str) {
 // ─── Helper: register proxy server in DB (needed for FK constraints) ────────
 
 fn register_oauth_server(db: &Database, server_id: &str, url: &str) {
-    db.register_proxy_server(server_id, server_id, "oauth", Some(url), None, None)
+    db.register_proxy_server(server_id, server_id, "oauth", Some(url), None, None, None)
         .unwrap();
 }
 

@@ -604,6 +604,7 @@ mod tests {
                 command: None,
                 args: None,
                 url: None,
+                api_key_injection: None,
             }),
         };
         let bytes = encode_message(&req).unwrap();

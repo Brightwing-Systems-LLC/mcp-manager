@@ -327,6 +327,7 @@ async fn test_get_credentials_found() {
         command: Some("npx".to_string()),
         args: Some(vec!["-y".to_string(), "server-github".to_string()]),
         url: None,
+                api_key_injection: None,
     });
     seed_credential(&vault, "github", &cred).await;
 
@@ -436,6 +437,7 @@ async fn test_concurrent_clients() {
             command: None,
             args: None,
             url: Some("http://example.com".to_string()),
+                api_key_injection: None,
         }),
     )
     .await;
@@ -505,6 +507,7 @@ async fn test_store_and_retrieve_credentials() {
         command: None,
         args: None,
         url: Some("https://brave-mcp.example.com".to_string()),
+                api_key_injection: None,
     });
 
     client
@@ -555,6 +558,7 @@ async fn test_delete_credentials() {
             command: None,
             args: None,
             url: None,
+                api_key_injection: None,
         }),
     )
     .await;
@@ -657,6 +661,7 @@ async fn test_credential_store_overwrite() {
                 command: None,
                 args: None,
                 url: None,
+                api_key_injection: None,
             }),
         })
         .await;
@@ -671,6 +676,7 @@ async fn test_credential_store_overwrite() {
         command: Some("node".to_string()),
         args: Some(vec!["server.js".to_string()]),
         url: None,
+                api_key_injection: None,
     });
     client
         .send(&IpcRequest::StoreCredentials {

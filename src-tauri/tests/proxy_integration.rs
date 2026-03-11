@@ -449,6 +449,7 @@ async fn test_proxy_tool_call_with_api_key() {
             command: None,
             args: None,
             url: Some(mock.url()),
+                api_key_injection: None,
         }),
     )
     .await;
@@ -647,6 +648,7 @@ async fn test_credential_store_then_proxy_uses() {
                 command: None,
                 args: None,
                 url: Some(mock.url()),
+                api_key_injection: None,
             }),
         })
         .await;
@@ -707,6 +709,7 @@ async fn test_credential_overwrite_then_proxy_uses_latest() {
             command: None,
             args: None,
             url: Some(mock.url()),
+                api_key_injection: None,
         }),
     })
     .await;
@@ -722,6 +725,7 @@ async fn test_credential_overwrite_then_proxy_uses_latest() {
             command: None,
             args: None,
             url: Some(mock.url()),
+                api_key_injection: None,
         }),
     })
     .await;

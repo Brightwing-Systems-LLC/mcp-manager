@@ -138,8 +138,15 @@ export interface ProxyServer {
   upstream_url: string | null;
   upstream_command: string | null;
   upstream_args: string | null;
+  api_key_injection: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface ApiKeyTestResult {
+  success: boolean;
+  injection_method: string | null;
+  error_message: string | null;
 }
 
 export interface ToolFilterEntry {

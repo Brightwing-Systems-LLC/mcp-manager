@@ -32,6 +32,7 @@ use proxy_common::transport::{IpcListener, IpcServerStream};
 /// Daemon state shared across all client connections.
 struct DaemonState {
     db: Arc<Database>,
+    vault: Option<Arc<dyn proxy_common::vault::VaultBackend>>,
     version: String,
     started_at: Instant,
     log_buffers: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<proxy_common::ipc::ProxyLogEvent>>>,
@@ -40,9 +41,10 @@ struct DaemonState {
 const MAX_LOG_EVENTS_PER_SERVER: usize = 200;
 
 impl DaemonState {
-    fn new(db: Arc<Database>) -> Self {
+    fn new(db: Arc<Database>, vault: Option<Arc<dyn proxy_common::vault::VaultBackend>>) -> Self {
         Self {
             db,
+            vault,
             version: IPC_PROTOCOL_VERSION.to_string(),
             started_at: Instant::now(),
             log_buffers: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -55,7 +57,7 @@ impl DaemonState {
             IpcRequest::Handshake(hs) => self.handle_handshake(hs),
 
             IpcRequest::GetCredentials { server_id } => {
-                self.handle_get_credentials(&server_id)
+                self.handle_get_credentials(&server_id).await
             }
 
             IpcRequest::StoreCredentials { server_id, credential } => {
@@ -158,7 +160,19 @@ impl DaemonState {
         }
     }
 
-    fn handle_get_credentials(&self, server_id: &str) -> IpcResponse {
+    /// Try to read an API key from the encrypted vault.
+    async fn try_get_api_key_from_vault(&self, server_id: &str) -> Option<std::collections::HashMap<String, String>> {
+        let vault = self.vault.as_ref()?;
+        let vault_key = format!("apikey:{}", server_id);
+        match vault.retrieve(&vault_key).await {
+            Ok(Some(data)) => {
+                serde_json::from_slice::<std::collections::HashMap<String, String>>(&data).ok()
+            }
+            _ => None,
+        }
+    }
+
+    async fn handle_get_credentials(&self, server_id: &str) -> IpcResponse {
         // Look up proxy server to determine auth type
         let server = match self.db.get_proxy_server(server_id) {
             Ok(Some(s)) => s,
@@ -240,32 +254,30 @@ impl DaemonState {
                 }
             }
             "api_key" => {
-                match self.db.get_api_key(server_id) {
-                    Ok(Some(key)) => {
+                // Try vault first, fall back to SQLite
+                let api_key_env = self.try_get_api_key_from_vault(server_id).await
+                    .or_else(|| {
+                        self.db.get_api_key(server_id).ok().flatten().map(|k| k.env)
+                    });
+
+                match api_key_env {
+                    Some(env) => {
                         Credential::ApiKey(ApiKeyCredential {
-                            env: key.env,
+                            env,
                             command: server.upstream_command.clone(),
                             args: server.upstream_args.as_ref().map(|a| {
                                 a.split_whitespace().map(String::from).collect()
                             }),
                             url: server.upstream_url.clone(),
+                            api_key_injection: server.api_key_injection.clone(),
                         })
                     }
-                    Ok(None) => {
+                    None => {
                         return IpcResponse::CredentialError {
                             server_id: server_id.to_string(),
                             error: CredentialError {
                                 code: CredentialErrorCode::NotFound,
                                 message: "No API key stored. Please add one in Brightwing.".to_string(),
-                            },
-                        };
-                    }
-                    Err(e) => {
-                        return IpcResponse::CredentialError {
-                            server_id: server_id.to_string(),
-                            error: CredentialError {
-                                code: CredentialErrorCode::Internal,
-                                message: format!("Database error: {}", e),
                             },
                         };
                     }
@@ -394,7 +406,7 @@ impl DaemonState {
         auth_type: &str,
         upstream_url: Option<&str>,
     ) -> IpcResponse {
-        match self.db.register_proxy_server(server_id, display_name, auth_type, upstream_url, None, None) {
+        match self.db.register_proxy_server(server_id, display_name, auth_type, upstream_url, None, None, None) {
             Ok(()) => IpcResponse::Ok {
                 message: Some(format!("Server '{}' registered", server_id)),
             },
@@ -569,12 +581,39 @@ impl DaemonState {
                 }
             }
             "api_key" => {
-                match self.db.get_api_key(server_id) {
-                    Ok(Some(key)) => key.env.values().next().map(|v| format!("Bearer {}", v)),
-                    _ => None,
+                let injection = server.api_key_injection.as_deref().unwrap_or("bearer");
+                if injection.starts_with("query_param:") {
+                    // Key will be appended to URL as query param, not as header
+                    None
+                } else {
+                    let env = self.try_get_api_key_from_vault(server_id).await
+                        .or_else(|| self.db.get_api_key(server_id).ok().flatten().map(|k| k.env));
+                    env.and_then(|e| e.values().next().map(|v| format!("Bearer {}", v)))
                 }
             }
             _ => None,
+        };
+
+        // For query_param injection, append API key to the upstream URL
+        let effective_url = if server.auth_type == "api_key" {
+            if let Some(injection) = &server.api_key_injection {
+                if let Some(param_name) = injection.strip_prefix("query_param:") {
+                    let env = self.try_get_api_key_from_vault(server_id).await
+                        .or_else(|| self.db.get_api_key(server_id).ok().flatten().map(|k| k.env));
+                    if let Some(key_value) = env.and_then(|e| e.values().next().cloned()) {
+                        let sep = if upstream_url.contains('?') { "&" } else { "?" };
+                        format!("{}{}{}={}", upstream_url, sep, param_name, urlencoding::encode(&key_value))
+                    } else {
+                        upstream_url.clone()
+                    }
+                } else {
+                    upstream_url.clone()
+                }
+            } else {
+                upstream_url.clone()
+            }
+        } else {
+            upstream_url.clone()
         };
 
         // Send tools/call via JSON-RPC
@@ -589,7 +628,7 @@ impl DaemonState {
         });
 
         let client = reqwest::Client::new();
-        let mut req = client.post(&upstream_url).json(&rpc_request);
+        let mut req = client.post(&effective_url).json(&rpc_request);
         if let Some(auth) = &auth_header {
             req = req.header("Authorization", auth.as_str());
         }
@@ -924,7 +963,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Open the shared SQLite database
     let db = Arc::new(Database::new().expect("Failed to open database"));
-    let state = Arc::new(DaemonState::new(Arc::clone(&db)));
+
+    // Open encrypted vault for API key retrieval
+    let vault: Option<Arc<dyn proxy_common::vault::VaultBackend>> =
+        match brightwing_mcp_manager_lib::vault_init::open_vault() {
+            Ok(v) => {
+                eprintln!("brightwing-authd: encrypted vault opened successfully");
+                Some(v)
+            }
+            Err(e) => {
+                eprintln!("brightwing-authd: WARNING: failed to open vault: {}. Using SQLite fallback.", e);
+                None
+            }
+        };
+
+    let state = Arc::new(DaemonState::new(Arc::clone(&db), vault));
 
     let mut listener = IpcListener::bind(&socket_path)?;
 

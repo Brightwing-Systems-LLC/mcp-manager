@@ -113,7 +113,7 @@ async fn test_discover_and_cache_in_db() {
     let db = Database::new_in_memory().unwrap();
 
     // Register a proxy server
-    db.register_proxy_server("test-server", "Test", "none", Some(&server.url()), None, None)
+    db.register_proxy_server("test-server", "Test", "none", Some(&server.url()), None, None, None)
         .unwrap();
 
     // Discover tools

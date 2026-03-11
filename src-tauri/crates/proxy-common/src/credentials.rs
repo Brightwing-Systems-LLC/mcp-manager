@@ -41,6 +41,9 @@ pub struct ApiKeyCredential {
     /// URL for HTTP upstream servers (mutually exclusive with command)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// How to inject the API key: "bearer" (default) or "query_param:<paramName>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_injection: Option<String>,
 }
 
 /// Errors returned when credentials can't be retrieved.

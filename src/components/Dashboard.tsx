@@ -1,6 +1,6 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { useStore } from "../store";
-import { fetchCliServerConfig, deleteServer, getOAuthStatus, installProxyToTool, registerProxyServer, daemonStatus, startDaemon, addFavorite, removeFavorite } from "../lib/tauri";
+import { fetchCliServerConfig, getOAuthStatus, installProxyToTool, registerProxyServer, daemonStatus, startDaemon, addFavorite, removeFavorite } from "../lib/tauri";
 import type { OAuthStatus } from "../lib/types";
 
 type CellInfo = {
@@ -67,8 +67,6 @@ export default function Dashboard() {
   const [pendingChanges, setPendingChanges] = useState<Map<string, PendingChange>>(new Map());
   const [saving, setSaving] = useState(false);
   const [saveProgress, setSaveProgress] = useState({ current: 0, total: 0, currentName: "" });
-  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
-  const [deleting, setDeleting] = useState(false);
   const [oauthStatuses, setOauthStatuses] = useState<Record<string, OAuthStatus>>({});
 
   useEffect(() => {
@@ -393,89 +391,6 @@ export default function Dashboard() {
     }
   };
 
-  // Compute which tools a server is installed in (for delete confirmation)
-  const getServerToolNames = useCallback(
-    (serverName: string): string[] => {
-      const toolIds = new Set<string>();
-      for (const cs of configuredServers) {
-        if (normalizeServerName(cs.server_name) === serverName) {
-          toolIds.add(cs.tool_id);
-        }
-      }
-      for (const ds of disabledServers) {
-        if (normalizeServerName(ds.server_name) === serverName) {
-          toolIds.add(ds.tool_id);
-        }
-      }
-      return Array.from(toolIds).map((tid) => {
-        const tool = tools.find((t) => t.id === tid);
-        return tool ? tool.display_name : tid;
-      });
-    },
-    [configuredServers, disabledServers, tools]
-  );
-
-  // Collect all actual (non-normalized) name variants for a normalized server key
-  const getServerNameVariants = useCallback(
-    (normalizedName: string): string[] => {
-      const variants = new Set<string>();
-      for (const cs of configuredServers) {
-        if (normalizeServerName(cs.server_name) === normalizedName) {
-          variants.add(cs.server_name);
-        }
-      }
-      for (const ds of disabledServers) {
-        if (normalizeServerName(ds.server_name) === normalizedName) {
-          variants.add(ds.server_name);
-        }
-      }
-      // Also include the normalized name itself and the display name
-      variants.add(normalizedName);
-      const display = displayNameMap.get(normalizedName);
-      if (display) variants.add(display);
-      // Include proxy server_id so proxy records get cleaned up
-      const ps = proxyServerByNormalized.get(normalizedName);
-      if (ps) {
-        variants.add(ps.server_id);
-        variants.add(ps.display_name);
-      }
-      return Array.from(variants);
-    },
-    [configuredServers, disabledServers, displayNameMap]
-  );
-
-  const handleDeleteConfirm = async () => {
-    if (!deleteTarget) return;
-    setDeleting(true);
-    try {
-      const displayName = displayNameMap.get(deleteTarget) || deleteTarget;
-      const nameVariants = getServerNameVariants(deleteTarget);
-      const removedFrom = await deleteServer(nameVariants);
-      await refreshConfiguredServers();
-      await refreshDisabledServers();
-      await refreshProxyServers();
-      await refreshFavorites();
-      // Clear any pending changes for this server
-      setPendingChanges((prev) => {
-        const next = new Map(prev);
-        for (const key of next.keys()) {
-          if (key.startsWith(deleteTarget + ":")) next.delete(key);
-        }
-        return next;
-      });
-      showToast(
-        removedFrom.length > 0
-          ? `Deleted "${displayName}" from ${removedFrom.length} app${removedFrom.length > 1 ? "s" : ""}`
-          : `Deleted "${displayName}"`,
-        "success"
-      );
-    } catch (e) {
-      showToast(`Failed to delete: ${e}`, "error");
-    }
-    setDeleting(false);
-    setDeleteTarget(null);
-  };
-
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
@@ -663,7 +578,6 @@ export default function Dashboard() {
                         </th>
                       );
                     })}
-                    <th className="px-3 py-3 w-10" />
                   </tr>
                 </thead>
                 <tbody>
@@ -757,17 +671,6 @@ export default function Dashboard() {
                           </td>
                         );
                       })}
-                      <td className="px-3 py-2.5 text-center">
-                        <button
-                          onClick={() => setDeleteTarget(serverName)}
-                          className="p-1 text-brightwing-gray-600 hover:text-red-400 transition-colors"
-                          title="Delete server"
-                        >
-                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                            <path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" />
-                          </svg>
-                        </button>
-                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -780,60 +683,6 @@ export default function Dashboard() {
           Check/uncheck to enable/disable MCP servers, then click Save Changes to apply.
         </p>
       </section>
-
-      {/* Delete confirmation modal */}
-      {deleteTarget && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-          <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-xl p-6 max-w-md mx-4 shadow-2xl">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-10 h-10 rounded-full bg-red-500/10 flex items-center justify-center shrink-0">
-                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" />
-                </svg>
-              </div>
-              <h3 className="text-lg font-semibold">Delete Server</h3>
-            </div>
-
-            <p className="text-sm text-brightwing-gray-300 mb-4">
-              This will permanently remove <strong className="text-white">{displayNameMap.get(deleteTarget) || deleteTarget}</strong> and
-              cannot be undone. You would need to add it from scratch again.
-            </p>
-
-            {(() => {
-              const affectedTools = getServerToolNames(deleteTarget);
-              return affectedTools.length > 0 ? (
-                <div className="bg-brightwing-gray-900 border border-brightwing-gray-700 rounded-lg p-3 mb-5">
-                  <p className="text-xs text-brightwing-gray-400 mb-2">Will be removed from:</p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {affectedTools.map((name) => (
-                      <span key={name} className="text-xs bg-red-500/10 text-red-300 px-2 py-0.5 rounded-full">
-                        {name}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              ) : null;
-            })()}
-
-            <div className="flex gap-3 justify-end">
-              <button
-                onClick={() => setDeleteTarget(null)}
-                disabled={deleting}
-                className="px-4 py-2 text-sm bg-brightwing-gray-700 hover:bg-brightwing-gray-600 rounded-md transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleDeleteConfirm}
-                disabled={deleting}
-                className="px-4 py-2 text-sm bg-red-600 hover:bg-red-500 text-white rounded-md transition-colors disabled:opacity-50"
-              >
-                {deleting ? "Deleting..." : "Yes, Delete"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Saving modal */}
       {saving && (

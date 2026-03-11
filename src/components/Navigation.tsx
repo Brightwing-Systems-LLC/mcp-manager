@@ -3,7 +3,7 @@ import { useStore } from "../store";
 import type { View } from "../lib/types";
 import birdIcon from "../assets-logo-bird.png";
 
-const APP_VERSION = "0.3.9";
+const APP_VERSION = "0.3.10";
 
 const navItems: { id: View; label: string; icon: string }[] = [
   { id: "dashboard", label: "Dashboard", icon: "grid" },

@@ -3,7 +3,7 @@ members = [".", "crates/proxy-common"]
 
 [package]
 name = "brightwing-mcp-manager"
-version = "0.3.9"
+version = "0.3.10"
 description = "Brightwing MCP Manager - Universal MCP server installer"
 authors = ["Brightwing Systems"]
 edition = "2021"
@@ -49,10 +49,12 @@ chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 urlencoding = "2"
-proxy-common = { path = "crates/proxy-common" }
+proxy-common = { path = "crates/proxy-common", features = ["stronghold"] }
 tokio = { version = "1", features = ["full"] }
 rand = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
 libc = "0.2"
 futures = "0.3"
+hostname = "0.4"
+whoami = "1"

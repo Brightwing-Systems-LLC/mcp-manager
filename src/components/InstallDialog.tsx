@@ -4,8 +4,7 @@ import {
   apiGetServer,
   registerProxyServer,
   storeApiKey,
-  installProxyToTool,
-  uninstallProxyFromTool,
+  getApiKey,
   daemonStatus,
   startDaemon,
   getProxyServer,
@@ -24,16 +23,6 @@ function normalizeServerName(name: string): string {
   sanitized = sanitized.replace(/^_+|_+$/g, "");
   return sanitized.toLowerCase();
 }
-
-// Tools with known MCP bugs — config is written correctly but the app may not use it
-const TOOL_WARNINGS: Record<string, { short: string; detail: string; link: string }> = {
-  codex: {
-    short: "Desktop app MCP tools may not work",
-    detail:
-      "Codex Desktop has a known bug where MCP tools are configured but not surfaced to the model. The CLI works correctly. Both share the same config file.",
-    link: "https://github.com/openai/codex/issues/11264",
-  },
-};
 
 /** Returns true if the install config has any sensitive env vars (API keys, tokens, etc.) */
 function hasSensitiveEnv(
@@ -56,18 +45,14 @@ export default function InstallDialog() {
     setServerDetailId,
     refreshInstallations,
     refreshProxyServers,
-    refreshConfiguredServers,
     showToast,
-    addPendingRestart,
   } = useStore();
 
-  const [selectedTools, setSelectedTools] = useState<Set<string>>(new Set());
-  const [saving, setSaving] = useState(false);
   const [envValues, setEnvValues] = useState<Record<string, string>>({});
   const [deepLinkLoading, setDeepLinkLoading] = useState(false);
   const [deepLinkError, setDeepLinkError] = useState<string | null>(null);
-  // Proxy mode is always on — all servers go through the proxy
-  const proxyMode = true;
+  const [savingKey, setSavingKey] = useState(false);
+  const [apiKeySaved, setApiKeySaved] = useState(false);
 
   // Auto-probe state for HTTP servers
   const [probeResult, setProbeResult] = useState<AuthProbeResult | null>(null);
@@ -80,6 +65,24 @@ export default function InstallDialog() {
   const config = installConfig;
 
   const isHttpServer = config?.remote_url && config.transport === "http";
+
+  // Determine auth type: for HTTP servers use probe result, for stdio use env schema
+  const needsApiKey = isHttpServer
+    ? probeResult?.auth_type === "api_key"
+    : config ? hasSensitiveEnv(config.env_schema) : false;
+
+  /** Ensure the daemon is running, starting it if needed. */
+  const ensureDaemon = async (): Promise<boolean> => {
+    try {
+      const status = await daemonStatus();
+      if (status.running) return true;
+      const started = await startDaemon();
+      return started.running;
+    } catch {
+      showToast("Failed to start auth daemon", "error");
+      return false;
+    }
+  };
 
   // Auto-probe HTTP servers when config loads
   useEffect(() => {
@@ -135,7 +138,7 @@ export default function InstallDialog() {
   // Auto-register proxy server for stdio servers when config loads
   const [stdioProxyRegistered, setStdioProxyRegistered] = useState(false);
   useEffect(() => {
-    if (!config || isHttpServer || stdioProxyRegistered || !proxyMode) return;
+    if (!config || isHttpServer || stdioProxyRegistered) return;
     if (!server) return;
 
     let cancelled = false;
@@ -161,7 +164,18 @@ export default function InstallDialog() {
     })();
 
     return () => { cancelled = true; };
-  }, [config, isHttpServer, stdioProxyRegistered, proxyMode, server?.name]);
+  }, [config, isHttpServer, stdioProxyRegistered, server?.name]);
+
+  // Check if API key already exists in vault on mount
+  useEffect(() => {
+    if (!config) return;
+    const serverId = config.config_key;
+    getApiKey(serverId).then((key) => {
+      if (key && Object.keys(key.env).length > 0) {
+        setApiKeySaved(true);
+      }
+    }).catch(() => {});
+  }, [config?.config_key]);
 
   // When we have a deep link but no server, fetch the server details
   useEffect(() => {
@@ -182,12 +196,12 @@ export default function InstallDialog() {
     }
   }, [deepLink, server, deepLinkLoading, setInstallTarget, setPendingDeepLink]);
 
-  // Refresh installations on mount to avoid stale data (e.g. deep link while app is running)
+  // Refresh installations on mount
   useEffect(() => {
     refreshInstallations();
   }, [refreshInstallations]);
 
-  // Initialize checkbox state from current installations when server loads
+  // Track which tools already have this server installed
   const detectedTools = tools.filter((t) => t.detected);
   const installedToolIds = server
     ? new Set(
@@ -200,12 +214,6 @@ export default function InstallDialog() {
           .map((i) => i.tool_id)
       )
     : new Set<string>();
-
-  useEffect(() => {
-    if (server) {
-      setSelectedTools(new Set(installedToolIds));
-    }
-  }, [server?.id, installations]);
 
   if (!server && !deepLink) {
     return (
@@ -259,176 +267,46 @@ export default function InstallDialog() {
 
   const hasConfig = config !== null;
 
-  const toggleTool = (toolId: string) => {
-    const next = new Set(selectedTools);
-    if (next.has(toolId)) {
-      next.delete(toolId);
-    } else {
-      next.add(toolId);
-    }
-    setSelectedTools(next);
-  };
-
   const handleEnvChange = (key: string, value: string) => {
     setEnvValues((prev) => ({ ...prev, [key]: value }));
   };
 
-  // Compute what changed vs. current installations
-  const toInstall = [...selectedTools].filter((id) => !installedToolIds.has(id));
-  const toRemove = [...installedToolIds].filter((id) => !selectedTools.has(id));
-  const hasChanges = toInstall.length > 0 || toRemove.length > 0;
-
-  // For HTTP+OAuth servers, block install until OAuth is connected
-  const needsOauthFirst = !!(isHttpServer && probeResult?.auth_type === "oauth" && !oauthConnected);
-
-  /** Ensure the daemon is running, starting it if needed. */
-  const ensureDaemon = async (): Promise<boolean> => {
-    try {
-      const status = await daemonStatus();
-      if (status.running) return true;
-      const started = await startDaemon();
-      return started.running;
-    } catch {
-      showToast("Failed to start auth daemon", "error");
-      return false;
-    }
-  };
-
-  /** Proxy install: register server with daemon, store credentials, install proxy configs. */
-  const handleProxySave = async () => {
+  /** Save API key to vault */
+  const handleSaveApiKey = async () => {
     if (!config) return;
 
-    // For HTTP servers with auto-probe, proxy registration already happened
     const serverId = config.config_key;
+    const env: Record<string, string> = {};
 
-    // Validate required env vars (for non-OAuth HTTP servers or stdio proxy)
-    if (toInstall.length > 0 && !isHttpServer) {
-      const missingRequired = Object.entries(config.env_schema)
-        .filter(([, schema]) => schema.required)
-        .filter(([key]) => !envValues[key]?.trim());
-
-      if (missingRequired.length > 0) {
-        showToast(
-          `Missing required: ${missingRequired.map(([k]) => k).join(", ")}`,
-          "error"
-        );
-        return;
+    for (const [key, schema] of Object.entries(config.env_schema)) {
+      const value = envValues[key]?.trim();
+      if (value) {
+        env[key] = value;
+      } else if (schema.default) {
+        env[key] = schema.default;
       }
     }
 
-    // For API key HTTP servers, validate env vars
-    if (isHttpServer && probeResult?.auth_type === "api_key" && toInstall.length > 0) {
-      const missingRequired = Object.entries(config.env_schema)
-        .filter(([, schema]) => schema.required)
-        .filter(([key]) => !envValues[key]?.trim());
-
-      if (missingRequired.length > 0) {
-        showToast(
-          `Missing required: ${missingRequired.map(([k]) => k).join(", ")}`,
-          "error"
-        );
-        return;
-      }
+    // Validate that at least one key has a value
+    const hasValue = Object.values(env).some((v) => v.length > 0);
+    if (!hasValue) {
+      showToast("Please enter an API key", "error");
+      return;
     }
 
-    setSaving(true);
-
+    setSavingKey(true);
     try {
-      // Ensure daemon is running
-      const daemonOk = await ensureDaemon();
-      if (!daemonOk) {
-        setSaving(false);
-        return;
-      }
-
-      // If not an auto-probed HTTP server, register proxy now
-      if (!isHttpServer) {
-        const authType = hasSensitiveEnv(config.env_schema) ? "api_key" : "none";
-        await registerProxyServer({
-          serverId,
-          displayName: server.name,
-          authType,
-          upstreamUrl: config.remote_url || undefined,
-          upstreamCommand: config.transport === "stdio" ? config.command : undefined,
-          upstreamArgs:
-            config.transport === "stdio" ? config.args.join(" ") : undefined,
-        });
-      }
-
-      // Store credentials if there are sensitive env vars (not OAuth)
-      if (probeResult?.auth_type !== "oauth" && hasSensitiveEnv(config.env_schema)) {
-        const env: Record<string, string> = {};
-        for (const [key, schema] of Object.entries(config.env_schema)) {
-          const value = envValues[key]?.trim();
-          if (value) {
-            env[key] = value;
-          } else if (schema.default) {
-            env[key] = schema.default;
-          }
-        }
-        await storeApiKey(serverId, env);
-      }
-
-      // Install/uninstall proxy configs
-      let successCount = 0;
-      let failCount = 0;
-
-      for (const toolId of toInstall) {
-        try {
-          const result = await installProxyToTool(toolId, serverId, config.config_key);
-          if (result.success) {
-            successCount++;
-            if (result.needs_restart) addPendingRestart(toolId);
-          } else {
-            failCount++;
-            showToast(result.message, "error");
-          }
-        } catch (e) {
-          failCount++;
-          showToast(`Proxy install failed: ${e}`, "error");
-        }
-      }
-
-      for (const toolId of toRemove) {
-        try {
-          const result = await uninstallProxyFromTool(toolId, serverId, config.config_key);
-          if (result.success) {
-            successCount++;
-            if (result.needs_restart) addPendingRestart(toolId);
-          } else {
-            failCount++;
-            showToast(result.message, "error");
-          }
-        } catch (e) {
-          failCount++;
-          showToast(`Proxy uninstall failed: ${e}`, "error");
-        }
-      }
-
-      await Promise.all([refreshInstallations(), refreshProxyServers(), refreshConfiguredServers()]);
-
-      if (failCount === 0) {
-        const parts = [];
-        if (toInstall.length > 0)
-          parts.push(`installed into ${toInstall.length}`);
-        if (toRemove.length > 0)
-          parts.push(`removed from ${toRemove.length}`);
-        showToast(
-          `${server.name}: ${parts.join(", ")} tool${successCount !== 1 ? "s" : ""} (via proxy)`,
-          "success"
-        );
-        // Navigate to unified server detail page
-        setServerDetailId(normalizeServerName(config.config_key));
-        setView("server-detail");
-      }
+      await storeApiKey(serverId, env);
+      setApiKeySaved(true);
+      setEnvValues({});
+      showToast("API key saved to secure vault", "success");
+      await refreshProxyServers();
     } catch (e) {
-      showToast(`Proxy setup failed: ${e}`, "error");
+      showToast(`Failed to save API key: ${e}`, "error");
     } finally {
-      setSaving(false);
+      setSavingKey(false);
     }
   };
-
-  const handleSave = handleProxySave;
 
   const handleBack = () => {
     setInstallTarget(null);
@@ -440,6 +318,39 @@ export default function InstallDialog() {
     setView("dashboard");
   };
 
+  const handleViewDetail = () => {
+    if (config) {
+      setServerDetailId(normalizeServerName(config.config_key));
+      setView("server-detail");
+    }
+  };
+
+  const handleGoToDashboard = () => {
+    setInstallTarget(null);
+    setPendingDeepLink(null);
+    setView("dashboard");
+  };
+
+  // Auth type for status display
+  const authType = isHttpServer
+    ? probeResult?.auth_type === "oauth" ? "oauth"
+      : probeResult?.auth_type === "api_key" ? "api_key"
+      : probeResult?.auth_type === "none" ? "none"
+      : null
+    : needsApiKey ? "api_key" : "none";
+
+  // Status dot color for the identity card
+  const dotColor = (() => {
+    if (!hasConfig) return "bg-brightwing-gray-500";
+    if (authType === "oauth") {
+      return oauthConnected ? "bg-green-400" : "bg-purple-400";
+    }
+    if (authType === "api_key") {
+      return apiKeySaved ? "bg-green-400" : "bg-amber-400";
+    }
+    if (authType === "none") return "bg-green-400";
+    return "bg-brightwing-gray-500";
+  })();
 
   return (
     <div>
@@ -450,30 +361,51 @@ export default function InstallDialog() {
         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" />
         </svg>
-        Back
+        Back to Dashboard
       </button>
 
-      {/* Server info */}
+      {/* Server identity card — matches ServerDetail style */}
       <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-6 mb-6">
         <div className="flex items-start gap-4">
-          <div className="flex-1">
-            <h1 className="text-xl font-mono font-semibold">{server.name}</h1>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2">
+              <span className={`w-2 h-2 rounded-full ${dotColor} shrink-0`} />
+              <h1 className="text-xl font-mono font-semibold">{server.name}</h1>
+            </div>
             <p className="text-sm text-brightwing-gray-400 mt-1">
               {server.description}
             </p>
-            <div className="flex gap-3 mt-2 text-xs text-brightwing-gray-500">
+            <div className="flex items-center gap-2 mt-2 flex-wrap">
+              {authType && (
+                <span
+                  className={`text-xs px-2 py-0.5 rounded-full ${
+                    authType === "oauth"
+                      ? "bg-purple-500/20 text-purple-300"
+                      : authType === "api_key"
+                      ? "bg-amber-500/20 text-amber-300"
+                      : "bg-brightwing-gray-700 text-brightwing-gray-400"
+                  }`}
+                >
+                  {authType === "api_key" ? "API Key" : authType === "oauth" ? "OAuth" : "No Auth"}
+                </span>
+              )}
+              {isHttpServer && config?.remote_url && (
+                <span className="text-xs font-mono text-brightwing-gray-500 truncate">
+                  {config.remote_url}
+                </span>
+              )}
               {server.current_grade && (
-                <span className="font-semibold text-green-400">
+                <span className="text-xs font-semibold text-green-400">
                   {server.current_grade}
                   {server.current_score != null && ` (${server.current_score})`}
                 </span>
               )}
-              {server.language && <span>{server.language}</span>}
-              {server.stars_count > 0 && <span>{server.stars_count} stars</span>}
+              {server.language && <span className="text-xs text-brightwing-gray-500">{server.language}</span>}
+              {server.stars_count > 0 && <span className="text-xs text-brightwing-gray-500">{server.stars_count} stars</span>}
             </div>
           </div>
           {config?.verified && (
-            <span className="px-2 py-1 text-xs bg-green-500/10 text-green-400 rounded-md">
+            <span className="px-2 py-1 text-xs bg-green-500/10 text-green-400 rounded-md shrink-0">
               Verified
             </span>
           )}
@@ -503,60 +435,27 @@ export default function InstallDialog() {
         </div>
       ) : (
         <div className="space-y-5 max-w-xl">
-          {/* Auth probe status for HTTP servers */}
-          {isHttpServer && (
+          {/* Authentication section — matches ServerDetail pattern */}
+
+          {/* HTTP server auth probe loading */}
+          {isHttpServer && probing && (
             <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
-              <div className="flex items-center gap-2 mb-1">
-                <p className="text-sm font-medium">Server Authentication</p>
-                {probing && (
-                  <svg className="w-4 h-4 animate-spin text-brightwing-blue" viewBox="0 0 24 24" fill="none">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                  </svg>
-                )}
+              <div className="flex items-center gap-2">
+                <svg className="w-4 h-4 animate-spin text-brightwing-blue" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                <span className="text-xs text-brightwing-gray-500">Checking server auth requirements...</span>
               </div>
-              {probing ? (
-                <p className="text-xs text-brightwing-gray-500">Checking server auth requirements...</p>
-              ) : probeResult ? (
-                <div className="flex items-center gap-2">
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      !probeResult.server_reachable
-                        ? "bg-red-400"
-                        : probeResult.auth_type === "oauth"
-                        ? "bg-purple-400"
-                        : probeResult.auth_type === "api_key"
-                        ? "bg-amber-400"
-                        : probeResult.auth_type === "none"
-                        ? "bg-green-400"
-                        : "bg-brightwing-gray-500"
-                    }`}
-                  />
-                  <span className="text-xs text-brightwing-gray-300">
-                    {!probeResult.server_reachable
-                      ? "Server unreachable"
-                      : probeResult.auth_type === "oauth"
-                      ? "OAuth detected"
-                      : probeResult.auth_type === "api_key"
-                      ? "API key required"
-                      : probeResult.auth_type === "none"
-                      ? "No auth needed"
-                      : "Unknown auth"}
-                  </span>
-                  {probeResult.error_message && (
-                    <span className="text-xs text-brightwing-gray-500">
-                      ({probeResult.error_message})
-                    </span>
-                  )}
-                </div>
-              ) : null}
             </div>
           )}
 
-          {/* Inline OAuth connect for HTTP+OAuth servers */}
-          {isHttpServer && probeResult?.auth_type === "oauth" && proxyServer && (
-            <div className="bg-brightwing-gray-800 border border-purple-500/30 rounded-lg p-4">
-              <h3 className="text-sm font-medium mb-3">Connect with OAuth</h3>
+          {/* OAuth auth card */}
+          {authType === "oauth" && proxyServer && (
+            <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
+              <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
+                Authentication
+              </h2>
               <OAuthConnect
                 server={proxyServer}
                 onStatusChange={(status) => {
@@ -566,161 +465,177 @@ export default function InstallDialog() {
             </div>
           )}
 
-          {/* Unreachable fallback warning */}
-          {isHttpServer && probeResult && !probeResult.server_reachable && (
-            <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4">
-              <p className="text-sm text-red-400 font-medium mb-1">Server Unreachable</p>
-              <p className="text-xs text-brightwing-gray-400">
-                Could not connect to the server. You can still install it and configure auth later from the Proxy tab.
-              </p>
-            </div>
-          )}
-
-          {/* Proxy command preview */}
-          {(
+          {/* API Key auth card — shows inline form OR configured status */}
+          {authType === "api_key" && (
             <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
-              <p className="text-xs text-brightwing-gray-500 mb-1">
-                Proxy Command (written to tool configs)
-              </p>
-              <code className="text-sm text-brightwing-gray-200 font-mono">
-                brightwing-proxy --server {config.config_key}
-              </code>
+              <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
+                Authentication
+              </h2>
+
+              {apiKeySaved ? (
+                /* Key is saved — show green status matching ServerDetail */
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-green-400" />
+                  <span className="text-xs text-brightwing-gray-300">API Key configured</span>
+                  <button
+                    onClick={() => setView("api-keys")}
+                    className="ml-auto text-xs text-brightwing-blue hover:text-brightwing-blue/80"
+                  >
+                    Manage Keys
+                  </button>
+                </div>
+              ) : (
+                /* Key not saved — show inline entry form */
+                <div className="space-y-3">
+                  {config && Object.entries(config.env_schema).map(([key, schema]) => (
+                    <div key={key}>
+                      <label className="block text-xs text-brightwing-gray-400 mb-1">
+                        {key}
+                        {schema.required && (
+                          <span className="text-red-400 ml-1">*</span>
+                        )}
+                        {schema.description && (
+                          <span className="text-brightwing-gray-600 ml-2">
+                            — {schema.description}
+                          </span>
+                        )}
+                      </label>
+                      <input
+                        type={schema.sensitive ? "password" : "text"}
+                        placeholder={schema.default || ""}
+                        value={envValues[key] || ""}
+                        onChange={(e) => handleEnvChange(key, e.target.value)}
+                        className="w-full px-3 py-2 bg-brightwing-gray-900 border border-brightwing-gray-700 rounded-md text-sm font-mono placeholder-brightwing-gray-600 focus:outline-none focus:border-brightwing-blue focus:ring-1 focus:ring-brightwing-blue"
+                      />
+                    </div>
+                  ))}
+
+                  {/* Save button appears when any field has a value */}
+                  {Object.values(envValues).some((v) => v.trim().length > 0) && (
+                    <button
+                      onClick={handleSaveApiKey}
+                      disabled={savingKey}
+                      className="w-full py-2 text-sm bg-brightwing-blue hover:bg-brightwing-blue-dark text-white rounded-md transition-colors disabled:opacity-50"
+                    >
+                      {savingKey ? "Saving to vault..." : "Save API Key"}
+                    </button>
+                  )}
+
+                  <p className="text-xs text-brightwing-gray-500">
+                    Credentials are stored in Brightwing's encrypted vault.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
-          {/* Env var form — hidden for HTTP+OAuth (OAuth handles auth), shown for API key / none / stdio */}
-          {!(isHttpServer && probeResult?.auth_type === "oauth") &&
-            Object.keys(config.env_schema).length > 0 && (
-            <div>
-              <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
-                {proxyMode ? "Credentials (stored securely)" : "Configuration"}
-              </h2>
-              <div className="space-y-3">
-                {Object.entries(config.env_schema).map(([key, schema]) => (
-                  <div key={key}>
-                    <label className="block text-xs text-brightwing-gray-400 mb-1">
-                      {key}
-                      {schema.required && (
-                        <span className="text-red-400 ml-1">*</span>
-                      )}
-                      {schema.description && (
-                        <span className="text-brightwing-gray-600 ml-2">
-                          — {schema.description}
-                        </span>
-                      )}
-                    </label>
-                    <input
-                      type={schema.sensitive ? "password" : "text"}
-                      placeholder={schema.default || ""}
-                      value={envValues[key] || ""}
-                      onChange={(e) => handleEnvChange(key, e.target.value)}
-                      className="w-full px-3 py-2 bg-brightwing-gray-900 border border-brightwing-gray-700 rounded-md text-sm font-mono placeholder-brightwing-gray-600 focus:outline-none focus:border-brightwing-blue focus:ring-1 focus:ring-brightwing-blue"
-                    />
-                  </div>
-                ))}
+          {/* No auth needed card */}
+          {authType === "none" && !probing && (
+            <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-green-400" />
+                <span className="text-xs text-brightwing-gray-400">No auth required</span>
               </div>
             </div>
           )}
 
-          {/* Tool selection with checkboxes */}
+          {/* Unreachable warning */}
+          {isHttpServer && probeResult && !probeResult.server_reachable && (
+            <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4">
+              <p className="text-sm text-red-400 font-medium mb-1">Server Unreachable</p>
+              <p className="text-xs text-brightwing-gray-400">
+                Could not connect to the server. You can still configure auth later from the server detail page.
+              </p>
+            </div>
+          )}
+
+          {/* Installed In — read-only display (matches ServerDetail) */}
           <div>
-            <label className="block text-xs text-brightwing-gray-400 uppercase tracking-wider mb-2">
-              Install Into
-            </label>
-            <div className="space-y-2">
+            <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
+              Installed In
+            </h2>
+            <div className="flex flex-wrap gap-2">
               {detectedTools.map((tool) => {
-                const isSelected = selectedTools.has(tool.id);
-                return (
-                  <button
+                const isInstalled = installedToolIds.has(tool.id);
+                if (!isInstalled) return (
+                  <span
                     key={tool.id}
-                    onClick={() => toggleTool(tool.id)}
-                    disabled={saving}
-                    className={`w-full flex items-center gap-3 p-3 rounded-lg border transition-colors text-left ${
-                      isSelected
-                        ? "bg-brightwing-blue/10 border-brightwing-blue"
-                        : "bg-brightwing-gray-800 border-brightwing-gray-700 hover:border-brightwing-gray-600"
-                    } disabled:opacity-50`}
+                    className="px-3 py-1.5 text-xs rounded-md bg-brightwing-gray-700/50 border border-brightwing-gray-600 text-brightwing-gray-500"
                   >
-                    <div
-                      className={`w-4 h-4 rounded border-2 flex items-center justify-center flex-shrink-0 ${
-                        isSelected
-                          ? "border-brightwing-blue bg-brightwing-blue"
-                          : "border-brightwing-gray-600"
-                      }`}
-                    >
-                      {isSelected && (
-                        <svg
-                          className="w-3 h-3 text-white"
-                          fill="none"
-                          viewBox="0 0 24 24"
-                          stroke="currentColor"
-                          strokeWidth={3}
-                        >
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            d="m4.5 12.75 6 6 9-13.5"
-                          />
-                        </svg>
-                      )}
-                    </div>
-                    <span className="text-sm font-medium">
-                      {tool.display_name}
-                    </span>
-                    <span className="text-xs text-brightwing-gray-500">
-                      ({tool.short_name})
-                    </span>
-                    {TOOL_WARNINGS[tool.id] && (
-                      <span
-                        className="text-xs text-amber-400 flex items-center gap-1"
-                        title={TOOL_WARNINGS[tool.id].detail}
-                      >
-                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
-                        </svg>
-                        Known issue
-                      </span>
-                    )}
-                    {installedToolIds.has(tool.id) && (
-                      <span className="ml-auto text-xs text-green-400">
-                        installed
-                      </span>
-                    )}
-                  </button>
+                    {tool.short_name}
+                  </span>
+                );
+                return (
+                  <span
+                    key={tool.id}
+                    className="px-3 py-1.5 text-xs rounded-md bg-green-500/10 border border-green-500/30 text-green-300"
+                  >
+                    {tool.short_name} {"\u2713"}
+                  </span>
                 );
               })}
-              {detectedTools.length === 0 && (
-                <p className="text-brightwing-gray-500 text-sm">
-                  No AI tools detected on your machine.
-                </p>
+            </div>
+            <p className="text-xs text-brightwing-gray-500 mt-2">
+              Use the Dashboard to add or remove this server from tools.
+            </p>
+          </div>
+
+          {/* Server Info */}
+          <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
+            <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
+              Server Info
+            </h2>
+            <div className="space-y-2 text-xs">
+              <div className="flex items-center justify-between">
+                <span className="text-brightwing-gray-500">Config Key</span>
+                <span className="font-mono text-brightwing-gray-300">
+                  {config.config_key}
+                </span>
+              </div>
+              {config.remote_url && (
+                <div className="flex items-center justify-between">
+                  <span className="text-brightwing-gray-500">Upstream URL</span>
+                  <span className="font-mono text-brightwing-gray-300 truncate ml-4">{config.remote_url}</span>
+                </div>
               )}
+              {config.transport === "stdio" && (
+                <div className="flex items-center justify-between">
+                  <span className="text-brightwing-gray-500">Upstream Command</span>
+                  <span className="font-mono text-brightwing-gray-300 truncate ml-4">
+                    {config.command} {config.args.join(" ")}
+                  </span>
+                </div>
+              )}
+              <div className="flex items-center justify-between">
+                <span className="text-brightwing-gray-500">Transport</span>
+                <span className="font-mono text-brightwing-gray-300">proxy (stdio)</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-brightwing-gray-500">Proxy Command</span>
+                <span className="font-mono text-brightwing-gray-300">
+                  brightwing-proxy --server {config.config_key}
+                </span>
+              </div>
             </div>
           </div>
 
-          {/* Save button */}
-          <button
-            onClick={handleSave}
-            disabled={saving || !hasChanges || needsOauthFirst}
-            className="w-full py-2.5 text-sm bg-brightwing-blue hover:bg-brightwing-blue-dark text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {saving
-              ? proxyMode
-                ? "Setting up proxy..."
-                : "Saving..."
-              : needsOauthFirst
-                ? "Connect OAuth First"
-                : !hasChanges
-                  ? "No Changes"
-                  : proxyMode
-                    ? "Save Changes (via Proxy)"
-                    : "Save Changes"}
-          </button>
-
-          <p className="text-xs text-brightwing-gray-500">
-            {proxyMode
-              ? "Credentials are stored in Brightwing's secure vault. Tool configs will reference the local proxy."
-              : "Changes will appear in the restart banner above when tools need restarting."}
-          </p>
+          {/* Action buttons */}
+          <div className="flex gap-3">
+            <button
+              onClick={handleGoToDashboard}
+              className="flex-1 py-2.5 text-sm bg-brightwing-blue hover:bg-brightwing-blue-dark text-white rounded-md transition-colors"
+            >
+              Go to Dashboard to Install
+            </button>
+            {(stdioProxyRegistered || proxyServer) && (
+              <button
+                onClick={handleViewDetail}
+                className="px-4 py-2.5 text-sm bg-brightwing-gray-700 hover:bg-brightwing-gray-600 text-white rounded-md transition-colors"
+              >
+                View Details
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>

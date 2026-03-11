@@ -107,6 +107,16 @@ export default function About() {
           {
             icon: (
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
+              </svg>
+            ),
+            title: "Encrypted Vault",
+            desc: "API keys stored in a Stronghold encrypted vault — never in plaintext config files",
+            color: "text-rose-400",
+          },
+          {
+            icon: (
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 3c2.755 0 5.455.232 8.083.678.533.09.917.556.917 1.096v1.044a2.25 2.25 0 0 1-.659 1.591l-5.432 5.432a2.25 2.25 0 0 0-.659 1.591v2.927a2.25 2.25 0 0 1-1.244 2.013L9.75 21v-6.568a2.25 2.25 0 0 0-.659-1.591L3.659 7.409A2.25 2.25 0 0 1 3 5.818V4.774c0-.54.384-1.006.917-1.096A48.32 48.32 0 0 1 12 3Z" />
               </svg>
             ),
@@ -147,7 +157,7 @@ export default function About() {
       <div className="mb-8">
         <h2 className="text-base font-bold mb-2">How It Works</h2>
         <p className="text-sm text-brightwing-gray-400 mb-4">
-          Every MCP server you install is routed through the Brightwing proxy. Your AI tools connect to the proxy over local stdio, and the proxy handles authentication, tool filtering, and request forwarding to the upstream server. No credentials are stored in config files — they live in the proxy's encrypted database.
+          Every MCP server you install is routed through the Brightwing proxy. Your AI tools connect to the proxy over local stdio, and the proxy handles authentication, tool filtering, and request forwarding to the upstream server. Credentials are stored in an encrypted Stronghold vault — never in plaintext config files.
         </p>
         <ProxyDiagram />
         <p className="text-xs text-brightwing-gray-500 mt-2 text-center">
@@ -159,7 +169,7 @@ export default function About() {
       <div className="mb-8">
         <h2 className="text-base font-bold mb-3">The Problem</h2>
         <p className="text-sm text-brightwing-gray-400 mb-3">
-          MCP servers are powerful, but managing them is painful. Each AI tool has its own config format, its own file location, and its own quirks. Adding a server means hand-editing JSON, managing OAuth flows, and copy-pasting credentials. Multiply that across 3-5 AI tools and dozens of servers, and it becomes a maintenance burden.
+          MCP servers are powerful, but managing them is painful. Each AI tool has its own config format, its own file location, and its own quirks. Adding a server means hand-editing JSON, managing OAuth flows, and copy-pasting API keys into plaintext config files that any process on your machine can read. Multiply that across 3-5 AI tools and dozens of servers, and it becomes a security and maintenance nightmare.
         </p>
         <p className="text-sm text-brightwing-gray-400">
           Worse, every tool gets the full tool list from every server — even tools you never use. A server with 89 tools dumps all of them into context, eating thousands of tokens before your AI assistant has even started thinking about your request.
@@ -237,7 +247,7 @@ export default function About() {
 
       {/* Version */}
       <div className="text-center text-xs text-brightwing-gray-600 mt-8 pb-4">
-        MCP Manager v0.3.9
+        MCP Manager v0.3.10
       </div>
     </div>
   );

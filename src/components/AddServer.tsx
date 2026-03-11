@@ -7,6 +7,7 @@ import {
   startDaemon,
   getProxyServer,
   probeServerAuth,
+  testApiKeyConnection,
 } from "../lib/tauri";
 import type { AuthProbeResult, ProxyServer } from "../lib/types";
 import OAuthConnect from "./OAuthConnect";
@@ -20,6 +21,31 @@ function normalizeServerName(name: string): string {
   sanitized = sanitized.replace(/_+/g, "_");
   sanitized = sanitized.replace(/^_+|_+$/g, "");
   return sanitized.toLowerCase();
+}
+
+/** Try to extract an API key from URL query params. */
+function parseUrlForApiKey(rawUrl: string): {
+  cleanUrl: string;
+  apiKey: string | null;
+  paramName: string | null;
+} {
+  try {
+    const parsed = new URL(rawUrl);
+    const keyPatterns = /key|token|api/i;
+    for (const [name, value] of parsed.searchParams.entries()) {
+      if (keyPatterns.test(name) && value.length >= 8) {
+        parsed.searchParams.delete(name);
+        return {
+          cleanUrl: parsed.toString(),
+          apiKey: value,
+          paramName: name,
+        };
+      }
+    }
+  } catch {
+    // Not a valid URL yet, ignore
+  }
+  return { cleanUrl: rawUrl, apiKey: null, paramName: null };
 }
 
 export default function AddServer() {
@@ -40,15 +66,31 @@ export default function AddServer() {
   const [proxyServer, setProxyServer] = useState<ProxyServer | null>(null);
   const [oauthConnected, setOauthConnected] = useState(false);
 
+  // Inline API key state
+  const [apiKey, setApiKey] = useState("");
+  const [detectedParamName, setDetectedParamName] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [testPassed, setTestPassed] = useState(false);
+  const [resolvedInjection, setResolvedInjection] = useState<string | null>(null);
+  const [apiKeySaved, setApiKeySaved] = useState(false);
+
   const isHttp = transport === "http";
   const isStdio = transport === "stdio";
 
+  // Effective auth type: if we extracted a key from the URL, treat as api_key regardless of probe
+  const effectiveAuthType = detectedParamName
+    ? "api_key"
+    : probeResult?.auth_type || null;
+
   // For HTTP+OAuth, block save until connected
-  const needsOauthFirst = isHttp && probeResult?.auth_type === "oauth" && !oauthConnected;
+  const needsOauthFirst = isHttp && effectiveAuthType === "oauth" && !oauthConnected;
+  // For HTTP+API key, block save until key is tested (unless we auto-extracted it from URL)
+  const needsApiKeyFirst = isHttp && effectiveAuthType === "api_key" && !testPassed && !detectedParamName;
 
   const canSave = configKey.trim() &&
     (isStdio ? command.trim() : url.trim()) &&
-    !needsOauthFirst;
+    !needsOauthFirst &&
+    !needsApiKeyFirst;
 
   const addEnvRow = () => {
     setEnvRows([...envRows, { key: "", value: "" }]);
@@ -76,6 +118,22 @@ export default function AddServer() {
     }
   };
 
+  /** Handle URL change — detect API keys in query params */
+  const handleUrlChange = (raw: string) => {
+    const { cleanUrl, apiKey: extractedKey, paramName } = parseUrlForApiKey(raw);
+    if (extractedKey) {
+      setUrl(cleanUrl);
+      setApiKey(extractedKey);
+      setDetectedParamName(paramName);
+      showToast(
+        `Detected API key in URL (param: ${paramName}). Key extracted and URL cleaned.`,
+        "success"
+      );
+    } else {
+      setUrl(raw);
+    }
+  };
+
   const handleProbe = async () => {
     if (!url.trim() || !configKey.trim()) {
       showToast("Server name and URL are required", "error");
@@ -86,6 +144,9 @@ export default function AddServer() {
     setProbeResult(null);
     setProxyServer(null);
     setOauthConnected(false);
+    setTestPassed(false);
+    setResolvedInjection(null);
+    setApiKeySaved(false);
 
     try {
       const result = await probeServerAuth(url.trim());
@@ -98,7 +159,10 @@ export default function AddServer() {
       }
 
       const serverId = configKey.trim();
-      const authType = result.auth_type === "oauth" ? "oauth"
+      // If we extracted a key from URL, override auth type to api_key
+      const authType = detectedParamName
+        ? "api_key"
+        : result.auth_type === "oauth" ? "oauth"
         : result.auth_type === "api_key" ? "api_key"
         : "none";
 
@@ -107,6 +171,7 @@ export default function AddServer() {
         displayName: serverId,
         authType,
         upstreamUrl: url.trim(),
+        apiKeyInjection: detectedParamName ? `query_param:${detectedParamName}` : undefined,
       });
 
       const ps = await getProxyServer(serverId);
@@ -120,6 +185,66 @@ export default function AddServer() {
       });
     }
     setProbing(false);
+  };
+
+  /** Test API key connection — tries Bearer, then query_param */
+  const handleTestApiKey = async () => {
+    if (!apiKey.trim()) {
+      showToast("Enter an API key first", "error");
+      return;
+    }
+
+    const serverId = configKey.trim();
+
+    // Save key to vault first
+    const envName = detectedParamName?.toUpperCase().replace(/[^A-Z0-9]/g, "_") || "API_KEY";
+    const env: Record<string, string> = { [envName]: apiKey.trim() };
+
+    try {
+      await storeApiKey(serverId, env);
+      setApiKeySaved(true);
+      showToast("API key saved to encrypted vault", "success");
+    } catch (e) {
+      showToast(`Failed to save API key: ${e}`, "error");
+      return;
+    }
+
+    // Now test the connection
+    setTesting(true);
+    try {
+      const result = await testApiKeyConnection(
+        url.trim(),
+        apiKey.trim(),
+        detectedParamName || undefined
+      );
+
+      if (result.success && result.injection_method) {
+        setTestPassed(true);
+        setResolvedInjection(result.injection_method);
+
+        // Update the server registration with the discovered injection method
+        await registerProxyServer({
+          serverId,
+          displayName: serverId,
+          authType: "api_key",
+          upstreamUrl: url.trim(),
+          apiKeyInjection: result.injection_method,
+        });
+
+        const method = result.injection_method.startsWith("query_param:")
+          ? `query parameter (${result.injection_method.split(":")[1]})`
+          : "Bearer token";
+        showToast(`Connection verified — using ${method}`, "success");
+      } else {
+        showToast(
+          result.error_message || "Connection test failed. Check your API key and URL.",
+          "error"
+        );
+      }
+    } catch (e) {
+      showToast(`Test failed: ${e}`, "error");
+    }
+    setTesting(false);
   };
 
   const handleSave = async () => {
@@ -155,7 +280,8 @@ export default function AddServer() {
             env[row.key.trim()] = row.value.trim();
           }
         }
-        const authType = Object.keys(env).length > 0 ? "api_key" : "none";
+        const hasEnvKeys = Object.keys(env).length > 0;
+        const authType = (hasEnvKeys || detectedParamName) ? "api_key" : "none";
         await registerProxyServer({
           serverId,
           displayName: serverId,
@@ -163,18 +289,29 @@ export default function AddServer() {
           upstreamUrl: !isStdio ? url.trim() : undefined,
           upstreamCommand: isStdio ? command.trim() : undefined,
           upstreamArgs: isStdio ? args.trim() || undefined : undefined,
+          apiKeyInjection: detectedParamName ? `query_param:${detectedParamName}` : undefined,
         });
       }
 
       // Store credentials if any
-      const env: Record<string, string> = {};
-      for (const row of envRows) {
-        if (row.key.trim() && row.value.trim()) {
-          env[row.key.trim()] = row.value.trim();
+      if (!apiKeySaved) {
+        const env: Record<string, string> = {};
+
+        // If we extracted an API key from URL, include it
+        if (detectedParamName && apiKey.trim()) {
+          const envName = detectedParamName.toUpperCase().replace(/[^A-Z0-9]/g, "_") || "API_KEY";
+          env[envName] = apiKey.trim();
         }
-      }
-      if (Object.keys(env).length > 0 && probeResult?.auth_type !== "oauth") {
-        await storeApiKey(serverId, env);
+
+        // Also include any manually-added env rows (stdio servers)
+        for (const row of envRows) {
+          if (row.key.trim() && row.value.trim()) {
+            env[row.key.trim()] = row.value.trim();
+          }
+        }
+        if (Object.keys(env).length > 0 && effectiveAuthType !== "oauth") {
+          await storeApiKey(serverId, env);
+        }
       }
 
       await refreshProxyServers();
@@ -287,9 +424,9 @@ export default function AddServer() {
             <div className="flex gap-2">
               <input
                 type="text"
-                placeholder="https://mcp.example.com/sse"
+                placeholder="https://mcp.example.com/mcp/"
                 value={url}
-                onChange={(e) => setUrl(e.target.value)}
+                onChange={(e) => handleUrlChange(e.target.value)}
                 className="flex-1 px-3 py-2 bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-md text-sm font-mono placeholder-brightwing-gray-600 focus:outline-none focus:border-brightwing-blue focus:ring-1 focus:ring-brightwing-blue"
               />
               <button
@@ -300,48 +437,50 @@ export default function AddServer() {
                 {probing ? "Checking..." : "Check Server"}
               </button>
             </div>
+            {detectedParamName && (
+              <p className="text-xs text-amber-400 mt-1">
+                API key detected in URL (param: <code className="font-mono">{detectedParamName}</code>). Key extracted and stored securely.
+              </p>
+            )}
           </div>
         )}
 
         {/* Probe result for HTTP servers */}
-        {isHttp && probeResult && (
+        {isHttp && (probeResult || detectedParamName) && (
           <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
             <div className="flex items-center gap-2">
               <span
                 className={`w-2 h-2 rounded-full ${
-                  !probeResult.server_reachable
+                  probeResult && !probeResult.server_reachable
                     ? "bg-red-400"
-                    : probeResult.auth_type === "oauth"
+                    : effectiveAuthType === "oauth"
                     ? "bg-purple-400"
-                    : probeResult.auth_type === "api_key"
+                    : effectiveAuthType === "api_key"
                     ? "bg-amber-400"
-                    : probeResult.auth_type === "none"
+                    : effectiveAuthType === "none"
                     ? "bg-green-400"
                     : "bg-brightwing-gray-500"
                 }`}
               />
               <span className="text-xs text-brightwing-gray-300">
-                {!probeResult.server_reachable
+                {probeResult && !probeResult.server_reachable
                   ? "Server unreachable"
-                  : probeResult.auth_type === "oauth"
+                  : effectiveAuthType === "oauth"
                   ? "OAuth detected"
-                  : probeResult.auth_type === "api_key"
-                  ? "API key required"
-                  : probeResult.auth_type === "none"
+                  : effectiveAuthType === "api_key"
+                  ? detectedParamName
+                    ? `API key detected in URL (${detectedParamName})`
+                    : "API key required"
+                  : effectiveAuthType === "none"
                   ? "No auth needed"
                   : "Unknown auth"}
               </span>
-              {probeResult.error_message && (
-                <span className="text-xs text-brightwing-gray-500">
-                  ({probeResult.error_message})
-                </span>
-              )}
             </div>
           </div>
         )}
 
         {/* Inline OAuth connect for HTTP+OAuth servers */}
-        {isHttp && probeResult?.auth_type === "oauth" && proxyServer && (
+        {isHttp && effectiveAuthType === "oauth" && proxyServer && (
           <div className="bg-brightwing-gray-800 border border-purple-500/30 rounded-lg p-4">
             <h3 className="text-sm font-medium mb-3">Connect with OAuth</h3>
             <OAuthConnect
@@ -350,6 +489,66 @@ export default function AddServer() {
                 setOauthConnected(status === "connected");
               }}
             />
+          </div>
+        )}
+
+        {/* Inline API key form for HTTP+API key servers */}
+        {isHttp && effectiveAuthType === "api_key" && (
+          <div className="bg-brightwing-gray-800 border border-amber-500/30 rounded-lg p-4">
+            <h3 className="text-sm font-medium mb-3">
+              {testPassed ? (
+                <span className="text-green-400">API Key Verified</span>
+              ) : (
+                "Enter API Key"
+              )}
+            </h3>
+            {!testPassed ? (
+              <>
+                <div className="flex gap-2 mb-3">
+                  <input
+                    type="password"
+                    placeholder="Paste your API key"
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    className="flex-1 px-3 py-2 bg-brightwing-gray-900 border border-brightwing-gray-600 rounded-md text-sm font-mono placeholder-brightwing-gray-600 focus:outline-none focus:border-brightwing-blue focus:ring-1 focus:ring-brightwing-blue"
+                  />
+                  <button
+                    onClick={handleTestApiKey}
+                    disabled={testing || !apiKey.trim()}
+                    className="px-4 py-2 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded-md transition-colors disabled:opacity-50 whitespace-nowrap"
+                  >
+                    {testing ? (
+                      <span className="flex items-center gap-2">
+                        <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                        </svg>
+                        Testing...
+                      </span>
+                    ) : (
+                      "Test Connection"
+                    )}
+                  </button>
+                </div>
+                <p className="text-xs text-brightwing-gray-500">
+                  Key will be stored in the encrypted vault, then tested against the server.
+                </p>
+              </>
+            ) : (
+              <div className="flex items-center gap-2 text-sm">
+                <svg className="w-4 h-4 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+                </svg>
+                <span className="text-green-400">
+                  Connected via {resolvedInjection?.startsWith("query_param:")
+                    ? `URL parameter (${resolvedInjection.split(":")[1]})`
+                    : "Bearer token"}
+                </span>
+                <span className="text-brightwing-gray-500 ml-auto text-xs">
+                  Stored in encrypted vault
+                </span>
+              </div>
+            )}
           </div>
         )}
 
@@ -363,8 +562,8 @@ export default function AddServer() {
           </div>
         )}
 
-        {/* Environment Variables — not shown for HTTP+OAuth */}
-        {!(isHttp && probeResult?.auth_type === "oauth") && (
+        {/* Environment Variables — only for stdio or HTTP without auto-detected auth */}
+        {(isStdio || (isHttp && !probeResult)) && (
           <div>
             <div className="flex items-center justify-between mb-2">
               <label className="text-xs text-brightwing-gray-400">
@@ -420,7 +619,9 @@ export default function AddServer() {
             ? "Adding server..."
             : needsOauthFirst
               ? "Connect OAuth First"
-              : "Add Server"}
+              : needsApiKeyFirst
+                ? "Test API Key First"
+                : "Add Server"}
         </button>
 
         <p className="text-xs text-brightwing-gray-500">
