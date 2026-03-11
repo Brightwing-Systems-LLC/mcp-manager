@@ -18,6 +18,7 @@ import type {
   OAuthFlowInfo,
   OAuthStatus,
   DaemonStatusInfo,
+  AuthProbeResult,
 } from "./types";
 
 export async function scanTools(): Promise<DetectedTool[]> {
@@ -163,6 +164,12 @@ export async function apiGetServer(
   return invoke<ScoreboardServer>("api_get_server", { serverId });
 }
 
+// --- Auth Probe ---
+
+export async function probeServerAuth(url: string): Promise<AuthProbeResult> {
+  return invoke<AuthProbeResult>("probe_server_auth", { url });
+}
+
 // --- Proxy Server Management ---
 
 export async function registerProxyServer(params: {
@@ -208,24 +215,26 @@ export async function getProxyInstalls(serverId: string): Promise<string[]> {
   return invoke<string[]>("get_proxy_installs", { serverId });
 }
 
-export async function getToolFilter(serverId: string): Promise<ToolFilterEntry[]> {
-  return invoke<ToolFilterEntry[]>("get_tool_filter", { serverId });
+export async function getToolFilter(serverId: string, toolId?: string): Promise<ToolFilterEntry[]> {
+  return invoke<ToolFilterEntry[]>("get_tool_filter", { serverId, toolId: toolId || null });
 }
 
 export async function setToolFilter(
   serverId: string,
   toolName: string,
   enabled: boolean,
-  tokenEstimate: number
+  tokenEstimate: number,
+  toolId?: string
 ): Promise<void> {
-  return invoke("set_tool_filter", { serverId, toolName, enabled, tokenEstimate });
+  return invoke("set_tool_filter", { serverId, toolId: toolId || null, toolName, enabled, tokenEstimate });
 }
 
 export async function setToolFilterBulk(
   serverId: string,
-  enabledTools: string[]
+  enabledTools: string[],
+  toolId?: string
 ): Promise<void> {
-  return invoke("set_tool_filter_bulk", { serverId, enabledTools });
+  return invoke("set_tool_filter_bulk", { serverId, toolId: toolId || null, enabledTools });
 }
 
 export async function getCachedTools(serverId: string): Promise<CachedTool[]> {
@@ -301,6 +310,16 @@ export async function distributeBinaries(): Promise<string[]> {
 
 export async function getBinaryVersions(): Promise<Record<string, string>> {
   return invoke<Record<string, string>>("get_binary_versions");
+}
+
+export async function checkCliPath(): Promise<boolean> {
+  return invoke<boolean>("check_cli_path");
+}
+
+// --- Proxy Logs ---
+
+export async function getProxyLogs(serverId: string): Promise<import("./types").ProxyLogEvent[]> {
+  return invoke<import("./types").ProxyLogEvent[]>("get_proxy_logs", { serverId });
 }
 
 // --- Daemon Lifecycle ---

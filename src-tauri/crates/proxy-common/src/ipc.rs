@@ -48,7 +48,12 @@ pub enum IpcRequest {
 
     // Tool filtering
     #[serde(rename = "get_tool_filter")]
-    GetToolFilter { server_id: String },
+    GetToolFilter {
+        server_id: String,
+        /// App identifier (e.g. "claude_code", "cursor"). Defaults to "_all" if absent.
+        #[serde(default)]
+        tool_id: Option<String>,
+    },
 
     // CLI shim: list all servers
     #[serde(rename = "list_servers")]
@@ -94,6 +99,9 @@ pub enum IpcRequest {
         server_id: String,
         tool_name: String,
         enabled: bool,
+        /// App identifier. Defaults to "_all" if absent.
+        #[serde(default)]
+        tool_id: Option<String>,
     },
 
     /// Bulk-set the entire tool filter for a server (replaces all).
@@ -101,6 +109,9 @@ pub enum IpcRequest {
     SetToolFilterBulk {
         server_id: String,
         enabled_tools: Vec<String>,
+        /// App identifier. Defaults to "_all" if absent.
+        #[serde(default)]
+        tool_id: Option<String>,
     },
 
     /// Register a new proxy server in the daemon.
@@ -118,6 +129,14 @@ pub enum IpcRequest {
     /// Unregister a proxy server from the daemon.
     #[serde(rename = "unregister_server")]
     UnregisterServer { server_id: String },
+
+    /// Submit a log event from the proxy to the daemon.
+    #[serde(rename = "submit_log")]
+    SubmitLog { event: ProxyLogEvent },
+
+    /// Retrieve recent log events for a server.
+    #[serde(rename = "get_proxy_logs")]
+    GetProxyLogs { server_id: String },
 
     /// Health check / keepalive.
     #[serde(rename = "ping")]
@@ -203,6 +222,13 @@ pub enum IpcResponse {
     #[serde(rename = "error")]
     Error { code: String, message: String },
 
+    /// Recent proxy log events for a server.
+    #[serde(rename = "proxy_logs")]
+    ProxyLogs {
+        server_id: String,
+        events: Vec<ProxyLogEvent>,
+    },
+
     /// Pong response to Ping. Includes daemon uptime in seconds.
     #[serde(rename = "pong")]
     Pong { uptime_secs: u64, daemon_version: String },
@@ -253,6 +279,37 @@ pub struct ContentBlock {
     #[serde(rename = "type")]
     pub content_type: String,
     pub text: String,
+}
+
+// ─── Proxy log events ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProxyLogEvent {
+    pub timestamp: String,
+    pub event_type: ProxyLogEventType,
+    pub server_id: String,
+    /// MCP client name from the initialize handshake (e.g. "gemini-cli", "claude-code")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyLogEventType {
+    Connect,
+    Request,
+    Response,
+    Error,
+    Session,
+    Disconnect,
 }
 
 // ─── Wire format ─────────────────────────────────────────────────────────────
@@ -364,6 +421,7 @@ mod tests {
     fn test_tool_filter_request_roundtrip() {
         let req = IpcRequest::GetToolFilter {
             server_id: "github".to_string(),
+            tool_id: None,
         };
         let bytes = encode_message(&req).unwrap();
         let decoded: IpcRequest = decode_message(&bytes).unwrap();
@@ -571,6 +629,7 @@ mod tests {
             server_id: "github".to_string(),
             tool_name: "search_repos".to_string(),
             enabled: false,
+            tool_id: Some("claude_code".to_string()),
         };
         let bytes = encode_message(&req).unwrap();
         let decoded: IpcRequest = decode_message(&bytes).unwrap();
@@ -582,6 +641,7 @@ mod tests {
         let req = IpcRequest::SetToolFilterBulk {
             server_id: "github".to_string(),
             enabled_tools: vec!["search_repos".to_string(), "get_repo".to_string()],
+            tool_id: None,
         };
         let bytes = encode_message(&req).unwrap();
         let decoded: IpcRequest = decode_message(&bytes).unwrap();
@@ -667,9 +727,12 @@ mod tests {
             r#"{"action":"store_credentials","server_id":"gh","credential":{"type":"none"}}"#,
             r#"{"action":"delete_credentials","server_id":"gh"}"#,
             r#"{"action":"set_tool_filter","server_id":"gh","tool_name":"t","enabled":true}"#,
+            r#"{"action":"set_tool_filter","server_id":"gh","tool_name":"t","enabled":true,"tool_id":"claude_code"}"#,
             r#"{"action":"set_tool_filter_bulk","server_id":"gh","enabled_tools":["t1"]}"#,
             r#"{"action":"register_server","server_id":"gh","display_name":"GH","auth_type":"oauth"}"#,
             r#"{"action":"unregister_server","server_id":"gh"}"#,
+            r#"{"action":"submit_log","event":{"timestamp":"2026-01-01T00:00:00Z","event_type":"connect","server_id":"gh"}}"#,
+            r#"{"action":"get_proxy_logs","server_id":"gh"}"#,
             r#"{"action":"ping"}"#,
         ];
         for json_str in cases {

@@ -30,10 +30,19 @@ pub fn install_server(tool_id: &str, config: &ServerInstallConfig) -> Result<Ins
         .find(|d| d.id == tool_id)
         .ok_or_else(|| format!("Unknown tool: {}", tool_id))?;
 
+    // Sanitize the config key for tools that only accept identifier characters
+    let config = if needs_sanitizing(&config.config_key) {
+        let mut sanitized = config.clone();
+        sanitized.config_key = sanitize_server_name(&sanitized.config_key);
+        sanitized
+    } else {
+        config.clone()
+    };
+
     match def.config_format {
-        ConfigFormat::Json => install_json(def, config),
-        ConfigFormat::Toml => install_toml(def, config),
-        ConfigFormat::Cli => install_cli(def, config),
+        ConfigFormat::Json => install_json(def, &config),
+        ConfigFormat::Toml => install_toml(def, &config),
+        ConfigFormat::Cli => install_cli(def, &config),
     }
 }
 
@@ -354,17 +363,23 @@ pub fn restore_server_entry(
         .find(|d| d.id == tool_id)
         .ok_or_else(|| format!("Unknown tool: {}", tool_id))?;
 
+    let safe_name = if needs_sanitizing(server_name) {
+        sanitize_server_name(server_name)
+    } else {
+        server_name.to_string()
+    };
+
     match def.config_format {
         ConfigFormat::Json => {
             let entry: JsonValue = serde_json::from_str(config_json)
                 .map_err(|e| format!("Invalid config JSON: {}", e))?;
-            restore_json(def, server_name, entry)
+            restore_json(def, &safe_name, entry)
         }
         ConfigFormat::Toml => {
-            restore_toml(def, server_name, config_json)
+            restore_toml(def, &safe_name, config_json)
         }
         ConfigFormat::Cli => {
-            restore_cli(def, server_name, config_json)
+            restore_cli(def, &safe_name, config_json)
         }
     }
 }

@@ -12,6 +12,35 @@ pub struct DiscoveredTool {
     pub token_estimate: u32,
 }
 
+/// Parse an MCP HTTP response that may be JSON or SSE (text/event-stream).
+/// For SSE, extracts the JSON from the first `data:` line that contains a JSON-RPC message.
+async fn parse_mcp_response(resp: reqwest::Response) -> Result<serde_json::Value, String> {
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let body_text = resp.text().await.map_err(|e| e.to_string())?;
+
+    if content_type.contains("text/event-stream") {
+        // Parse SSE: look for lines starting with "data:" that contain JSON-RPC
+        for line in body_text.lines() {
+            let line = line.trim();
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim();
+                if data.starts_with('{') {
+                    return serde_json::from_str(data).map_err(|e| e.to_string());
+                }
+            }
+        }
+        Err("No JSON-RPC message found in SSE response".to_string())
+    } else {
+        serde_json::from_str(&body_text).map_err(|e| e.to_string())
+    }
+}
+
 /// Discover tools from an upstream HTTP MCP server.
 ///
 /// Sends `initialize` (required by MCP spec) then `tools/list`, returning
@@ -20,7 +49,11 @@ pub async fn discover_tools(
     upstream_url: &str,
     auth_header: Option<&str>,
 ) -> Result<Vec<DiscoveredTool>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
     // 1. Send initialize request
     let init_request = serde_json::json!({
@@ -37,7 +70,10 @@ pub async fn discover_tools(
         }
     });
 
-    let mut req = client.post(upstream_url).json(&init_request);
+    let mut req = client
+        .post(upstream_url)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&init_request);
     if let Some(auth) = auth_header {
         req = req.header("Authorization", auth);
     }
@@ -51,23 +87,52 @@ pub async fn discover_tools(
         return Err(format!("Initialize failed with status {}", init_resp.status()));
     }
 
-    // Parse initialize response (we don't need the contents, just confirm it worked)
-    let _init_body: serde_json::Value = init_resp
-        .json()
-        .await
+    // Capture session ID if the server provides one
+    let session_id = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Parse initialize response — handle both JSON and SSE formats
+    let _init_body = parse_mcp_response(init_resp).await
         .map_err(|e| format!("Failed to parse initialize response: {}", e))?;
 
-    // 2. Send tools/list request
+    // 2. Send initialized notification (required by MCP spec before calling methods)
+    let initialized_notification = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+
+    let mut req = client
+        .post(upstream_url)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&initialized_notification);
+    if let Some(auth) = auth_header {
+        req = req.header("Authorization", auth);
+    }
+    if let Some(ref sid) = session_id {
+        req = req.header("Mcp-Session-Id", sid);
+    }
+    // Notification — we don't need the response, just fire it
+    let _ = req.send().await;
+
+    // 3. Send tools/list request
     let tools_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 2,
-        "method": "tools/list",
-        "params": {}
+        "method": "tools/list"
     });
 
-    let mut req = client.post(upstream_url).json(&tools_request);
+    let mut req = client
+        .post(upstream_url)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&tools_request);
     if let Some(auth) = auth_header {
         req = req.header("Authorization", auth);
+    }
+    if let Some(ref sid) = session_id {
+        req = req.header("Mcp-Session-Id", sid);
     }
 
     let tools_resp = req.send().await.map_err(|e| format!("tools/list request failed: {}", e))?;
@@ -76,9 +141,7 @@ pub async fn discover_tools(
         return Err(format!("tools/list failed with status {}", tools_resp.status()));
     }
 
-    let body: serde_json::Value = tools_resp
-        .json()
-        .await
+    let body: serde_json::Value = parse_mcp_response(tools_resp).await
         .map_err(|e| format!("Failed to parse tools/list response: {}", e))?;
 
     // Check for JSON-RPC error

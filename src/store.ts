@@ -79,17 +79,22 @@ interface AppState {
   clearPendingRestart: (toolId: string) => void;
   restartTool: (toolId: string) => Promise<void>;
 
+  // Server detail
+  serverDetailId: string | null;
+  setServerDetailId: (id: string | null) => void;
+
   // Proxy servers
   proxyServers: ProxyServer[];
   proxyServersLoading: boolean;
   refreshProxyServers: () => Promise<void>;
 
-  // Tool filter (per-server, loaded on demand)
+  // Tool filter (per-server per-app, loaded on demand)
   activeFilterServerId: string | null;
+  activeFilterToolId: string | null;
   activeFilter: ToolFilterEntry[];
   activeFilterLoading: boolean;
-  loadToolFilter: (serverId: string) => Promise<void>;
-  toggleToolFilter: (serverId: string, toolName: string, enabled: boolean, tokenEstimate: number) => Promise<void>;
+  loadToolFilter: (serverId: string, toolId?: string) => Promise<void>;
+  toggleToolFilter: (serverId: string, toolName: string, enabled: boolean, tokenEstimate: number, toolId?: string) => Promise<void>;
 
   // Daemon lifecycle
   daemonStatus: DaemonStatusInfo | null;
@@ -340,6 +345,10 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  // Server detail
+  serverDetailId: null,
+  setServerDetailId: (id) => set({ serverDetailId: id }),
+
   // Proxy servers
   proxyServers: [],
   proxyServersLoading: false,
@@ -356,21 +365,22 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Tool filter
   activeFilterServerId: null,
+  activeFilterToolId: null,
   activeFilter: [],
   activeFilterLoading: false,
-  loadToolFilter: async (serverId: string) => {
-    set({ activeFilterServerId: serverId, activeFilterLoading: true });
+  loadToolFilter: async (serverId: string, toolId?: string) => {
+    set({ activeFilterServerId: serverId, activeFilterToolId: toolId || null, activeFilterLoading: true });
     try {
-      const filter = await tauri.getToolFilter(serverId);
+      const filter = await tauri.getToolFilter(serverId, toolId);
       set({ activeFilter: filter, activeFilterLoading: false });
     } catch (e) {
       console.error("Failed to load tool filter:", e);
       set({ activeFilter: [], activeFilterLoading: false });
     }
   },
-  toggleToolFilter: async (serverId: string, toolName: string, enabled: boolean, tokenEstimate: number) => {
+  toggleToolFilter: async (serverId: string, toolName: string, enabled: boolean, tokenEstimate: number, toolId?: string) => {
     try {
-      await tauri.setToolFilter(serverId, toolName, enabled, tokenEstimate);
+      await tauri.setToolFilter(serverId, toolName, enabled, tokenEstimate, toolId);
       // Optimistic update
       set((state) => ({
         activeFilter: state.activeFilter.map((t) =>

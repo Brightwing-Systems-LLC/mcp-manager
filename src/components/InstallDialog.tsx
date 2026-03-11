@@ -1,8 +1,6 @@
 import { useState, useEffect } from "react";
 import { useStore } from "../store";
 import {
-  installServer,
-  uninstallServer,
   apiGetServer,
   registerProxyServer,
   storeApiKey,
@@ -10,8 +8,32 @@ import {
   uninstallProxyFromTool,
   daemonStatus,
   startDaemon,
+  getProxyServer,
+  probeServerAuth,
 } from "../lib/tauri";
-import type { ServerInstallConfig, ScoreboardServer } from "../lib/types";
+import type { ScoreboardServer, AuthProbeResult, ProxyServer } from "../lib/types";
+import OAuthConnect from "./OAuthConnect";
+
+// Mirror Rust sanitize_server_name
+function normalizeServerName(name: string): string {
+  let sanitized = name
+    .split("")
+    .map((c) => (/[a-zA-Z0-9_-]/.test(c) ? c : "_"))
+    .join("");
+  sanitized = sanitized.replace(/_+/g, "_");
+  sanitized = sanitized.replace(/^_+|_+$/g, "");
+  return sanitized.toLowerCase();
+}
+
+// Tools with known MCP bugs — config is written correctly but the app may not use it
+const TOOL_WARNINGS: Record<string, { short: string; detail: string; link: string }> = {
+  codex: {
+    short: "Desktop app MCP tools may not work",
+    detail:
+      "Codex Desktop has a known bug where MCP tools are configured but not surfaced to the model. The CLI works correctly. Both share the same config file.",
+    link: "https://github.com/openai/codex/issues/11264",
+  },
+};
 
 /** Returns true if the install config has any sensitive env vars (API keys, tokens, etc.) */
 function hasSensitiveEnv(
@@ -31,8 +53,10 @@ export default function InstallDialog() {
     setView,
     setInstallTarget,
     setPendingDeepLink,
+    setServerDetailId,
     refreshInstallations,
     refreshProxyServers,
+    refreshConfiguredServers,
     showToast,
     addPendingRestart,
   } = useStore();
@@ -42,20 +66,102 @@ export default function InstallDialog() {
   const [envValues, setEnvValues] = useState<Record<string, string>>({});
   const [deepLinkLoading, setDeepLinkLoading] = useState(false);
   const [deepLinkError, setDeepLinkError] = useState<string | null>(null);
-  const [proxyMode, setProxyMode] = useState(false);
-  const [proxyModeInitialized, setProxyModeInitialized] = useState(false);
+  // Proxy mode is always on — all servers go through the proxy
+  const proxyMode = true;
+
+  // Auto-probe state for HTTP servers
+  const [probeResult, setProbeResult] = useState<AuthProbeResult | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [proxyServer, setProxyServer] = useState<ProxyServer | null>(null);
+  const [oauthConnected, setOauthConnected] = useState(false);
 
   const server = installTarget;
   const deepLink = pendingDeepLink;
   const config = installConfig;
 
-  // Auto-detect proxy mode when config loads: default ON if server has sensitive env vars
+  const isHttpServer = config?.remote_url && config.transport === "http";
+
+  // Auto-probe HTTP servers when config loads
   useEffect(() => {
-    if (config && !proxyModeInitialized) {
-      setProxyMode(hasSensitiveEnv(config.env_schema));
-      setProxyModeInitialized(true);
-    }
-  }, [config, proxyModeInitialized]);
+    if (!config?.remote_url || config.transport !== "http") return;
+    if (probeResult || probing) return;
+
+    let cancelled = false;
+    setProbing(true);
+
+    (async () => {
+      try {
+        const result = await probeServerAuth(config.remote_url!);
+        if (cancelled) return;
+        setProbeResult(result);
+
+        // Auto-register proxy server invisibly
+        const daemonOk = await ensureDaemon();
+        if (!daemonOk || cancelled) return;
+
+        const serverId = config.config_key;
+        const authType = result.auth_type === "oauth" ? "oauth"
+          : result.auth_type === "api_key" ? "api_key"
+          : "none";
+
+        await registerProxyServer({
+          serverId,
+          displayName: server?.name || serverId,
+          authType,
+          upstreamUrl: config.remote_url || undefined,
+        });
+
+        const ps = await getProxyServer(serverId);
+        if (!cancelled && ps) {
+          setProxyServer(ps);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setProbeResult({
+            auth_type: "unknown",
+            server_reachable: false,
+            error_message: String(e),
+            has_oauth_metadata: false,
+          });
+        }
+      } finally {
+        if (!cancelled) setProbing(false);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [config?.remote_url, config?.transport, config?.config_key, server?.name]);
+
+  // Auto-register proxy server for stdio servers when config loads
+  const [stdioProxyRegistered, setStdioProxyRegistered] = useState(false);
+  useEffect(() => {
+    if (!config || isHttpServer || stdioProxyRegistered || !proxyMode) return;
+    if (!server) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const daemonOk = await ensureDaemon();
+        if (!daemonOk || cancelled) return;
+
+        const serverId = config.config_key;
+        const authType = hasSensitiveEnv(config.env_schema) ? "api_key" : "none";
+        await registerProxyServer({
+          serverId,
+          displayName: server.name,
+          authType,
+          upstreamCommand: config.command,
+          upstreamArgs: config.args.join(" "),
+        });
+        await refreshProxyServers();
+        if (!cancelled) setStdioProxyRegistered(true);
+      } catch {
+        // Non-fatal — proxy will be registered on save
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [config, isHttpServer, stdioProxyRegistered, proxyMode, server?.name]);
 
   // When we have a deep link but no server, fetch the server details
   useEffect(() => {
@@ -76,10 +182,13 @@ export default function InstallDialog() {
     }
   }, [deepLink, server, deepLinkLoading, setInstallTarget, setPendingDeepLink]);
 
+  // Refresh installations on mount to avoid stale data (e.g. deep link while app is running)
+  useEffect(() => {
+    refreshInstallations();
+  }, [refreshInstallations]);
+
   // Initialize checkbox state from current installations when server loads
-  // Filter out tools that don't support programmatic config updates
-  const UNSUPPORTED_TOOL_IDS = new Set(["claude_desktop"]);
-  const detectedTools = tools.filter((t) => t.detected && !UNSUPPORTED_TOOL_IDS.has(t.id));
+  const detectedTools = tools.filter((t) => t.detected);
   const installedToolIds = server
     ? new Set(
         installations
@@ -169,6 +278,9 @@ export default function InstallDialog() {
   const toRemove = [...installedToolIds].filter((id) => !selectedTools.has(id));
   const hasChanges = toInstall.length > 0 || toRemove.length > 0;
 
+  // For HTTP+OAuth servers, block install until OAuth is connected
+  const needsOauthFirst = !!(isHttpServer && probeResult?.auth_type === "oauth" && !oauthConnected);
+
   /** Ensure the daemon is running, starting it if needed. */
   const ensureDaemon = async (): Promise<boolean> => {
     try {
@@ -186,8 +298,26 @@ export default function InstallDialog() {
   const handleProxySave = async () => {
     if (!config) return;
 
-    // Validate required env vars
-    if (toInstall.length > 0) {
+    // For HTTP servers with auto-probe, proxy registration already happened
+    const serverId = config.config_key;
+
+    // Validate required env vars (for non-OAuth HTTP servers or stdio proxy)
+    if (toInstall.length > 0 && !isHttpServer) {
+      const missingRequired = Object.entries(config.env_schema)
+        .filter(([, schema]) => schema.required)
+        .filter(([key]) => !envValues[key]?.trim());
+
+      if (missingRequired.length > 0) {
+        showToast(
+          `Missing required: ${missingRequired.map(([k]) => k).join(", ")}`,
+          "error"
+        );
+        return;
+      }
+    }
+
+    // For API key HTTP servers, validate env vars
+    if (isHttpServer && probeResult?.auth_type === "api_key" && toInstall.length > 0) {
       const missingRequired = Object.entries(config.env_schema)
         .filter(([, schema]) => schema.required)
         .filter(([key]) => !envValues[key]?.trim());
@@ -204,28 +334,29 @@ export default function InstallDialog() {
     setSaving(true);
 
     try {
-      // 1. Ensure daemon is running
+      // Ensure daemon is running
       const daemonOk = await ensureDaemon();
       if (!daemonOk) {
         setSaving(false);
         return;
       }
 
-      // 2. Register server with daemon (idempotent — OK to call multiple times)
-      const serverId = config.config_key;
-      const authType = hasSensitiveEnv(config.env_schema) ? "api_key" : "none";
-      await registerProxyServer({
-        serverId,
-        displayName: server.name,
-        authType,
-        upstreamUrl: config.remote_url || undefined,
-        upstreamCommand: config.transport === "stdio" ? config.command : undefined,
-        upstreamArgs:
-          config.transport === "stdio" ? config.args.join(" ") : undefined,
-      });
+      // If not an auto-probed HTTP server, register proxy now
+      if (!isHttpServer) {
+        const authType = hasSensitiveEnv(config.env_schema) ? "api_key" : "none";
+        await registerProxyServer({
+          serverId,
+          displayName: server.name,
+          authType,
+          upstreamUrl: config.remote_url || undefined,
+          upstreamCommand: config.transport === "stdio" ? config.command : undefined,
+          upstreamArgs:
+            config.transport === "stdio" ? config.args.join(" ") : undefined,
+        });
+      }
 
-      // 3. Store credentials if there are sensitive env vars
-      if (hasSensitiveEnv(config.env_schema)) {
+      // Store credentials if there are sensitive env vars (not OAuth)
+      if (probeResult?.auth_type !== "oauth" && hasSensitiveEnv(config.env_schema)) {
         const env: Record<string, string> = {};
         for (const [key, schema] of Object.entries(config.env_schema)) {
           const value = envValues[key]?.trim();
@@ -238,7 +369,7 @@ export default function InstallDialog() {
         await storeApiKey(serverId, env);
       }
 
-      // 4. Install/uninstall proxy configs
+      // Install/uninstall proxy configs
       let successCount = 0;
       let failCount = 0;
 
@@ -274,7 +405,7 @@ export default function InstallDialog() {
         }
       }
 
-      await Promise.all([refreshInstallations(), refreshProxyServers()]);
+      await Promise.all([refreshInstallations(), refreshProxyServers(), refreshConfiguredServers()]);
 
       if (failCount === 0) {
         const parts = [];
@@ -286,6 +417,9 @@ export default function InstallDialog() {
           `${server.name}: ${parts.join(", ")} tool${successCount !== 1 ? "s" : ""} (via proxy)`,
           "success"
         );
+        // Navigate to unified server detail page
+        setServerDetailId(normalizeServerName(config.config_key));
+        setView("server-detail");
       }
     } catch (e) {
       showToast(`Proxy setup failed: ${e}`, "error");
@@ -294,114 +428,18 @@ export default function InstallDialog() {
     }
   };
 
-  /** Direct install: write raw server config into tool config files. */
-  const handleDirectSave = async () => {
-    if (!config) return;
-
-    // Check required env vars if installing into new tools
-    if (toInstall.length > 0) {
-      const missingRequired = Object.entries(config.env_schema)
-        .filter(([, schema]) => schema.required)
-        .filter(([key]) => !envValues[key]?.trim());
-
-      if (missingRequired.length > 0) {
-        showToast(
-          `Missing required: ${missingRequired.map(([k]) => k).join(", ")}`,
-          "error"
-        );
-        return;
-      }
-    }
-
-    setSaving(true);
-    let successCount = 0;
-    let failCount = 0;
-
-    // Install into newly selected tools
-    for (const toolId of toInstall) {
-      try {
-        const env: Record<string, string> = {};
-        for (const [key, schema] of Object.entries(config.env_schema)) {
-          const value = envValues[key]?.trim();
-          if (value) {
-            env[key] = value;
-          } else if (schema.default) {
-            env[key] = schema.default;
-          }
-        }
-
-        const installCfg: ServerInstallConfig = {
-          server_name: server.name,
-          config_key: config.config_key,
-          command: config.command,
-          args: config.args,
-          env,
-          transport: config.transport,
-          url: config.remote_url || "",
-        };
-
-        const result = await installServer(toolId, installCfg);
-        if (result.success) {
-          successCount++;
-          if (result.needs_restart) addPendingRestart(toolId);
-        } else {
-          failCount++;
-          showToast(result.message, "error");
-        }
-      } catch (e) {
-        failCount++;
-        showToast(`Install failed: ${e}`, "error");
-      }
-    }
-
-    // Remove from newly unchecked tools
-    for (const toolId of toRemove) {
-      try {
-        const result = await uninstallServer(
-          toolId,
-          config.config_key,
-          String(server.id)
-        );
-        if (result.success) {
-          successCount++;
-          if (result.needs_restart) addPendingRestart(toolId);
-        } else {
-          failCount++;
-          showToast(result.message, "error");
-        }
-      } catch (e) {
-        failCount++;
-        showToast(`Uninstall failed: ${e}`, "error");
-      }
-    }
-
-    await refreshInstallations();
-    setSaving(false);
-
-    if (failCount === 0) {
-      const parts = [];
-      if (toInstall.length > 0)
-        parts.push(`installed into ${toInstall.length}`);
-      if (toRemove.length > 0)
-        parts.push(`removed from ${toRemove.length}`);
-      showToast(
-        `${server.name}: ${parts.join(", ")} tool${successCount !== 1 ? "s" : ""}`,
-        "success"
-      );
-    }
-  };
-
-  const handleSave = proxyMode ? handleProxySave : handleDirectSave;
+  const handleSave = handleProxySave;
 
   const handleBack = () => {
     setInstallTarget(null);
     setPendingDeepLink(null);
-    setProxyModeInitialized(false);
+    setProbeResult(null);
+    setProxyServer(null);
+    setOauthConnected(false);
+    setStdioProxyRegistered(false);
     setView("dashboard");
   };
 
-  // Whether this config has sensitive env vars that benefit from proxy mode
-  const hasSensitive = config ? hasSensitiveEnv(config.env_schema) : false;
 
   return (
     <div>
@@ -465,59 +503,81 @@ export default function InstallDialog() {
         </div>
       ) : (
         <div className="space-y-5 max-w-xl">
-          {/* Proxy mode toggle — shown when server has sensitive env vars */}
-          {hasSensitive && (
+          {/* Auth probe status for HTTP servers */}
+          {isHttpServer && (
             <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm font-medium">
-                    {proxyMode ? "Proxy Install" : "Direct Install"}
-                  </p>
-                  <p className="text-xs text-brightwing-gray-500 mt-0.5">
-                    {proxyMode
-                      ? "Credentials stored securely. Tools get a local proxy — no plaintext secrets in config files."
-                      : "API keys written directly into each tool's config file."}
-                  </p>
-                </div>
-                <button
-                  onClick={() => setProxyMode(!proxyMode)}
-                  disabled={saving}
-                  className={`relative w-11 h-6 rounded-full transition-colors ${
-                    proxyMode ? "bg-brightwing-blue" : "bg-brightwing-gray-600"
-                  } disabled:opacity-50`}
-                >
+              <div className="flex items-center gap-2 mb-1">
+                <p className="text-sm font-medium">Server Authentication</p>
+                {probing && (
+                  <svg className="w-4 h-4 animate-spin text-brightwing-blue" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                )}
+              </div>
+              {probing ? (
+                <p className="text-xs text-brightwing-gray-500">Checking server auth requirements...</p>
+              ) : probeResult ? (
+                <div className="flex items-center gap-2">
                   <span
-                    className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
-                      proxyMode ? "translate-x-5" : ""
+                    className={`w-2 h-2 rounded-full ${
+                      !probeResult.server_reachable
+                        ? "bg-red-400"
+                        : probeResult.auth_type === "oauth"
+                        ? "bg-purple-400"
+                        : probeResult.auth_type === "api_key"
+                        ? "bg-amber-400"
+                        : probeResult.auth_type === "none"
+                        ? "bg-green-400"
+                        : "bg-brightwing-gray-500"
                     }`}
                   />
-                </button>
-              </div>
-              {proxyMode && (
-                <div className="flex items-center gap-2 mt-3 pt-3 border-t border-brightwing-gray-700">
-                  <svg className="w-4 h-4 text-green-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285Z" />
-                  </svg>
-                  <span className="text-xs text-brightwing-gray-400">
-                    Authenticate once, use across all tools. Manage credentials in the Proxy tab.
+                  <span className="text-xs text-brightwing-gray-300">
+                    {!probeResult.server_reachable
+                      ? "Server unreachable"
+                      : probeResult.auth_type === "oauth"
+                      ? "OAuth detected"
+                      : probeResult.auth_type === "api_key"
+                      ? "API key required"
+                      : probeResult.auth_type === "none"
+                      ? "No auth needed"
+                      : "Unknown auth"}
                   </span>
+                  {probeResult.error_message && (
+                    <span className="text-xs text-brightwing-gray-500">
+                      ({probeResult.error_message})
+                    </span>
+                  )}
                 </div>
-              )}
+              ) : null}
             </div>
           )}
 
-          {/* Command preview — only shown in direct mode */}
-          {!proxyMode && (
-            <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
-              <p className="text-xs text-brightwing-gray-500 mb-1">Command</p>
-              <code className="text-sm text-brightwing-gray-200 font-mono">
-                {config.command} {config.args.join(" ")}
-              </code>
+          {/* Inline OAuth connect for HTTP+OAuth servers */}
+          {isHttpServer && probeResult?.auth_type === "oauth" && proxyServer && (
+            <div className="bg-brightwing-gray-800 border border-purple-500/30 rounded-lg p-4">
+              <h3 className="text-sm font-medium mb-3">Connect with OAuth</h3>
+              <OAuthConnect
+                server={proxyServer}
+                onStatusChange={(status) => {
+                  setOauthConnected(status === "connected");
+                }}
+              />
             </div>
           )}
 
-          {/* Proxy command preview — shown in proxy mode */}
-          {proxyMode && (
+          {/* Unreachable fallback warning */}
+          {isHttpServer && probeResult && !probeResult.server_reachable && (
+            <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4">
+              <p className="text-sm text-red-400 font-medium mb-1">Server Unreachable</p>
+              <p className="text-xs text-brightwing-gray-400">
+                Could not connect to the server. You can still install it and configure auth later from the Proxy tab.
+              </p>
+            </div>
+          )}
+
+          {/* Proxy command preview */}
+          {(
             <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-4">
               <p className="text-xs text-brightwing-gray-500 mb-1">
                 Proxy Command (written to tool configs)
@@ -528,8 +588,9 @@ export default function InstallDialog() {
             </div>
           )}
 
-          {/* Env var form */}
-          {Object.keys(config.env_schema).length > 0 && (
+          {/* Env var form — hidden for HTTP+OAuth (OAuth handles auth), shown for API key / none / stdio */}
+          {!(isHttpServer && probeResult?.auth_type === "oauth") &&
+            Object.keys(config.env_schema).length > 0 && (
             <div>
               <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider mb-3">
                 {proxyMode ? "Credentials (stored securely)" : "Configuration"}
@@ -609,6 +670,17 @@ export default function InstallDialog() {
                     <span className="text-xs text-brightwing-gray-500">
                       ({tool.short_name})
                     </span>
+                    {TOOL_WARNINGS[tool.id] && (
+                      <span
+                        className="text-xs text-amber-400 flex items-center gap-1"
+                        title={TOOL_WARNINGS[tool.id].detail}
+                      >
+                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+                        </svg>
+                        Known issue
+                      </span>
+                    )}
                     {installedToolIds.has(tool.id) && (
                       <span className="ml-auto text-xs text-green-400">
                         installed
@@ -628,18 +700,20 @@ export default function InstallDialog() {
           {/* Save button */}
           <button
             onClick={handleSave}
-            disabled={saving || !hasChanges}
+            disabled={saving || !hasChanges || needsOauthFirst}
             className="w-full py-2.5 text-sm bg-brightwing-blue hover:bg-brightwing-blue-dark text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {saving
               ? proxyMode
                 ? "Setting up proxy..."
                 : "Saving..."
-              : !hasChanges
-                ? "No Changes"
-                : proxyMode
-                  ? "Save Changes (via Proxy)"
-                  : "Save Changes"}
+              : needsOauthFirst
+                ? "Connect OAuth First"
+                : !hasChanges
+                  ? "No Changes"
+                  : proxyMode
+                    ? "Save Changes (via Proxy)"
+                    : "Save Changes"}
           </button>
 
           <p className="text-xs text-brightwing-gray-500">

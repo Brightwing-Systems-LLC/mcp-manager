@@ -5,9 +5,10 @@ import { useStore } from "../store";
 
 interface Props {
   server: ProxyServer;
+  onStatusChange?: (status: string) => void;
 }
 
-export default function OAuthConnect({ server }: Props) {
+export default function OAuthConnect({ server, onStatusChange }: Props) {
   const { showToast } = useStore();
   const [status, setStatus] = useState<OAuthStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -36,12 +37,14 @@ export default function OAuthConnect({ server }: Props) {
         }
       }
       setStatus(s);
+      onStatusChange?.(s.status);
     } catch (e) {
       setStatus({
         status: "error",
         expires_at: null,
         error_message: String(e),
       });
+      onStatusChange?.("error");
     }
     setLoading(false);
   }, [server.server_id, server.display_name, status?.status]);

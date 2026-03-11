@@ -49,6 +49,12 @@ pub struct ToolFilterEntry {
     pub tool_name: String,
     pub enabled: bool,
     pub token_estimate: u32,
+    #[serde(default = "default_tool_id")]
+    pub tool_id: String,
+}
+
+fn default_tool_id() -> String {
+    "_all".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +287,12 @@ impl Database {
             rusqlite::params![server_name],
         ).map_err(|e| format!("Failed to delete disabled entries: {}", e))?;
 
+        // Delete proxy server and all cascaded records (api keys, oauth, tool filter, cache, installs)
+        conn.execute(
+            "DELETE FROM proxy_servers WHERE server_id = ?1 OR display_name = ?1",
+            rusqlite::params![server_name],
+        ).map_err(|e| format!("Failed to delete proxy server: {}", e))?;
+
         Ok(installs)
     }
 
@@ -394,15 +406,16 @@ impl Database {
     pub fn set_tool_filter(
         &self,
         server_id: &str,
+        tool_id: &str,
         tool_name: &str,
         enabled: bool,
         token_estimate: u32,
     ) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
-            "INSERT OR REPLACE INTO proxy_tool_filter (server_id, tool_name, enabled, token_estimate)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![server_id, tool_name, enabled as i32, token_estimate],
+            "INSERT OR REPLACE INTO proxy_tool_filter (server_id, tool_id, tool_name, enabled, token_estimate)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![server_id, tool_id, tool_name, enabled as i32, token_estimate],
         )
         .map_err(|e| format!("Failed to set tool filter: {}", e))?;
         Ok(())
@@ -411,51 +424,89 @@ impl Database {
     pub fn set_tool_filter_bulk(
         &self,
         server_id: &str,
+        tool_id: &str,
         enabled_tools: &[String],
     ) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        // Disable all tools for this server first
+        // Disable all tools for this server+tool_id first
         conn.execute(
-            "UPDATE proxy_tool_filter SET enabled = 0 WHERE server_id = ?1",
-            rusqlite::params![server_id],
+            "UPDATE proxy_tool_filter SET enabled = 0 WHERE server_id = ?1 AND tool_id = ?2",
+            rusqlite::params![server_id, tool_id],
         )
         .map_err(|e| format!("Failed to disable tools: {}", e))?;
 
         // Enable the specified tools
         for tool in enabled_tools {
             conn.execute(
-                "UPDATE proxy_tool_filter SET enabled = 1 WHERE server_id = ?1 AND tool_name = ?2",
-                rusqlite::params![server_id, tool],
+                "UPDATE proxy_tool_filter SET enabled = 1 WHERE server_id = ?1 AND tool_id = ?2 AND tool_name = ?3",
+                rusqlite::params![server_id, tool_id, tool],
             )
             .map_err(|e| format!("Failed to enable tool {}: {}", tool, e))?;
         }
         Ok(())
     }
 
-    pub fn get_tool_filter(&self, server_id: &str) -> Result<Vec<ToolFilterEntry>, String> {
+    /// Get tool filter for a specific app (tool_id). Falls back to '_all' if no per-app entries exist.
+    pub fn get_tool_filter(&self, server_id: &str, tool_id: &str) -> Result<Vec<ToolFilterEntry>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
+
+        // First try per-app filter
+        let rows = Self::query_tool_filter(&conn, server_id, tool_id)?;
+
+        // If per-app entries exist, return them
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+
+        // Fall back to '_all' global filter (using same lock)
+        if tool_id != "_all" {
+            return Self::query_tool_filter(&conn, server_id, "_all");
+        }
+
+        Ok(rows)
+    }
+
+    /// Inner query helper — operates on an already-locked connection.
+    fn query_tool_filter(conn: &rusqlite::Connection, server_id: &str, tool_id: &str) -> Result<Vec<ToolFilterEntry>, String> {
         let mut stmt = conn
             .prepare(
-                "SELECT tool_name, enabled, token_estimate FROM proxy_tool_filter
-                 WHERE server_id = ?1 ORDER BY tool_name",
+                "SELECT tool_name, enabled, token_estimate, tool_id FROM proxy_tool_filter
+                 WHERE server_id = ?1 AND tool_id = ?2 ORDER BY tool_name",
             )
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
-        let rows = stmt
-            .query_map(rusqlite::params![server_id], |row| {
+        let rows: Vec<ToolFilterEntry> = stmt
+            .query_map(rusqlite::params![server_id, tool_id], |row| {
                 Ok(ToolFilterEntry {
                     tool_name: row.get(0)?,
                     enabled: row.get::<_, i32>(1)? != 0,
                     token_estimate: row.get(2)?,
+                    tool_id: row.get(3)?,
                 })
             })
-            .map_err(|e| format!("Query failed: {}", e))?;
+            .map_err(|e| format!("Query failed: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
 
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row.map_err(|e| format!("Row error: {}", e))?);
-        }
-        Ok(result)
+        Ok(rows)
+    }
+
+    /// Initialize per-app filter entries from the global '_all' filter.
+    /// Creates a copy of the '_all' entries for the given tool_id.
+    pub fn init_tool_filter_for_app(
+        &self,
+        server_id: &str,
+        tool_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR IGNORE INTO proxy_tool_filter (server_id, tool_id, tool_name, enabled, token_estimate)
+             SELECT server_id, ?2, tool_name, enabled, token_estimate
+             FROM proxy_tool_filter WHERE server_id = ?1 AND tool_id = '_all'",
+            rusqlite::params![server_id, tool_id],
+        )
+        .map_err(|e| format!("Failed to init tool filter for app: {}", e))?;
+        Ok(())
     }
 
     // ─── Tool schema cache ───────────────────────────────────────────────
@@ -476,10 +527,10 @@ impl Database {
         )
         .map_err(|e| format!("Failed to cache tool schema: {}", e))?;
 
-        // Also ensure tool filter entry exists (default: enabled)
+        // Also ensure tool filter entry exists for '_all' (default: enabled)
         conn.execute(
-            "INSERT OR IGNORE INTO proxy_tool_filter (server_id, tool_name, enabled, token_estimate)
-             VALUES (?1, ?2, 1, ?3)",
+            "INSERT OR IGNORE INTO proxy_tool_filter (server_id, tool_id, tool_name, enabled, token_estimate)
+             VALUES (?1, '_all', ?2, 1, ?3)",
             rusqlite::params![server_id, tool_name, token_estimate],
         )
         .map_err(|e| format!("Failed to create tool filter entry: {}", e))?;

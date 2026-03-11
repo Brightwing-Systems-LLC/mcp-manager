@@ -132,7 +132,7 @@ async fn test_discover_and_cache_in_db() {
     assert_eq!(cached.len(), 2);
 
     // Verify tool filter entries were auto-created (default: enabled)
-    let filter = db.get_tool_filter("test-server").unwrap();
+    let filter = db.get_tool_filter("test-server", "_all").unwrap();
     assert_eq!(filter.len(), 2);
     assert!(filter.iter().all(|f| f.enabled));
 }

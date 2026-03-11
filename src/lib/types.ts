@@ -118,7 +118,16 @@ export interface ApiInstallConfig {
   verified: boolean;
 }
 
-export type View = "dashboard" | "search" | "favorites" | "install" | "add-server" | "proxy" | "api-keys" | "about";
+export type View = "dashboard" | "search" | "favorites" | "install" | "add-server" | "proxy" | "api-keys" | "cli" | "about" | "server-detail";
+
+// --- Auth Probe Types ---
+
+export interface AuthProbeResult {
+  auth_type: "oauth" | "api_key" | "none" | "unknown";
+  server_reachable: boolean;
+  error_message: string | null;
+  has_oauth_metadata: boolean;
+}
 
 // --- Proxy Server Types ---
 
@@ -137,6 +146,7 @@ export interface ToolFilterEntry {
   tool_name: string;
   enabled: boolean;
   token_estimate: number;
+  tool_id: string;
 }
 
 export interface CachedTool {
@@ -164,6 +174,19 @@ export interface OAuthStatus {
   status: "disconnected" | "connected" | "expired" | "error";
   expires_at: string | null;
   error_message: string | null;
+}
+
+// --- Proxy Log Types ---
+
+export interface ProxyLogEvent {
+  timestamp: string;
+  event_type: "connect" | "request" | "response" | "error" | "session" | "disconnect";
+  server_id: string;
+  client_name: string | null;
+  method: string | null;
+  status: string | null;
+  error_message: string | null;
+  detail: string | null;
 }
 
 // --- Daemon Types ---

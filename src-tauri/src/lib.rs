@@ -10,10 +10,28 @@ use config::writer::{InstallResult, ServerInstallConfig};
 use db::queries::{DisabledServer, Favorite, Installation, ProxyServer, ProxyApiKey, ToolFilterEntry, CachedTool};
 use db::Database;
 use deeplink::{DeepLinkAction, DeepLinkState};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
 use tauri::{Emitter, Listener, Manager};
 use tools::definitions::DetectedTool;
+
+// --- Installable IDs Cache (5-minute TTL) ---
+
+static INSTALLABLE_IDS_CACHE: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+const INSTALLABLE_IDS_TTL_SECS: u64 = 300; // 5 minutes
+
+// --- Auth Probe Types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthProbeResult {
+    pub auth_type: String,         // "oauth" | "api_key" | "none" | "unknown"
+    pub server_reachable: bool,
+    pub error_message: Option<String>,
+    pub has_oauth_metadata: bool,
+}
 
 // --- Tauri Commands ---
 
@@ -416,6 +434,84 @@ async fn restart_tool(tool_id: String) -> Result<String, String> {
     }
 }
 
+// --- Auth Probe ---
+
+#[tauri::command]
+async fn probe_server_auth(url: String) -> Result<AuthProbeResult, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    // Try MCP initialize with no auth
+    let init_payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "brightwing-probe",
+                "version": "1.0.0"
+            }
+        }
+    });
+
+    let resp = match client.post(&url).json(&init_payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(AuthProbeResult {
+                auth_type: "unknown".to_string(),
+                server_reachable: false,
+                error_message: Some(format!("Connection failed: {}", e)),
+                has_oauth_metadata: false,
+            });
+        }
+    };
+
+    let status = resp.status().as_u16();
+
+    if status == 200 || (200..300).contains(&status) {
+        return Ok(AuthProbeResult {
+            auth_type: "none".to_string(),
+            server_reachable: true,
+            error_message: None,
+            has_oauth_metadata: false,
+        });
+    }
+
+    if status == 401 || status == 403 {
+        // Check for OAuth metadata
+        match oauth::discovery::discover_oauth_metadata(&url).await {
+            Ok(_) => {
+                return Ok(AuthProbeResult {
+                    auth_type: "oauth".to_string(),
+                    server_reachable: true,
+                    error_message: None,
+                    has_oauth_metadata: true,
+                });
+            }
+            Err(_) => {
+                return Ok(AuthProbeResult {
+                    auth_type: "api_key".to_string(),
+                    server_reachable: true,
+                    error_message: None,
+                    has_oauth_metadata: false,
+                });
+            }
+        }
+    }
+
+    // Other status codes — server is reachable but unexpected response
+    Ok(AuthProbeResult {
+        auth_type: "unknown".to_string(),
+        server_reachable: true,
+        error_message: Some(format!("Unexpected HTTP status: {}", status)),
+        has_oauth_metadata: false,
+    })
+}
+
 // --- Proxy Server Management ---
 
 #[tauri::command]
@@ -499,31 +595,44 @@ fn get_proxy_installs(
 }
 
 #[tauri::command]
-fn get_tool_filter(
+async fn get_tool_filter(
     server_id: String,
+    tool_id: Option<String>,
     db: tauri::State<'_, Database>,
 ) -> Result<Vec<ToolFilterEntry>, String> {
-    db.get_tool_filter(&server_id)
+    let tid = tool_id.as_deref().unwrap_or("_all");
+    db.get_tool_filter(&server_id, tid)
 }
 
 #[tauri::command]
-fn set_tool_filter(
+async fn set_tool_filter(
     server_id: String,
+    tool_id: Option<String>,
     tool_name: String,
     enabled: bool,
     token_estimate: u32,
     db: tauri::State<'_, Database>,
 ) -> Result<(), String> {
-    db.set_tool_filter(&server_id, &tool_name, enabled, token_estimate)
+    let tid = tool_id.as_deref().unwrap_or("_all");
+    // If setting per-app filter for the first time, initialize from global
+    if tid != "_all" {
+        let _ = db.init_tool_filter_for_app(&server_id, tid);
+    }
+    db.set_tool_filter(&server_id, tid, &tool_name, enabled, token_estimate)
 }
 
 #[tauri::command]
-fn set_tool_filter_bulk(
+async fn set_tool_filter_bulk(
     server_id: String,
+    tool_id: Option<String>,
     enabled_tools: Vec<String>,
     db: tauri::State<'_, Database>,
 ) -> Result<(), String> {
-    db.set_tool_filter_bulk(&server_id, &enabled_tools)
+    let tid = tool_id.as_deref().unwrap_or("_all");
+    if tid != "_all" {
+        let _ = db.init_tool_filter_for_app(&server_id, tid);
+    }
+    db.set_tool_filter_bulk(&server_id, tid, &enabled_tools)
 }
 
 #[tauri::command]
@@ -781,6 +890,33 @@ async fn ping_daemon() -> Option<(u64, String)> {
     match resp {
         IpcResponse::Pong { uptime_secs, daemon_version } => Some((uptime_secs, daemon_version)),
         _ => None,
+    }
+}
+
+/// Fetch recent proxy log events for a server from the daemon.
+#[tauri::command]
+async fn get_proxy_logs(server_id: String) -> Result<Vec<proxy_common::ipc::ProxyLogEvent>, String> {
+    use proxy_common::ipc::{IpcRequest, IpcResponse};
+    use proxy_common::transport::DaemonClient;
+
+    let socket = daemon_socket_path();
+    let mut client = DaemonClient::connect(&socket).await
+        .map_err(|e| format!("Cannot connect to daemon: {}", e))?;
+
+    client.send(&IpcRequest::GetProxyLogs { server_id }).await
+        .map_err(|e| format!("Send failed: {}", e))?;
+
+    let resp: IpcResponse = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        client.recv(),
+    ).await
+        .map_err(|_| "Timeout waiting for daemon".to_string())?
+        .map_err(|e| format!("Receive failed: {}", e))?;
+
+    match resp {
+        IpcResponse::ProxyLogs { events, .. } => Ok(events),
+        IpcResponse::Error { message, .. } => Err(message),
+        _ => Err("Unexpected response".to_string()),
     }
 }
 
@@ -1105,6 +1241,18 @@ fn get_binary_versions() -> Result<HashMap<String, String>, String> {
     Ok(versions)
 }
 
+#[tauri::command]
+fn check_cli_path() -> Result<bool, String> {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    let local_bin = home.join(".local/bin");
+    let local_bin_str = local_bin.to_string_lossy();
+    Ok(path_env.split(':').any(|p| {
+        let expanded = p.replace('~', &home.to_string_lossy());
+        expanded == *local_bin_str || p == "~/.local/bin"
+    }))
+}
+
 // --- API Proxy (bypasses CORS) ---
 
 const API_BASE: &str = "https://mcpscoreboard.com/api/v1";
@@ -1146,35 +1294,73 @@ async fn api_get_install_config(server_id: String) -> Result<JsonValue, String> 
 
 #[tauri::command]
 async fn api_get_installable_ids() -> Result<Vec<String>, String> {
-    let mut all_ids = Vec::new();
-    let mut page = 1u32;
-    loop {
-        let url = format!(
-            "{}/servers/installable/?per_page=100&page={}",
-            API_BASE, page
-        );
-        let resp = reqwest::get(&url)
-            .await
-            .map_err(|e| format!("Request failed: {}", e))?;
-        let json: JsonValue = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
-        if let Some(results) = json["results"].as_array() {
-            for r in results {
-                if let Some(id) = r["id"].as_str() {
-                    all_ids.push(id.to_string());
+    // Check cache first
+    {
+        if let Ok(cache) = INSTALLABLE_IDS_CACHE.lock() {
+            if let Some((cached_at, ref ids)) = *cache {
+                if cached_at.elapsed().as_secs() < INSTALLABLE_IDS_TTL_SECS {
+                    return Ok(ids.clone());
                 }
             }
-            let total_pages = json["meta"]["total_pages"].as_u64().unwrap_or(1);
-            if (page as u64) >= total_pages {
-                break;
-            }
-            page += 1;
-        } else {
-            break;
         }
     }
+
+    // Fetch page 1 to discover total_pages
+    let url = format!("{}/servers/installable/?per_page=100&page=1", API_BASE);
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    let json: JsonValue = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    let mut all_ids = Vec::new();
+    if let Some(results) = json["results"].as_array() {
+        for r in results {
+            if let Some(id) = r["id"].as_str() {
+                all_ids.push(id.to_string());
+            }
+        }
+    } else {
+        return Ok(all_ids);
+    }
+
+    let total_pages = json["meta"]["total_pages"].as_u64().unwrap_or(1);
+
+    // Fetch remaining pages in parallel
+    if total_pages > 1 {
+        let futures: Vec<_> = (2..=total_pages as u32)
+            .map(|page| {
+                let url = format!(
+                    "{}/servers/installable/?per_page=100&page={}",
+                    API_BASE, page
+                );
+                async move {
+                    let resp = reqwest::get(&url).await.ok()?;
+                    let json: JsonValue = resp.json().await.ok()?;
+                    let results = json["results"].as_array()?;
+                    Some(
+                        results
+                            .iter()
+                            .filter_map(|r| r["id"].as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+        for page_ids in results.into_iter().flatten() {
+            all_ids.extend(page_ids);
+        }
+    }
+
+    // Update cache
+    if let Ok(mut cache) = INSTALLABLE_IDS_CACHE.lock() {
+        *cache = Some((Instant::now(), all_ids.clone()));
+    }
+
     Ok(all_ids)
 }
 
@@ -1252,6 +1438,8 @@ pub fn run() {
             restart_tool,
             fetch_cli_server_config,
             add_server_to_tool,
+            // Auth probe
+            probe_server_auth,
             // Proxy server management
             register_proxy_server,
             unregister_proxy_server,
@@ -1281,6 +1469,9 @@ pub fn run() {
             // Binary distribution
             distribute_binaries,
             get_binary_versions,
+            check_cli_path,
+            // Proxy logs
+            get_proxy_logs,
             // Daemon lifecycle
             daemon_status,
             start_daemon,

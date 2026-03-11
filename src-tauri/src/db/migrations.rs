@@ -81,14 +81,16 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
             updated_at TEXT DEFAULT (datetime('now'))
         );
 
-        -- Per-server tool filter state (which tools are enabled/disabled)
+        -- Per-server per-app tool filter state (which tools are enabled/disabled)
+        -- tool_id = app identifier (claude_code, cursor, etc.) or '_all' for global default
         CREATE TABLE IF NOT EXISTS proxy_tool_filter (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             server_id TEXT NOT NULL,
+            tool_id TEXT NOT NULL DEFAULT '_all',
             tool_name TEXT NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1,
             token_estimate INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(server_id, tool_name),
+            UNIQUE(server_id, tool_id, tool_name),
             FOREIGN KEY (server_id) REFERENCES proxy_servers(server_id) ON DELETE CASCADE
         );
 
@@ -142,6 +144,48 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         ",
     )
     .map_err(|e| format!("Migration failed: {}", e))?;
+
+    // Migrate proxy_tool_filter to add tool_id column if needed (v2 schema)
+    migrate_tool_filter_v2(conn)?;
+
+    Ok(())
+}
+
+/// Migrate proxy_tool_filter from v1 (server_id, tool_name) to v2 (server_id, tool_id, tool_name).
+/// This handles existing databases that already have the old schema.
+fn migrate_tool_filter_v2(conn: &Connection) -> Result<(), String> {
+    // Check if tool_id column already exists
+    let has_tool_id: bool = conn
+        .prepare("SELECT tool_id FROM proxy_tool_filter LIMIT 0")
+        .is_ok();
+
+    if has_tool_id {
+        return Ok(()); // Already migrated
+    }
+
+    // Need to recreate the table with the new schema
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS proxy_tool_filter_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id TEXT NOT NULL,
+            tool_id TEXT NOT NULL DEFAULT '_all',
+            tool_name TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            token_estimate INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(server_id, tool_id, tool_name),
+            FOREIGN KEY (server_id) REFERENCES proxy_servers(server_id) ON DELETE CASCADE
+        );
+
+        INSERT OR IGNORE INTO proxy_tool_filter_v2 (server_id, tool_id, tool_name, enabled, token_estimate)
+        SELECT server_id, '_all', tool_name, enabled, token_estimate FROM proxy_tool_filter;
+
+        DROP TABLE proxy_tool_filter;
+
+        ALTER TABLE proxy_tool_filter_v2 RENAME TO proxy_tool_filter;
+        ",
+    )
+    .map_err(|e| format!("Tool filter v2 migration failed: {}", e))?;
 
     Ok(())
 }

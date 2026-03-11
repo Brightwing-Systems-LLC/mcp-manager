@@ -165,6 +165,15 @@ fn coerce_value(s: &str) -> serde_json::Value {
 
 // ─── Output formatting ──────────────────────────────────────────────────────
 
+/// Shell-quote a string if it contains spaces or special characters.
+fn shell_quote(s: &str) -> String {
+    if s.contains(|c: char| c.is_whitespace() || "\"'\\$`!#&|;(){}".contains(c)) {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
+}
+
 /// Format MCP tool result content blocks as human-readable text.
 fn format_tool_result(content: &[serde_json::Value], is_error: bool) -> String {
     let mut output = String::new();
@@ -246,7 +255,7 @@ fn format_tool_list(server_id: &str, tools: &[serde_json::Value]) -> String {
 
     out.push_str(&format!(
         "\nRun `bw {} <tool> --help` for usage.\n",
-        server_id
+        shell_quote(server_id)
     ));
 
     out
@@ -259,7 +268,7 @@ fn format_tool_help(
     description: &str,
     parameters: &[serde_json::Value],
 ) -> String {
-    let mut out = format!("{}\n\nUSAGE:\n    bw {} {}", description, server_id, tool_name);
+    let mut out = format!("{}\n\nUSAGE:\n    bw {} {}", description, shell_quote(server_id), tool_name);
 
     let required: Vec<&serde_json::Value> = parameters
         .iter()

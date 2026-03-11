@@ -34,7 +34,10 @@ struct DaemonState {
     db: Arc<Database>,
     version: String,
     started_at: Instant,
+    log_buffers: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<proxy_common::ipc::ProxyLogEvent>>>,
 }
+
+const MAX_LOG_EVENTS_PER_SERVER: usize = 200;
 
 impl DaemonState {
     fn new(db: Arc<Database>) -> Self {
@@ -42,6 +45,7 @@ impl DaemonState {
             db,
             version: IPC_PROTOCOL_VERSION.to_string(),
             started_at: Instant::now(),
+            log_buffers: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -62,16 +66,19 @@ impl DaemonState {
                 self.handle_delete_credentials(&server_id)
             }
 
-            IpcRequest::GetToolFilter { server_id } => {
-                self.handle_get_tool_filter(&server_id)
+            IpcRequest::GetToolFilter { server_id, tool_id } => {
+                let tid = tool_id.as_deref().unwrap_or("_all");
+                self.handle_get_tool_filter(&server_id, tid)
             }
 
-            IpcRequest::SetToolFilter { server_id, tool_name, enabled } => {
-                self.handle_set_tool_filter(&server_id, &tool_name, enabled)
+            IpcRequest::SetToolFilter { server_id, tool_name, enabled, tool_id } => {
+                let tid = tool_id.as_deref().unwrap_or("_all");
+                self.handle_set_tool_filter(&server_id, tid, &tool_name, enabled)
             }
 
-            IpcRequest::SetToolFilterBulk { server_id, enabled_tools } => {
-                self.handle_set_tool_filter_bulk(&server_id, &enabled_tools)
+            IpcRequest::SetToolFilterBulk { server_id, enabled_tools, tool_id } => {
+                let tid = tool_id.as_deref().unwrap_or("_all");
+                self.handle_set_tool_filter_bulk(&server_id, tid, &enabled_tools)
             }
 
             IpcRequest::RegisterServer { server_id, display_name, auth_type, upstream_url } => {
@@ -96,6 +103,25 @@ impl DaemonState {
 
             IpcRequest::CallTool { server_id, tool_name, arguments } => {
                 self.handle_call_tool(&server_id, &tool_name, &arguments).await
+            }
+
+            IpcRequest::SubmitLog { event } => {
+                let mut buffers = self.log_buffers.lock().unwrap();
+                let buf = buffers.entry(event.server_id.clone()).or_default();
+                buf.push_back(event);
+                while buf.len() > MAX_LOG_EVENTS_PER_SERVER {
+                    buf.pop_front();
+                }
+                IpcResponse::Ok { message: None }
+            }
+
+            IpcRequest::GetProxyLogs { server_id } => {
+                let buffers = self.log_buffers.lock().unwrap();
+                let events = buffers
+                    .get(&server_id)
+                    .map(|buf| buf.iter().cloned().collect())
+                    .unwrap_or_default();
+                IpcResponse::ProxyLogs { server_id, events }
             }
 
             IpcRequest::Ping => {
@@ -315,8 +341,8 @@ impl DaemonState {
         }
     }
 
-    fn handle_get_tool_filter(&self, server_id: &str) -> IpcResponse {
-        match self.db.get_tool_filter(server_id) {
+    fn handle_get_tool_filter(&self, server_id: &str, tool_id: &str) -> IpcResponse {
+        match self.db.get_tool_filter(server_id, tool_id) {
             Ok(entries) => {
                 let enabled_tools: Vec<String> = entries
                     .iter()
@@ -341,8 +367,8 @@ impl DaemonState {
         }
     }
 
-    fn handle_set_tool_filter(&self, server_id: &str, tool_name: &str, enabled: bool) -> IpcResponse {
-        match self.db.set_tool_filter(server_id, tool_name, enabled, 0) {
+    fn handle_set_tool_filter(&self, server_id: &str, tool_id: &str, tool_name: &str, enabled: bool) -> IpcResponse {
+        match self.db.set_tool_filter(server_id, tool_id, tool_name, enabled, 0) {
             Ok(()) => IpcResponse::Ok { message: None },
             Err(e) => IpcResponse::Error {
                 code: "db_error".to_string(),
@@ -351,8 +377,8 @@ impl DaemonState {
         }
     }
 
-    fn handle_set_tool_filter_bulk(&self, server_id: &str, enabled_tools: &[String]) -> IpcResponse {
-        match self.db.set_tool_filter_bulk(server_id, enabled_tools) {
+    fn handle_set_tool_filter_bulk(&self, server_id: &str, tool_id: &str, enabled_tools: &[String]) -> IpcResponse {
+        match self.db.set_tool_filter_bulk(server_id, tool_id, enabled_tools) {
             Ok(()) => IpcResponse::Ok { message: None },
             Err(e) => IpcResponse::Error {
                 code: "db_error".to_string(),
@@ -395,7 +421,7 @@ impl DaemonState {
         match self.db.get_proxy_servers() {
             Ok(servers) => {
                 let infos: Vec<proxy_common::ipc::ServerInfo> = servers.into_iter().map(|s| {
-                    let filter = self.db.get_tool_filter(&s.server_id).unwrap_or_default();
+                    let filter = self.db.get_tool_filter(&s.server_id, "_all").unwrap_or_default();
                     let enabled: Vec<_> = filter.iter().filter(|e| e.enabled).collect();
                     let token_estimate: u32 = enabled.iter().map(|e| e.token_estimate).sum();
 

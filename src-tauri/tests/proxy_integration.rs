@@ -163,7 +163,7 @@ async fn handle_daemon_client(stream: UnixStream, vault: Arc<InMemoryVaultBacken
                     },
                 }
             }
-            IpcRequest::GetToolFilter { server_id } => {
+            IpcRequest::GetToolFilter { server_id, tool_id: _ } => {
                 // For filter tests, check if we stored a filter in the vault
                 let filter_key = format!("filter:{}", server_id);
                 let enabled = match vault.retrieve(&filter_key).await {
@@ -203,7 +203,7 @@ async fn handle_daemon_client(stream: UnixStream, vault: Arc<InMemoryVaultBacken
                     },
                 }
             }
-            IpcRequest::SetToolFilterBulk { server_id, enabled_tools } => {
+            IpcRequest::SetToolFilterBulk { server_id, enabled_tools, tool_id: _ } => {
                 let filter_key = format!("filter:{}", server_id);
                 let data = serde_json::to_vec(&enabled_tools).unwrap();
                 let _ = vault.store(&filter_key, &data).await;
@@ -303,6 +303,7 @@ async fn proxy_single_request(
     // Get tool filter
     let filter_req = IpcRequest::GetToolFilter {
         server_id: server_id.to_string(),
+        tool_id: None,
     };
     writer
         .write_all(&encode_message(&filter_req).unwrap())
@@ -829,6 +830,7 @@ async fn test_proxy_filter_update_reflected_in_next_request() {
     gui.send(&IpcRequest::SetToolFilterBulk {
         server_id: "greek".to_string(),
         enabled_tools: vec!["gamma".to_string()],
+        tool_id: None,
     })
     .await;
     let _ = gui.recv().await;

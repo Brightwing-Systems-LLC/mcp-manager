@@ -1,7 +1,7 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { useStore } from "../store";
-import { fetchCliServerConfig, addServerToTool, getToolFilter, deleteServer } from "../lib/tauri";
-import type { ToolFilterEntry } from "../lib/types";
+import { fetchCliServerConfig, deleteServer, getOAuthStatus, installProxyToTool, registerProxyServer, daemonStatus, startDaemon, addFavorite, removeFavorite } from "../lib/tauri";
+import type { OAuthStatus } from "../lib/types";
 
 type CellInfo = {
   configJson: string | null;
@@ -28,7 +28,17 @@ type PendingChange = {
 };
 
 // Tools where remote connectors are cloud-managed with no local API
-const LOCKED_TOOLS = new Set(["claude_desktop"]);
+const LOCKED_TOOLS = new Set<string>();
+
+// Tools with known MCP bugs — config is written correctly but the app may not use it
+const TOOL_WARNINGS: Record<string, { short: string; detail: string; link: string }> = {
+  codex: {
+    short: "Desktop app MCP tools may not work",
+    detail:
+      "Codex Desktop has a known bug where MCP tools are configured but not surfaced to the model. The CLI works correctly. Both share the same config file.",
+    link: "https://github.com/openai/codex/issues/11264",
+  },
+};
 
 export default function Dashboard() {
   const {
@@ -45,36 +55,82 @@ export default function Dashboard() {
     addPendingRestart,
     showToast,
     proxyServers,
+    refreshProxyServers,
+    favorites,
+    refreshFavorites,
     setView,
+    setServerDetailId,
   } = useStore();
+
+  const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
 
   const [pendingChanges, setPendingChanges] = useState<Map<string, PendingChange>>(new Map());
   const [saving, setSaving] = useState(false);
   const [saveProgress, setSaveProgress] = useState({ current: 0, total: 0, currentName: "" });
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [proxyFilterSummaries, setProxyFilterSummaries] = useState<
-    Record<string, { enabled: number; total: number; enabledTokens: number; totalTokens: number }>
-  >({});
+  const [oauthStatuses, setOauthStatuses] = useState<Record<string, OAuthStatus>>({});
 
   useEffect(() => {
     refreshConfiguredServers();
     refreshDisabledServers();
-  }, [refreshConfiguredServers, refreshDisabledServers]);
+    refreshProxyServers();
+    refreshFavorites();
+  }, [refreshConfiguredServers, refreshDisabledServers, refreshProxyServers, refreshFavorites]);
 
-  // Load token budget summaries for proxy servers
-  useEffect(() => {
-    for (const ps of proxyServers) {
-      getToolFilter(ps.server_id).then((entries: ToolFilterEntry[]) => {
-        const enabled = entries.filter((e) => e.enabled).length;
-        const enabledTokens = entries.filter((e) => e.enabled).reduce((s, e) => s + e.token_estimate, 0);
-        const totalTokens = entries.reduce((s, e) => s + e.token_estimate, 0);
-        setProxyFilterSummaries((prev) => ({
-          ...prev,
-          [ps.server_id]: { enabled, total: entries.length, enabledTokens, totalTokens },
-        }));
+  // Build a set of favorited normalized names for quick lookup
+  const favoriteNames = useMemo(() => {
+    const set = new Set<string>();
+    for (const f of favorites) {
+      set.add(normalizeServerName(f.server_name));
+      if (f.server_uuid) set.add(normalizeServerName(f.server_uuid));
+    }
+    return set;
+  }, [favorites]);
+
+  const isFavorited = (serverName: string) => favoriteNames.has(serverName);
+
+  const handleToggleFavorite = async (serverName: string) => {
+    const displayName = displayNameMap.get(serverName) || serverName;
+    const ps = proxyServerByNormalized.get(serverName);
+    const serverId = ps?.server_id || displayName;
+
+    // Check if already favorited
+    const existing = favorites.find(
+      (f) => normalizeServerName(f.server_name) === serverName || normalizeServerName(f.server_uuid) === serverName
+    );
+
+    if (existing) {
+      await removeFavorite(existing.server_uuid);
+    } else {
+      await addFavorite({
+        serverUuid: serverId,
+        serverName: displayName,
+        displayName,
       });
     }
+    await refreshFavorites();
+  };
+
+  // Load OAuth statuses for proxy servers
+  useEffect(() => {
+    for (const ps of proxyServers) {
+      if (ps.auth_type === "oauth") {
+        getOAuthStatus(ps.server_id).then((status) => {
+          setOauthStatuses((prev) => ({ ...prev, [ps.server_id]: status }));
+        });
+      }
+    }
+  }, [proxyServers]);
+
+  // Build a map of normalizedName -> proxyServer for status dots
+  const proxyServerByNormalized = useMemo(() => {
+    const map = new Map<string, typeof proxyServers[0]>();
+    for (const ps of proxyServers) {
+      map.set(normalizeServerName(ps.server_id), ps);
+      map.set(normalizeServerName(ps.display_name), ps);
+    }
+    return map;
   }, [proxyServers]);
 
   const detectedTools = tools.filter((t) => t.detected);
@@ -129,6 +185,18 @@ export default function Dashboard() {
       }
     }
 
+    // Include proxy servers that aren't already in any tool config
+    for (const ps of proxyServers) {
+      const normalized = normalizeServerName(ps.server_id);
+      if (!normalizedNames.has(normalized)) {
+        normalizedNames.add(normalized);
+        trackDisplayName(normalized, ps.display_name);
+      } else {
+        // Still track the display name (proxy may have a nicer name)
+        trackDisplayName(normalized, ps.display_name);
+      }
+    }
+
     return {
       originalState: state,
       cellInfoMap: info,
@@ -136,7 +204,7 @@ export default function Dashboard() {
       serverConfigMap: configByServer,
       displayNameMap: displayNames,
     };
-  }, [configuredServers, disabledServers]);
+  }, [configuredServers, disabledServers, proxyServers]);
 
   const cellKey = (serverName: string, toolId: string) => `${serverName}:${toolId}`;
 
@@ -246,21 +314,65 @@ export default function Dashboard() {
           await disableServer(change.toolId, actualName, configJson);
           successCount++;
         } else if (change.action === "add") {
-          let configJson = change.cellInfo.configJson;
-          if (!configJson) {
-            // Try to get config from another tool
-            configJson = serverConfigMap.get(change.serverName) || null;
-          }
-          if (!configJson) {
-            showToast(`No config available to install ${change.serverName}`, "error");
-            continue;
-          }
-          const result = await addServerToTool(change.toolId, change.serverName, configJson);
-          if (result.success) {
-            successCount++;
-            if (result.needs_restart) addPendingRestart(change.toolId);
+          // Always use proxy install path
+          let ps = proxyServerByNormalized.get(change.serverName);
+          if (!ps) {
+            // No proxy server yet — create one from existing config
+            try {
+              const status = await daemonStatus();
+              if (!status.running) await startDaemon();
+
+              const displayName = displayNameMap.get(change.serverName) || change.serverName;
+              let configJson = change.cellInfo.configJson;
+              if (!configJson) {
+                configJson = serverConfigMap.get(change.serverName) || null;
+              }
+
+              // Parse config to determine upstream details
+              let upstreamCommand: string | undefined;
+              let upstreamArgs: string | undefined;
+              let upstreamUrl: string | undefined;
+              if (configJson) {
+                try {
+                  const parsed = JSON.parse(configJson);
+                  if (parsed.command) {
+                    upstreamCommand = parsed.command;
+                    upstreamArgs = (parsed.args || []).join(" ");
+                  } else if (parsed.url) {
+                    upstreamUrl = parsed.url;
+                  }
+                } catch { /* ignore parse errors */ }
+              }
+
+              const serverId = change.serverName;
+              await registerProxyServer({
+                serverId,
+                displayName,
+                authType: "none",
+                upstreamUrl,
+                upstreamCommand,
+                upstreamArgs,
+              });
+
+              // Use the newly created proxy
+              const result = await installProxyToTool(change.toolId, serverId, serverId);
+              if (result.success) {
+                successCount++;
+                if (result.needs_restart) addPendingRestart(change.toolId);
+              } else {
+                showToast(result.message, "error");
+              }
+            } catch (e) {
+              showToast(`Failed to create proxy for ${change.serverName}: ${e}`, "error");
+            }
           } else {
-            showToast(result.message, "error");
+            const result = await installProxyToTool(change.toolId, ps.server_id, ps.server_id);
+            if (result.success) {
+              successCount++;
+              if (result.needs_restart) addPendingRestart(change.toolId);
+            } else {
+              showToast(result.message, "error");
+            }
           }
         }
       } catch (e) {
@@ -270,6 +382,7 @@ export default function Dashboard() {
 
     await refreshConfiguredServers();
     await refreshDisabledServers();
+    await refreshProxyServers();
     setPendingChanges(new Map());
     setSaving(false);
 
@@ -320,6 +433,12 @@ export default function Dashboard() {
       variants.add(normalizedName);
       const display = displayNameMap.get(normalizedName);
       if (display) variants.add(display);
+      // Include proxy server_id so proxy records get cleaned up
+      const ps = proxyServerByNormalized.get(normalizedName);
+      if (ps) {
+        variants.add(ps.server_id);
+        variants.add(ps.display_name);
+      }
       return Array.from(variants);
     },
     [configuredServers, disabledServers, displayNameMap]
@@ -334,6 +453,8 @@ export default function Dashboard() {
       const removedFrom = await deleteServer(nameVariants);
       await refreshConfiguredServers();
       await refreshDisabledServers();
+      await refreshProxyServers();
+      await refreshFavorites();
       // Clear any pending changes for this server
       setPendingChanges((prev) => {
         const next = new Map(prev);
@@ -416,99 +537,27 @@ export default function Dashboard() {
         )}
       </section>
 
-      {/* Proxy Servers Summary */}
-      {proxyServers.length > 0 && (
-        <section className="mb-8">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider">
-              Proxy Servers ({proxyServers.length})
-            </h2>
-            <button
-              onClick={() => setView("proxy")}
-              className="text-xs text-brightwing-blue hover:text-brightwing-blue/80 transition-colors"
-            >
-              Manage &rarr;
-            </button>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {proxyServers.map((ps) => {
-              const summary = proxyFilterSummaries[ps.server_id];
-              const tokenPercent = summary && summary.totalTokens > 0
-                ? (summary.enabledTokens / summary.totalTokens) * 100
-                : 0;
-              return (
-                <div
-                  key={ps.server_id}
-                  className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg px-4 py-3"
-                >
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span className="font-medium text-sm truncate">{ps.display_name}</span>
-                      <span
-                        className={`text-xs px-1.5 py-0.5 rounded-full shrink-0 ${
-                          ps.auth_type === "oauth"
-                            ? "bg-purple-500/20 text-purple-300"
-                            : ps.auth_type === "api_key"
-                            ? "bg-amber-500/20 text-amber-300"
-                            : "bg-brightwing-gray-700 text-brightwing-gray-400"
-                        }`}
-                      >
-                        {ps.auth_type === "api_key" ? "API Key" : ps.auth_type === "oauth" ? "OAuth" : "None"}
-                      </span>
-                    </div>
-                  </div>
-                  {summary && summary.total > 0 && (
-                    <div>
-                      <div className="flex items-center justify-between text-xs text-brightwing-gray-500 mb-1">
-                        <span>{summary.enabled}/{summary.total} tools</span>
-                        <span className="font-mono">~{summary.enabledTokens.toLocaleString()} tok</span>
-                      </div>
-                      <div className="w-full bg-brightwing-gray-700 rounded-full h-1.5">
-                        <div
-                          className="h-1.5 rounded-full transition-all duration-300 bg-brightwing-blue"
-                          style={{ width: `${tokenPercent}%` }}
-                        />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-          {/* Aggregate token budget summary */}
-          {(() => {
-            const summaries = Object.values(proxyFilterSummaries);
-            if (summaries.length === 0) return null;
-            const totalEnabled = summaries.reduce((s, v) => s + v.enabledTokens, 0);
-            const totalAll = summaries.reduce((s, v) => s + v.totalTokens, 0);
-            const totalTools = summaries.reduce((s, v) => s + v.enabled, 0);
-            const totalToolsAll = summaries.reduce((s, v) => s + v.total, 0);
-            if (totalAll === 0) return null;
-            const saved = totalAll - totalEnabled;
-            const pct = ((saved / totalAll) * 100).toFixed(0);
-            return (
-              <div className="mt-3 bg-brightwing-gray-800/60 border border-brightwing-gray-700/50 rounded-lg px-4 py-3 flex items-center justify-between">
-                <div className="text-xs text-brightwing-gray-400">
-                  <span className="font-medium text-brightwing-gray-300">{totalTools}/{totalToolsAll}</span> tools enabled across {proxyServers.length} proxy server{proxyServers.length > 1 ? "s" : ""}
-                </div>
-                <div className="text-xs text-right">
-                  <span className="font-mono text-brightwing-gray-300">~{totalEnabled.toLocaleString()} tok</span>
-                  {saved > 0 && (
-                    <span className="text-green-400 ml-2">({pct}% saved)</span>
-                  )}
-                </div>
-              </div>
-            );
-          })()}
-        </section>
-      )}
-
       {/* MCP Servers Grid */}
       <section>
         <div className="flex items-center justify-between mb-3">
-          <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider">
-            MCP Servers ({allServerNames.length})
-          </h2>
+          <div className="flex items-center gap-4">
+            <h2 className="text-sm font-medium text-brightwing-gray-400 uppercase tracking-wider">
+              MCP Servers ({allServerNames.length})
+            </h2>
+            <button
+              onClick={() => setShowFavoritesOnly(!showFavoritesOnly)}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs transition-colors ${
+                showFavoritesOnly
+                  ? "bg-orange-500/15 text-orange-400 border border-orange-500/30"
+                  : "bg-brightwing-gray-700/50 text-brightwing-gray-500 hover:text-brightwing-gray-300 border border-transparent"
+              }`}
+            >
+              <svg className="w-3.5 h-3.5" fill={showFavoritesOnly ? "currentColor" : "none"} viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M11.48 3.499a.562.562 0 0 1 1.04 0l2.125 5.111a.563.563 0 0 0 .475.345l5.518.442c.499.04.701.663.321.988l-4.204 3.602a.563.563 0 0 0-.182.557l1.285 5.385a.562.562 0 0 1-.84.61l-4.725-2.885a.562.562 0 0 0-.586 0L6.982 20.54a.562.562 0 0 1-.84-.61l1.285-5.386a.562.562 0 0 0-.182-.557l-4.204-3.602a.562.562 0 0 1 .321-.988l5.518-.442a.563.563 0 0 0 .475-.345L11.48 3.5Z" />
+              </svg>
+              Favorites
+            </button>
+          </div>
           {pendingChanges.size > 0 && (
             <button
               onClick={handleSave}
@@ -519,7 +568,51 @@ export default function Dashboard() {
           )}
         </div>
 
-        {configuredServersLoading ? (
+        {/* Tool-specific warnings */}
+        {(() => {
+          const affected = manageableTools.filter((t) => TOOL_WARNINGS[t.id]);
+          if (affected.length === 0) return null;
+          return (
+            <div className="mb-3 space-y-2">
+              {affected.map((tool) => {
+                const w = TOOL_WARNINGS[tool.id];
+                return (
+                  <div
+                    key={tool.id}
+                    className="flex items-start gap-2.5 bg-amber-500/5 border border-amber-500/20 rounded-lg px-4 py-3"
+                  >
+                    <svg className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+                    </svg>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs text-amber-300 font-medium">
+                        {tool.display_name}: {w.short}
+                      </p>
+                      <p className="text-xs text-brightwing-gray-400 mt-0.5">
+                        {w.detail}{" "}
+                        <a
+                          href={w.link}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-amber-400/70 hover:text-amber-300 underline underline-offset-2"
+                        >
+                          Track issue &rarr;
+                        </a>
+                      </p>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })()}
+
+        {(() => {
+          const filteredServerNames = showFavoritesOnly
+            ? allServerNames.filter((n) => isFavorited(n))
+            : allServerNames;
+
+          return configuredServersLoading ? (
           <p className="text-brightwing-gray-500 text-sm">Scanning config files...</p>
         ) : allServerNames.length === 0 ? (
           <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-8 text-center">
@@ -530,45 +623,112 @@ export default function Dashboard() {
               Use Search to find and install MCP servers.
             </p>
           </div>
+        ) : filteredServerNames.length === 0 && showFavoritesOnly ? (
+          <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg p-8 text-center">
+            <p className="text-brightwing-gray-400">
+              No favorite servers yet.
+            </p>
+            <p className="text-brightwing-gray-500 text-sm mt-1">
+              Click the star next to a server to add it to your favorites.
+            </p>
+          </div>
         ) : (
           <div className="bg-brightwing-gray-800 border border-brightwing-gray-700 rounded-lg overflow-hidden">
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-brightwing-gray-700">
+                    <th className="w-8 px-2 py-3" />
                     <th className="text-left px-4 py-3 text-brightwing-gray-400 font-medium text-xs uppercase tracking-wider sticky left-0 bg-brightwing-gray-800 z-10">
                       Server
                     </th>
-                    {manageableTools.map((tool) => (
-                      <th
-                        key={tool.id}
-                        className="px-3 py-3 text-center text-brightwing-gray-400 font-mono font-medium text-xs uppercase tracking-wider min-w-[60px]"
-                        title={tool.display_name}
-                      >
-                        {tool.short_name}
-                      </th>
-                    ))}
+                    {manageableTools.map((tool) => {
+                      const warning = TOOL_WARNINGS[tool.id];
+                      return (
+                        <th
+                          key={tool.id}
+                          className={`px-3 py-3 text-center font-mono font-medium text-xs uppercase tracking-wider min-w-[60px] ${
+                            warning ? "text-amber-400/80" : "text-brightwing-gray-400"
+                          }`}
+                          title={warning ? `${tool.display_name} — ${warning.short}` : tool.display_name}
+                        >
+                          <span className="inline-flex items-center gap-1 justify-center">
+                            {tool.short_name}
+                            {warning && (
+                              <svg className="w-3 h-3 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+                              </svg>
+                            )}
+                          </span>
+                        </th>
+                      );
+                    })}
                     <th className="px-3 py-3 w-10" />
                   </tr>
                 </thead>
                 <tbody>
-                  {allServerNames.map((serverName, idx) => (
+                  {filteredServerNames.map((serverName, idx) => (
                     <tr
                       key={serverName}
                       className={`border-b border-brightwing-gray-700/50 ${
                         idx % 2 === 0 ? "" : "bg-brightwing-gray-800/50"
                       }`}
                     >
-                      <td className="px-4 py-2.5 font-mono text-xs sticky left-0 bg-inherit z-10 max-w-[200px] truncate" title={displayNameMap.get(serverName) || serverName}>
-                        {displayNameMap.get(serverName) || serverName}
+                      <td className="w-8 px-2 py-2.5 text-center">
+                        <button
+                          onClick={() => handleToggleFavorite(serverName)}
+                          className="p-0.5 transition-colors"
+                          title={isFavorited(serverName) ? "Remove from favorites" : "Add to favorites"}
+                        >
+                          <svg
+                            className={`w-4 h-4 ${isFavorited(serverName) ? "text-orange-400" : "text-brightwing-gray-600 hover:text-brightwing-gray-400"}`}
+                            fill={isFavorited(serverName) ? "currentColor" : "none"}
+                            viewBox="0 0 24 24"
+                            stroke="currentColor"
+                            strokeWidth={1.5}
+                          >
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M11.48 3.499a.562.562 0 0 1 1.04 0l2.125 5.111a.563.563 0 0 0 .475.345l5.518.442c.499.04.701.663.321.988l-4.204 3.602a.563.563 0 0 0-.182.557l1.285 5.385a.562.562 0 0 1-.84.61l-4.725-2.885a.562.562 0 0 0-.586 0L6.982 20.54a.562.562 0 0 1-.84-.61l1.285-5.386a.562.562 0 0 0-.182-.557l-4.204-3.602a.562.562 0 0 1 .321-.988l5.518-.442a.563.563 0 0 0 .475-.345L11.48 3.5Z" />
+                          </svg>
+                        </button>
+                      </td>
+                      <td className="px-4 py-2.5 font-mono text-xs sticky left-0 bg-inherit z-10 max-w-[200px]">
+                        {(() => {
+                          const ps = proxyServerByNormalized.get(serverName);
+                          const oauthStatus = ps ? oauthStatuses[ps.server_id] : null;
+                          const dotColor = ps
+                            ? ps.auth_type === "oauth"
+                              ? oauthStatus?.status === "connected"
+                                ? "bg-green-400"
+                                : oauthStatus?.status === "expired"
+                                ? "bg-amber-400"
+                                : "bg-red-400"
+                              : ps.auth_type === "api_key"
+                              ? "bg-green-400"
+                              : "bg-green-400"
+                            : "bg-red-400";
+                          return (
+                            <button
+                              onClick={() => {
+                                setServerDetailId(serverName);
+                                setView("server-detail");
+                              }}
+                              className="flex items-center gap-1.5 hover:text-brightwing-blue transition-colors truncate text-left"
+                              title={displayNameMap.get(serverName) || serverName}
+                            >
+                              <span className={`w-1.5 h-1.5 rounded-full ${dotColor} shrink-0`} />
+                              <span className="truncate">{displayNameMap.get(serverName) || serverName}</span>
+                            </button>
+                          );
+                        })()}
                       </td>
                       {manageableTools.map((tool) => {
                         const effective = getEffectiveState(serverName, tool.id);
                         const changed = isChanged(serverName, tool.id);
                         const hasConfig = serverConfigMap.has(serverName);
+                        const isProxy = proxyServerByNormalized.has(serverName);
                         const original = getOriginalState(serverName, tool.id);
-                        // Can interact if: exists in this tool, OR we have config to install it
-                        const canInteract = original !== null || hasConfig;
+                        // Can interact if: exists in this tool, OR we have config to install it, OR it's a proxy server
+                        const canInteract = original !== null || hasConfig || isProxy;
 
                         return (
                           <td key={tool.id} className="px-3 py-2.5 text-center">
@@ -614,7 +774,8 @@ export default function Dashboard() {
               </table>
             </div>
           </div>
-        )}
+        );
+        })()}
         <p className="text-xs text-brightwing-gray-500 mt-4">
           Check/uncheck to enable/disable MCP servers, then click Save Changes to apply.
         </p>

@@ -114,7 +114,7 @@ async fn handle_test_client(stream: UnixStream, vault: Arc<InMemoryVaultBackend>
                     },
                 }
             }
-            IpcRequest::GetToolFilter { server_id } => {
+            IpcRequest::GetToolFilter { server_id, tool_id: _ } => {
                 let key = format!("filter:{}", server_id);
                 match vault.retrieve(&key).await {
                     Ok(Some(data)) => {
@@ -173,7 +173,7 @@ async fn handle_test_client(stream: UnixStream, vault: Arc<InMemoryVaultBackend>
                     },
                 }
             },
-            IpcRequest::SetToolFilter { server_id, tool_name, enabled } => {
+            IpcRequest::SetToolFilter { server_id, tool_name, enabled, tool_id: _ } => {
                 let key = format!("filter:{}", server_id);
                 let mut filter: serde_json::Value = match vault.retrieve(&key).await {
                     Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or(serde_json::json!({"enabled_tools": []})),
@@ -191,7 +191,7 @@ async fn handle_test_client(stream: UnixStream, vault: Arc<InMemoryVaultBackend>
                 let _ = vault.store(&key, &data).await;
                 IpcResponse::Ok { message: None }
             },
-            IpcRequest::SetToolFilterBulk { server_id, enabled_tools } => {
+            IpcRequest::SetToolFilterBulk { server_id, enabled_tools, tool_id: _ } => {
                 let key = format!("filter:{}", server_id);
                 let filter = serde_json::json!({"enabled_tools": enabled_tools});
                 let data = serde_json::to_vec(&filter).unwrap();
@@ -396,6 +396,7 @@ async fn test_multiple_requests_same_connection() {
     client
         .send(&IpcRequest::GetToolFilter {
             server_id: "test".to_string(),
+            tool_id: None,
         })
         .await;
     match client.recv().await {
@@ -603,6 +604,7 @@ async fn test_tool_filter_bulk_and_retrieve() {
         .send(&IpcRequest::SetToolFilterBulk {
             server_id: "github".to_string(),
             enabled_tools: vec!["search_repos".to_string(), "get_repo".to_string()],
+            tool_id: None,
         })
         .await;
 
@@ -615,6 +617,7 @@ async fn test_tool_filter_bulk_and_retrieve() {
     client
         .send(&IpcRequest::GetToolFilter {
             server_id: "github".to_string(),
+            tool_id: None,
         })
         .await;
 
@@ -707,6 +710,7 @@ async fn test_tool_filter_toggle_reenable() {
         .send(&IpcRequest::SetToolFilterBulk {
             server_id: "srv".to_string(),
             enabled_tools: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            tool_id: None,
         })
         .await;
     let _ = client.recv().await;
@@ -717,6 +721,7 @@ async fn test_tool_filter_toggle_reenable() {
             server_id: "srv".to_string(),
             tool_name: "b".to_string(),
             enabled: false,
+            tool_id: None,
         })
         .await;
     let _ = client.recv().await;
@@ -727,6 +732,7 @@ async fn test_tool_filter_toggle_reenable() {
             server_id: "srv".to_string(),
             tool_name: "b".to_string(),
             enabled: true,
+            tool_id: None,
         })
         .await;
     let _ = client.recv().await;
@@ -735,6 +741,7 @@ async fn test_tool_filter_toggle_reenable() {
     client
         .send(&IpcRequest::GetToolFilter {
             server_id: "srv".to_string(),
+            tool_id: None,
         })
         .await;
 
@@ -764,6 +771,7 @@ async fn test_tool_filter_toggle_single() {
         .send(&IpcRequest::SetToolFilterBulk {
             server_id: "github".to_string(),
             enabled_tools: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            tool_id: None,
         })
         .await;
     let _ = client.recv().await;
@@ -774,6 +782,7 @@ async fn test_tool_filter_toggle_single() {
             server_id: "github".to_string(),
             tool_name: "b".to_string(),
             enabled: false,
+            tool_id: None,
         })
         .await;
     let _ = client.recv().await;
@@ -782,6 +791,7 @@ async fn test_tool_filter_toggle_single() {
     client
         .send(&IpcRequest::GetToolFilter {
             server_id: "github".to_string(),
+            tool_id: None,
         })
         .await;
 

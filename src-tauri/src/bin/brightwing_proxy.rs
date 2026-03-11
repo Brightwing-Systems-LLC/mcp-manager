@@ -8,13 +8,46 @@
 
 use proxy_common::credentials::Credential;
 use proxy_common::ipc::{
-    ClientType, IpcRequest, IpcResponse,
+    ClientType, IpcRequest, IpcResponse, ProxyLogEvent, ProxyLogEventType,
 };
 use proxy_common::transport::DaemonClient;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+// ─── Logging helper ──────────────────────────────────────────────────────────
+
+fn make_log_event(
+    server_id: &str,
+    client_name: Option<&str>,
+    event_type: ProxyLogEventType,
+    method: Option<&str>,
+    status: Option<&str>,
+    error_message: Option<&str>,
+    detail: Option<&str>,
+) -> ProxyLogEvent {
+    ProxyLogEvent {
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        event_type,
+        server_id: server_id.to_string(),
+        client_name: client_name.map(|s| s.to_string()),
+        method: method.map(|s| s.to_string()),
+        status: status.map(|s| s.to_string()),
+        error_message: error_message.map(|s| s.to_string()),
+        detail: detail.map(|s| s.to_string()),
+    }
+}
+
+/// Fire-and-forget: send a log event to the daemon. Never blocks the proxy.
+async fn emit_log(daemon: &mut DaemonClient, event: ProxyLogEvent) {
+    let _ = daemon.send(&IpcRequest::SubmitLog { event }).await;
+    // Read the Ok response to keep the protocol in sync, but don't block long
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        daemon.recv(),
+    ).await;
+}
 
 // ─── CLI args ────────────────────────────────────────────────────────────────
 
@@ -95,14 +128,37 @@ async fn get_credentials(daemon: &mut DaemonClient, server_id: &str) -> Result<C
     }
 }
 
-async fn get_tool_filter(daemon: &mut DaemonClient, server_id: &str) -> Result<Vec<String>, String> {
+async fn get_tool_filter(daemon: &mut DaemonClient, server_id: &str, tool_id: Option<&str>) -> Result<Vec<String>, String> {
     daemon.send(&IpcRequest::GetToolFilter {
         server_id: server_id.to_string(),
+        tool_id: tool_id.map(|s| s.to_string()),
     }).await?;
 
     match daemon.recv().await? {
         IpcResponse::ToolFilter { enabled_tools, .. } => Ok(enabled_tools),
         other => Err(format!("Unexpected response: {:?}", other)),
+    }
+}
+
+/// Map MCP client names (from initialize handshake) to Brightwing tool IDs.
+fn client_name_to_tool_id(client_name: &str) -> Option<&'static str> {
+    let lower = client_name.to_lowercase();
+    if lower.contains("claude") && (lower.contains("code") || lower.contains("cli")) {
+        Some("claude_code")
+    } else if lower.contains("claude") && (lower.contains("desktop") || lower == "claude-ai" || lower == "claude") {
+        Some("claude_desktop")
+    } else if lower.contains("cursor") {
+        Some("cursor")
+    } else if lower.contains("codex") || lower.contains("openai") {
+        Some("codex")
+    } else if lower.contains("windsurf") {
+        Some("windsurf")
+    } else if lower.contains("gemini") {
+        Some("gemini_cli")
+    } else if lower.contains("vscode") || lower.contains("visual studio") || lower.contains("copilot") {
+        Some("vscode")
+    } else {
+        None
     }
 }
 
@@ -114,10 +170,17 @@ async fn send_upstream(
     upstream_url: &str,
     request: &serde_json::Value,
     auth_header: Option<&str>,
+    session_id: Option<&str>,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let mut req_builder = client.post(upstream_url).json(request);
+    let mut req_builder = client
+        .post(upstream_url)
+        .header("Accept", "application/json, text/event-stream")
+        .json(request);
     if let Some(auth) = auth_header {
         req_builder = req_builder.header("Authorization", auth);
+    }
+    if let Some(sid) = session_id {
+        req_builder = req_builder.header("Mcp-Session-Id", sid);
     }
     req_builder.send().await
 }
@@ -128,13 +191,19 @@ async fn run_http_proxy(
     args: &ProxyArgs,
     upstream_url: &str,
     mut auth_header: Option<String>,
-    tool_filter: Vec<String>,
+    mut tool_filter: Vec<String>,
     daemon: &mut DaemonClient,
 ) -> Result<(), String> {
     let client = reqwest::Client::new();
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut lines = BufReader::new(stdin).lines();
+    // Track MCP session ID from Streamable HTTP servers
+    let mut session_id: Option<String> = None;
+    // Track the MCP client name from the initialize handshake
+    let mut client_name: Option<String> = None;
+    // Whether we've refreshed the tool filter with per-app identity
+    let mut filter_refreshed = false;
 
     if args.verbose {
         eprintln!(
@@ -142,6 +211,12 @@ async fn run_http_proxy(
             args.server_id, upstream_url
         );
     }
+
+    // Log: connected
+    emit_log(daemon, make_log_event(
+        &args.server_id, None, ProxyLogEventType::Connect, None, None, None,
+        Some(&format!("Proxying to {}", upstream_url)),
+    )).await;
 
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
@@ -156,11 +231,40 @@ async fn run_http_proxy(
             }
         };
 
-        if args.verbose {
-            if let Some(method) = request.get("method").and_then(|m| m.as_str()) {
-                eprintln!("brightwing-proxy: → {}", method);
+        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("unknown").to_string();
+
+        // Capture client name from the MCP initialize handshake
+        if method == "initialize" {
+            if let Some(name) = request.pointer("/params/clientInfo/name").and_then(|v| v.as_str()) {
+                client_name = Some(name.to_string());
+                // Refresh tool filter with per-app identity
+                if !filter_refreshed {
+                    if let Some(tid) = client_name_to_tool_id(name) {
+                        if let Ok(new_filter) = get_tool_filter(daemon, &args.server_id, Some(tid)).await {
+                            tool_filter = new_filter;
+                            if args.verbose {
+                                eprintln!("brightwing-proxy: refreshed tool filter for app '{}'", tid);
+                            }
+                        }
+                    }
+                    filter_refreshed = true;
+                }
             }
         }
+
+        let cn = client_name.as_deref();
+
+        if args.verbose {
+            eprintln!("brightwing-proxy: → {}", method);
+        }
+
+        // Log: request
+        emit_log(daemon, make_log_event(
+            &args.server_id, cn, ProxyLogEventType::Request, Some(&method), None, None, None,
+        )).await;
+
+        // Notifications (no "id" field) — fire-and-forget to upstream, no response to stdout
+        let is_notification = request.get("id").is_none();
 
         // Forward to upstream
         let upstream_response = match send_upstream(
@@ -168,49 +272,70 @@ async fn run_http_proxy(
             upstream_url,
             &request,
             auth_header.as_deref(),
+            session_id.as_deref(),
         )
         .await
         {
             Ok(resp) => resp,
             Err(e) => {
-                let error_resp = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": request.get("id"),
-                    "error": {
-                        "code": -32000,
-                        "message": format!("Upstream server error: {}", e)
-                    }
-                });
-                let mut out = serde_json::to_vec(&error_resp).unwrap_or_default();
-                out.push(b'\n');
-                let _ = stdout.write_all(&out).await;
+                // Log: upstream error
+                emit_log(daemon, make_log_event(
+                    &args.server_id, cn, ProxyLogEventType::Error, Some(&method), None,
+                    Some(&format!("{}", e)), None,
+                )).await;
+                if !is_notification {
+                    let error_resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
+                        "error": {
+                            "code": -32000,
+                            "message": format!("Upstream server error: {}", e)
+                        }
+                    });
+                    let mut out = serde_json::to_vec(&error_resp).unwrap_or_default();
+                    out.push(b'\n');
+                    let _ = stdout.write_all(&out).await;
+                }
                 continue;
             }
         };
+
+        let http_status = upstream_response.status().as_u16().to_string();
 
         // On 401: re-fetch credentials from daemon and retry once
         let upstream_response = if upstream_response.status() == reqwest::StatusCode::UNAUTHORIZED {
             if args.verbose {
                 eprintln!("brightwing-proxy: got 401, re-fetching credentials from daemon");
             }
+            // Log: re-auth
+            emit_log(daemon, make_log_event(
+                &args.server_id, cn, ProxyLogEventType::Session, Some(&method), Some("401"), None,
+                Some("Re-fetching credentials"),
+            )).await;
             match get_credentials(daemon, &args.server_id).await {
                 Ok(new_cred) => {
                     let new_auth = auth_header_from_credential(&new_cred);
                     auth_header = new_auth.clone();
-                    match send_upstream(&client, upstream_url, &request, new_auth.as_deref()).await {
+                    match send_upstream(&client, upstream_url, &request, new_auth.as_deref(), session_id.as_deref()).await {
                         Ok(resp) => resp,
                         Err(e) => {
-                            let error_resp = serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": request.get("id"),
-                                "error": {
-                                    "code": -32000,
-                                    "message": format!("Upstream retry failed: {}", e)
-                                }
-                            });
-                            let mut out = serde_json::to_vec(&error_resp).unwrap_or_default();
-                            out.push(b'\n');
-                            let _ = stdout.write_all(&out).await;
+                            emit_log(daemon, make_log_event(
+                                &args.server_id, cn, ProxyLogEventType::Error, Some(&method), None,
+                                Some(&format!("Retry failed: {}", e)), None,
+                            )).await;
+                            if !is_notification {
+                                let error_resp = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": request.get("id"),
+                                    "error": {
+                                        "code": -32000,
+                                        "message": format!("Upstream retry failed: {}", e)
+                                    }
+                                });
+                                let mut out = serde_json::to_vec(&error_resp).unwrap_or_default();
+                                out.push(b'\n');
+                                let _ = stdout.write_all(&out).await;
+                            }
                             continue;
                         }
                     }
@@ -225,9 +350,44 @@ async fn run_http_proxy(
             upstream_response
         };
 
+        // Capture Mcp-Session-Id from response headers (set by Streamable HTTP servers)
+        if let Some(sid) = upstream_response.headers().get("mcp-session-id") {
+            if let Ok(sid_str) = sid.to_str() {
+                if session_id.is_none() {
+                    if args.verbose {
+                        eprintln!("brightwing-proxy: acquired session ID");
+                    }
+                    emit_log(daemon, make_log_event(
+                        &args.server_id, cn, ProxyLogEventType::Session, None, None, None,
+                        Some("Session established"),
+                    )).await;
+                }
+                session_id = Some(sid_str.to_string());
+            }
+        }
+
+        // For notifications, don't write a response to stdout
+        if is_notification {
+            // Consume the response body but don't forward
+            let _ = upstream_response.bytes().await;
+            if args.verbose {
+                eprintln!("brightwing-proxy: ← {} (notification, no response)", method);
+            }
+            // Log: response for notification
+            emit_log(daemon, make_log_event(
+                &args.server_id, cn, ProxyLogEventType::Response, Some(&method), Some(&http_status), None,
+                Some("notification"),
+            )).await;
+            continue;
+        }
+
         let mut response: serde_json::Value = match upstream_response.json().await {
             Ok(v) => v,
             Err(e) => {
+                emit_log(daemon, make_log_event(
+                    &args.server_id, cn, ProxyLogEventType::Error, Some(&method), Some(&http_status),
+                    Some(&format!("Failed to parse response: {}", e)), None,
+                )).await;
                 let error_resp = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": request.get("id"),
@@ -243,19 +403,34 @@ async fn run_http_proxy(
             }
         };
 
+        // Check if the response is a JSON-RPC error
+        let is_error = response.get("error").is_some();
+
         // Apply tool filter to tools/list responses
         if !tool_filter.is_empty() {
-            if let Some(method) = request.get("method").and_then(|m| m.as_str()) {
-                if method == "tools/list" {
-                    apply_tool_filter(&mut response, &tool_filter);
-                }
+            if method == "tools/list" {
+                apply_tool_filter(&mut response, &tool_filter);
             }
         }
 
         if args.verbose {
-            if let Some(method) = request.get("method").and_then(|m| m.as_str()) {
-                eprintln!("brightwing-proxy: ← {} response", method);
-            }
+            eprintln!("brightwing-proxy: ← {} response", method);
+        }
+
+        // Log: response
+        if is_error {
+            let err_msg = response.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            emit_log(daemon, make_log_event(
+                &args.server_id, cn, ProxyLogEventType::Error, Some(&method), Some(&http_status),
+                Some(err_msg), None,
+            )).await;
+        } else {
+            emit_log(daemon, make_log_event(
+                &args.server_id, cn, ProxyLogEventType::Response, Some(&method), Some(&http_status), None, None,
+            )).await;
         }
 
         let mut out = serde_json::to_vec(&response).unwrap_or_default();
@@ -264,6 +439,12 @@ async fn run_http_proxy(
             break; // AI tool closed stdin
         }
     }
+
+    // Log: disconnect
+    emit_log(daemon, make_log_event(
+        &args.server_id, client_name.as_deref(), ProxyLogEventType::Disconnect, None, None, None,
+        Some("Client disconnected"),
+    )).await;
 
     Ok(())
 }
@@ -311,6 +492,7 @@ async fn run_stdio_proxy(
     child_args: &[String],
     env: &HashMap<String, String>,
     tool_filter: Vec<String>,
+    daemon: &mut DaemonClient,
 ) -> Result<(), String> {
     use tokio::process::Command;
 
@@ -340,6 +522,8 @@ async fn run_stdio_proxy(
     let mut child_writer = child_stdin;
     let mut our_stdout = tokio::io::stdout();
 
+    let mut tool_filter = tool_filter;
+    let mut filter_refreshed = false;
     loop {
         tokio::select! {
             // Read from our stdin (AI tool) → write to child stdin
@@ -347,6 +531,28 @@ async fn run_stdio_proxy(
                 match line {
                     Ok(Some(line)) => {
                         if line.trim().is_empty() { continue; }
+
+                        // Capture client name from initialize request for per-app filtering
+                        if !filter_refreshed {
+                            if let Ok(req) = serde_json::from_str::<serde_json::Value>(&line) {
+                                if req.get("method").and_then(|m| m.as_str()) == Some("initialize") {
+                                    if let Some(name) = req.pointer("/params/clientInfo/name").and_then(|v| v.as_str()) {
+                                        if let Some(tid) = client_name_to_tool_id(name) {
+                                            if args.verbose {
+                                                eprintln!("brightwing-proxy: client {} → tool_id {}", name, tid);
+                                            }
+                                            if let Ok(new_filter) = get_tool_filter(daemon, &args.server_id, Some(tid)).await {
+                                                if !new_filter.is_empty() {
+                                                    tool_filter = new_filter;
+                                                }
+                                            }
+                                        }
+                                        filter_refreshed = true;
+                                    }
+                                }
+                            }
+                        }
+
                         if args.verbose {
                             if let Ok(req) = serde_json::from_str::<serde_json::Value>(&line) {
                                 if let Some(method) = req.get("method").and_then(|m| m.as_str()) {
@@ -385,8 +591,6 @@ async fn run_stdio_proxy(
 
                         // Apply tool filter to tools/list responses
                         if !tool_filter.is_empty() {
-                            // We need to match against the request method, but for stdio
-                            // we can detect tools/list responses by their shape
                             if response.get("result").and_then(|r| r.get("tools")).is_some() {
                                 apply_tool_filter(&mut response, &tool_filter);
                             }
@@ -482,8 +686,8 @@ async fn main() {
         }
     };
 
-    // Get tool filter
-    let tool_filter = get_tool_filter(&mut daemon, &args.server_id)
+    // Get tool filter (global default — will be refreshed per-app after initialize handshake)
+    let tool_filter = get_tool_filter(&mut daemon, &args.server_id, None)
         .await
         .unwrap_or_default();
 
@@ -518,6 +722,7 @@ async fn main() {
                     &child_args,
                     &api_key.env,
                     tool_filter,
+                    &mut daemon,
                 ).await;
                 if let Err(e) = result {
                     eprintln!("brightwing-proxy: {}", e);

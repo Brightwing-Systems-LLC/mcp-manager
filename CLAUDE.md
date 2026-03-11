@@ -37,9 +37,9 @@ To ship a new version:
    - `src/components/Navigation.tsx` → `APP_VERSION`
    - `src/components/About.tsx` → version string
 
-2. **Commit** the version bump with `[skip ci]` in the message to avoid a redundant CI run:
+2. **Commit** the version bump — do **NOT** use `[skip ci]` in the message, because GitHub applies it to all workflows triggered by that commit, including the tag-triggered build:
    ```bash
-   git commit -m "Bump to vX.Y.Z [skip ci]"
+   git commit -m "Bump to vX.Y.Z"
    ```
 
 3. **Tag and push**:

@@ -191,7 +191,7 @@ pub static TOOL_DEFINITIONS: &[ToolDefinition] = &[
     },
     ToolDefinition {
         id: "codex",
-        display_name: "OpenAI Codex",
+        display_name: "Codex CLI / Desktop",
         short_name: "CX",
         config_format: ConfigFormat::Toml,
         servers_key: "mcp_servers",
