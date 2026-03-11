@@ -40,8 +40,8 @@ The built-in search is powered by [MCP Scoreboard](https://patchworkmcp.com/scor
 │ Claude Code  │──stdio──┐                   ┌──────│  GitHub MCP  │
 ├──────────────┤         │                   │      ├──────────────┤
 │    Cursor    │──stdio──┤  ┌─────────────┐  │      │  Sentry MCP  │
-├──────────────┤         ├──│  Brightwing  │──┤      ├──────────────┤
-│  VS Code     │──stdio──┤  │    Proxy     │  ├─────│  Stripe MCP  │
+├──────────────┤         ├──│  Brightwing │──┤      ├──────────────┤
+│  VS Code     │──stdio──┤  │    Proxy    │  ├──────│  Stripe MCP  │
 ├──────────────┤         │  │             │  │      ├──────────────┤
 │  Gemini CLI  │──stdio──┤  │ • Auth      │  │      │ Custom Server│
 ├──────────────┤         │  │ • Filtering │  │      ├──────────────┤
