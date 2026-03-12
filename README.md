@@ -2,28 +2,69 @@
 
 **One app to install, authenticate, proxy, filter, and manage every MCP server across all your AI tools.**
 
-Stop hand-editing JSON configs. Stop copy-pasting OAuth tokens. Stop wondering why your AI assistant burned 12,000 tokens before it even started thinking about your prompt.
+MCP is powerful. Managing it is a nightmare. Every AI tool has its own config format, its own file location, its own quirks. OAuth tokens expire. API keys sit in plaintext JSON. Installing a new server means reading docs, editing configs by hand, and hoping you didn't break the JSON. And once it's running, every tool in every server gets dumped into your context window — whether you need it or not.
 
-MCP Manager is a desktop app that gives you a single control plane for all your MCP servers across Claude Desktop, Cursor, VS Code, Claude Code, Gemini CLI, Codex, and more.
+Brightwing MCP Manager fixes all of this. One desktop app. One control plane. Every AI tool you use.
 
-![MCP Manager Dashboard](docs/screenshot-dashboard.png)
+![MCP Manager Dashboard](docs/mcp-mgr-home.png)
 
-## Why MCP Manager?
+---
 
-### Auth Proxy
-Every MCP server you install is routed through the Brightwing proxy. OAuth tokens and API keys are injected automatically — your AI tools never see raw credentials, and nothing sensitive lives in config files.
+## The Dashboard — Your MCP Command Center
 
-### Encrypted API Key Vault
-API keys are stored in an encrypted [IOTA Stronghold](https://github.com/iotaledger/stronghold.rs) vault — not in plaintext JSON config files where any process on your machine can read them. The vault is encrypted with a machine-derived key and never leaves your device. Existing keys are migrated automatically on first launch.
+The dashboard gives you a single view of every MCP server and every AI tool on your machine. See which servers are connected to which tools at a glance. Toggle servers on or off per tool with a single click. No more editing five different config files when you add a new server.
 
-### Per-App Tool Filtering
-An MCP server with 89 tools dumps all of them into your AI assistant's context window, eating thousands of tokens before you've even asked a question. MCP Manager lets you control exactly which tools each app sees. Filter out what you don't need, per app, and reclaim that context space.
+Brightwing automatically detects your installed AI tools — Claude Desktop, Cursor, VS Code, Claude Code, Codex CLI, Gemini CLI, Windsurf, Antigravity — and keeps their configs in sync. Add a server once, enable it everywhere.
 
-### One-Click Install
-Search for servers, click Install, pick your tools — done. MCP Manager writes the correct config format for each tool (JSON, TOML, or CLI commands), handles the proxy setup, and manages auth. No more reading docs to figure out where Cursor keeps its config file.
+![Dashboard](docs/mcp-mgr-home.png)
 
-### CLI Access (`bw`)
-Call any MCP tool directly from your terminal — no AI assistant required. Pipe results to `jq`, chain with `grep`, use in shell scripts. Auth is handled through the same proxy, so it just works.
+---
+
+## Search & One-Click Install
+
+Find and install MCP servers in seconds. The built-in search is powered by [MCP Scoreboard](https://mcpscoreboard.com), which grades public servers across six dimensions — schema quality, protocol conformance, reliability, documentation, security, and agent usability. See quality scores *before* you install, so you know exactly what you're integrating.
+
+Click **Install**, pick your tools, and you're done. MCP Manager writes the correct config format for each tool (JSON, TOML, or CLI commands), sets up the proxy, and handles auth. No docs to read. No files to find. No JSON to hand-edit.
+
+![Search MCP Servers](docs/mcp-mgr-search.png)
+
+---
+
+## Auth Proxy — Credentials That Never Touch Config Files
+
+Every MCP server you install is routed through the Brightwing proxy. OAuth tokens and API keys are injected at request time — your AI tools never see raw credentials, and nothing sensitive lives in a config file.
+
+The proxy runs as a lightweight local daemon with start-on-login support. From the Proxy page you can see every connected server, its auth type (OAuth, API Key, or None), and the daemon's status at a glance. Stop, refresh, and monitor — all from one place.
+
+![Proxy Servers](docs/mcp-mgr-proxy.png)
+
+---
+
+## Encrypted API Key Vault
+
+API keys are stored in an encrypted [IOTA Stronghold](https://github.com/iotaledger/stronghold.rs) vault — not in plaintext JSON configs where any process on your machine can read them. The vault is encrypted with a machine-derived key and never leaves your device.
+
+Add, reveal, edit, or remove keys per server. Existing plaintext keys are migrated into the vault automatically on first launch.
+
+![API Keys](docs/mcp-mgr-api-keys.png)
+
+---
+
+## Per-App Tool Filtering
+
+An MCP server with 89 tools dumps every single one into your AI assistant's context window, eating thousands of tokens before you've even asked a question. That's real money and real latency — on every request.
+
+MCP Manager shows you exactly how many tokens each tool's schema costs and lets you control which tools each app sees. The token budget bar updates live as you toggle tools on and off. Keep the full toolset enabled for Claude Code where you need it, but filter down to just the five tools Cursor actually uses. Configure different filter sets per app using the tabs across the top. Reclaim your context window. Cut your token costs.
+
+![Tool Filtering](docs/mcp-mgr-tool-filter.png)
+
+---
+
+## The `bw` CLI — MCP Without the AI
+
+Call any MCP tool directly from your terminal. No AI assistant required. Search, create, query, automate — pipe results to `jq`, chain with `grep`, use in shell scripts. Auth is handled through the same proxy, so it just works.
+
+The CLI page walks you through installation and keeps it updated. Zero configuration required.
 
 ```bash
 $ bw list                                    # See all connected servers
@@ -31,8 +72,7 @@ $ bw "AI Cost Manager" get_costs --days 30   # Call a tool directly
 $ bw "AI Cost Manager" get_costs --json | jq '.content[0].text'  # Pipe to jq
 ```
 
-### Quality Scores via MCP Scoreboard
-The built-in search is powered by [MCP Scoreboard](https://patchworkmcp.com/scoreboard/), which scores public MCP servers across six dimensions — schema quality, protocol conformance, reliability, documentation, security, and agent usability. See grades before you install, so you know what you're integrating.
+![Brightwing CLI](docs/mcp-mgr-cli.png)
 
 ---
 
@@ -62,6 +102,8 @@ All AI tools connect to MCP servers through a local stdio proxy. The proxy handl
 - **Encrypted vault** — API keys stored in Stronghold encrypted storage, never in plaintext
 - **Tool filtering** — Per-app control over which tools are exposed (and how many tokens they cost)
 - **Request logging** — See what's happening between your AI tools and MCP servers
+
+---
 
 ## Supported Tools
 
