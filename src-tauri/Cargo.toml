@@ -3,7 +3,7 @@ members = [".", "crates/proxy-common"]
 
 [package]
 name = "brightwing-mcp-manager"
-version = "0.3.11"
+version = "0.3.12"
 description = "Brightwing MCP Manager - Universal MCP server installer"
 authors = ["Brightwing Systems"]
 edition = "2021"
@@ -59,3 +59,6 @@ futures = "0.3"
 hostname = "0.4"
 whoami = "1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+
+[dev-dependencies]
+tempfile = "3"

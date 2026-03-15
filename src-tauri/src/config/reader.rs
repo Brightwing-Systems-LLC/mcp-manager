@@ -435,12 +435,25 @@ pub fn read_installed_servers(tool_id: &str) -> Result<HashMap<String, JsonValue
     }
 }
 
+/// Traverse a JSON value using a dotted key path (e.g., "amp.mcpServers").
+fn json_get_nested<'a>(value: &'a JsonValue, key: &str) -> Option<&'a JsonValue> {
+    if key.contains('.') {
+        let mut current = value;
+        for part in key.split('.') {
+            current = current.get(part)?;
+        }
+        Some(current)
+    } else {
+        value.get(key)
+    }
+}
+
 fn read_json_servers(path: &Path, servers_key: &str) -> Result<HashMap<String, JsonValue>, String> {
     let content = fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
     let parsed: JsonValue =
         serde_json::from_str(&content).map_err(|e| format!("Invalid JSON in {}: {}", path.display(), e))?;
 
-    let servers = match parsed.get(servers_key) {
+    let servers = match json_get_nested(&parsed, servers_key) {
         Some(JsonValue::Object(obj)) => obj
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -473,4 +486,276 @@ fn read_toml_servers(path: &Path, servers_key: &str) -> Result<HashMap<String, J
     };
 
     Ok(servers)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// Expose read_json_servers for cross-module tests
+    pub fn read_json_servers_pub(path: &std::path::Path, key: &str) -> HashMap<String, JsonValue> {
+        read_json_servers(path, key).unwrap()
+    }
+
+    // ── read_json_servers ──
+
+    #[test]
+    fn test_read_json_servers_standard_mcpservers() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, r#"{{
+            "mcpServers": {{
+                "my-server": {{ "command": "npx", "args": ["-y", "pkg"] }},
+                "other": {{ "url": "https://example.com" }}
+            }}
+        }}"#).unwrap();
+
+        let servers = read_json_servers(f.path(), "mcpServers").unwrap();
+        assert_eq!(servers.len(), 2);
+        assert!(servers.contains_key("my-server"));
+        assert!(servers.contains_key("other"));
+        assert_eq!(servers["my-server"]["command"], "npx");
+        assert_eq!(servers["other"]["url"], "https://example.com");
+    }
+
+    #[test]
+    fn test_read_json_servers_opencode_mcp_key() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, r#"{{
+            "$schema": "https://opencode.ai/config.json",
+            "mcp": {{
+                "my-server": {{
+                    "type": "local",
+                    "command": ["npx", "-y", "pkg"],
+                    "environment": {{ "KEY": "value" }}
+                }}
+            }}
+        }}"#).unwrap();
+
+        let servers = read_json_servers(f.path(), "mcp").unwrap();
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("my-server"));
+        assert_eq!(servers["my-server"]["type"], "local");
+        // OpenCode uses command as array
+        assert!(servers["my-server"]["command"].is_array());
+    }
+
+    #[test]
+    fn test_read_json_servers_empty_config() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, r#"{{}}"#).unwrap();
+
+        let servers = read_json_servers(f.path(), "mcpServers").unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn test_read_json_servers_no_servers_key() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, r#"{{ "other_key": true }}"#).unwrap();
+
+        let servers = read_json_servers(f.path(), "mcpServers").unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn test_read_json_servers_invalid_json() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "not valid json").unwrap();
+
+        let result = read_json_servers(f.path(), "mcpServers");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn test_read_json_servers_vscode_servers_key() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, r#"{{
+            "editor.fontSize": 14,
+            "servers": {{
+                "my-mcp": {{ "type": "stdio", "command": "node", "args": ["server.js"] }}
+            }}
+        }}"#).unwrap();
+
+        let servers = read_json_servers(f.path(), "servers").unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers["my-mcp"]["type"], "stdio");
+    }
+
+    #[test]
+    fn test_read_json_servers_pi_mcpservers() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, r#"{{
+            "mcpServers": {{
+                "pi-server": {{
+                    "command": "npx",
+                    "args": ["-y", "some-pkg"],
+                    "lifecycle": "lazy"
+                }}
+            }},
+            "settings": {{ "toolPrefix": "server" }}
+        }}"#).unwrap();
+
+        let servers = read_json_servers(f.path(), "mcpServers").unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers["pi-server"]["command"], "npx");
+    }
+
+    // ── read_toml_servers ──
+
+    #[test]
+    fn test_read_toml_servers_codex_format() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, r#"
+[mcp_servers.my-server]
+command = "npx"
+args = ["-y", "pkg"]
+
+[mcp_servers.my-server.env]
+KEY = "value"
+"#).unwrap();
+
+        let servers = read_toml_servers(f.path(), "mcp_servers").unwrap();
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("my-server"));
+        assert_eq!(servers["my-server"]["command"], "npx");
+        assert_eq!(servers["my-server"]["env"]["KEY"], "value");
+    }
+
+    #[test]
+    fn test_read_toml_servers_empty() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "").unwrap();
+
+        let servers = read_toml_servers(f.path(), "mcp_servers").unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn test_read_toml_servers_multiple() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, r#"
+[mcp_servers.server-a]
+command = "node"
+args = ["a.js"]
+
+[mcp_servers.server-b]
+url = "https://example.com"
+"#).unwrap();
+
+        let servers = read_toml_servers(f.path(), "mcp_servers").unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers["server-a"]["command"], "node");
+        assert_eq!(servers["server-b"]["url"], "https://example.com");
+    }
+
+    #[test]
+    fn test_read_toml_servers_invalid_toml() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "[invalid toml =").unwrap();
+
+        let result = read_toml_servers(f.path(), "mcp_servers");
+        assert!(result.is_err());
+    }
+
+    // ── parse_cli_get_output ──
+
+    #[test]
+    fn test_parse_cli_get_output_http() {
+        let output = r#"
+my-server:
+    Scope: User config (~/.claude.json)
+    Type: http
+    URL: https://example.com/mcp
+"#;
+        let result = parse_cli_get_output(output).unwrap();
+        let parsed: JsonValue = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["url"], "https://example.com/mcp");
+        assert!(parsed.get("command").is_none());
+    }
+
+    #[test]
+    fn test_parse_cli_get_output_stdio() {
+        let output = r#"
+my-server:
+    Type: stdio
+    Command: npx
+    Args: -y @org/pkg
+    Env: API_KEY=secret, OTHER=val
+"#;
+        let result = parse_cli_get_output(output).unwrap();
+        let parsed: JsonValue = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["command"], "npx");
+        assert_eq!(parsed["args"][0], "-y");
+        assert_eq!(parsed["args"][1], "@org/pkg");
+        assert_eq!(parsed["env"]["API_KEY"], "secret");
+        assert_eq!(parsed["env"]["OTHER"], "val");
+    }
+
+    #[test]
+    fn test_parse_cli_get_output_http_with_headers() {
+        let output = r#"
+my-server:
+    Type: sse
+    URL: https://example.com/sse
+    Header: Authorization: Bearer token123
+    Header: X-Custom: value
+"#;
+        let result = parse_cli_get_output(output).unwrap();
+        let parsed: JsonValue = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["url"], "https://example.com/sse");
+        assert_eq!(parsed["headers"]["Authorization"], "Bearer token123");
+        assert_eq!(parsed["headers"]["X-Custom"], "value");
+    }
+
+    #[test]
+    fn test_parse_cli_get_output_empty() {
+        let result = parse_cli_get_output("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Could not parse"));
+    }
+
+    #[test]
+    fn test_parse_cli_get_output_no_type_defaults_stdio() {
+        let output = "    Command: node\n    Args: server.js";
+        let result = parse_cli_get_output(output).unwrap();
+        let parsed: JsonValue = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["command"], "node");
+    }
+
+    // ── extract_url_from_list_line ──
+
+    #[test]
+    fn test_extract_url_https() {
+        assert_eq!(
+            extract_url_from_list_line("https://example.com/mcp (HTTP) - connected"),
+            Some("https://example.com/mcp".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_url_http() {
+        assert_eq!(
+            extract_url_from_list_line("http://localhost:3000 - running"),
+            Some("http://localhost:3000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_url_no_url() {
+        assert_eq!(
+            extract_url_from_list_line("local (stdio) - running"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_url_bare() {
+        assert_eq!(
+            extract_url_from_list_line("https://example.com"),
+            Some("https://example.com".to_string())
+        );
+    }
 }

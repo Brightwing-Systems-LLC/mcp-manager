@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "brightwing-mcp-manager"
-version = "0.3.10"
+version = "0.3.12"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -436,6 +436,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "toml_edit 0.22.27",

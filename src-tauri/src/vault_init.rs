@@ -128,20 +128,30 @@ fn store_vault_key(key: &[u8], vault_path: &Path) -> Result<(), String> {
 
 /// Resolve the vault encryption key. Handles three scenarios:
 ///
-/// 1. Key already in keychain or fallback file → use it
+/// 1. Key already in fallback file or keychain → use it
 /// 2. Vault file exists but no key stored → legacy upgrade, re-encrypt with new key
 /// 3. No vault file, no key → fresh install, generate new key
+///
+/// The file-based fallback is checked FIRST because keychain access on macOS
+/// triggers a system authentication prompt for unsigned/local builds. Once a key
+/// is stored in the fallback file, the keychain is never consulted again.
 fn get_or_create_vault_key(vault_path: &Path) -> Result<Vec<u8>, String> {
-    // 1. Try keychain
-    match try_get_keychain_key() {
-        Ok(Some(key)) => return Ok(key),
-        Ok(None) => {}
-        Err(e) => eprintln!("vault: keychain unavailable ({}), trying file fallback", e),
-    }
-
-    // 2. Try file-based fallback
+    // 1. Try file-based fallback first (no system prompt)
     if let Some(key) = try_get_fallback_key(vault_path) {
         return Ok(key);
+    }
+
+    // 2. Try keychain (may prompt on macOS for unsigned builds)
+    match try_get_keychain_key() {
+        Ok(Some(key)) => {
+            // Persist to file so we never need keychain again
+            if let Err(e) = store_fallback_key(&key, vault_path) {
+                eprintln!("vault: failed to cache keychain key to file: {}", e);
+            }
+            return Ok(key);
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("vault: keychain unavailable ({})", e),
     }
 
     // 3. If vault file exists, this is a legacy upgrade — re-encrypt
@@ -162,9 +172,15 @@ fn get_or_create_vault_key(vault_path: &Path) -> Result<Vec<u8>, String> {
         return Ok(new_key);
     }
 
-    // 4. Fresh install — generate random key
+    // 4. Fresh install — generate random key, store to file first
     let new_key = generate_random_key();
-    store_vault_key(&new_key, vault_path)?;
+    // Store to file-based fallback first (no prompt), then try keychain
+    store_fallback_key(&new_key, vault_path)?;
+    // Best-effort store to keychain (don't fail if it prompts/errors)
+    match try_store_keychain_key(&new_key) {
+        Ok(()) => eprintln!("vault: encryption key stored in OS keychain and file"),
+        Err(e) => eprintln!("vault: key stored in file only (keychain: {})", e),
+    }
     Ok(new_key)
 }
 
