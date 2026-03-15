@@ -14,7 +14,7 @@ Brightwing MCP Manager fixes all of this. One desktop app. One control plane. Ev
 
 The dashboard gives you a single view of every MCP server and every AI tool on your machine. See which servers are connected to which tools at a glance. Toggle servers on or off per tool with a single click. No more editing five different config files when you add a new server.
 
-Brightwing automatically detects your installed AI tools — Claude Desktop, Cursor, VS Code, Claude Code, Codex CLI, Gemini CLI, Windsurf, Antigravity — and keeps their configs in sync. Add a server once, enable it everywhere.
+Brightwing automatically detects your installed AI tools — 20 and counting, from Claude Desktop and Cursor to Zed, Amp, and LM Studio — and keeps their configs in sync. Add a server once, enable it everywhere.
 
 ![Dashboard](docs/mcp-mgr-home.png)
 
@@ -180,18 +180,34 @@ All AI tools connect to MCP servers through a local stdio proxy. The proxy handl
 
 ---
 
-## Supported Tools
+## Supported AI Tools
+
+Brightwing auto-detects these MCP-compatible tools on your machine and can install, configure, and proxy MCP servers for all of them:
 
 | Tool | Config Format | Status |
 |------|--------------|--------|
 | Claude Desktop | JSON | Full support |
-| Claude Code | JSON | Full support |
+| Claude Code | CLI | Full support |
 | Cursor | JSON | Full support |
 | VS Code (Copilot) | JSON | Full support |
-| OpenAI Codex | TOML | Full support |
+| Copilot (JetBrains) | JSON | Full support |
+| GitHub Copilot CLI | JSON | Full support |
+| OpenAI Codex CLI / Desktop | TOML | Full support |
 | Gemini CLI | JSON | Full support |
+| Amazon Q | JSON | Full support |
+| Kiro | JSON | Full support |
 | Windsurf | JSON | Full support |
 | Antigravity | JSON | Full support |
+| Amp | JSON | Full support |
+| Zed | JSON | Full support |
+| Cline | JSON | Full support |
+| Roo Code | JSON | Full support |
+| OpenCode | JSON | Full support |
+| Pi | JSON | Full support |
+| LM Studio | JSON | Full support |
+| Junie CLI | JSON | Full support |
+
+Using an MCP-compatible tool that's not on this list? [Open an issue](https://github.com/Brightwing-Systems-LLC/mcp-manager/issues) and we'll add support for it.
 
 ## Platform Support
 
