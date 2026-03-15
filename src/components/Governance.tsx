@@ -287,8 +287,15 @@ export default function Governance() {
         <div>
           <h1 className="text-2xl font-bold text-brightwing-gray-100">Registry Governance</h1>
           <p className="text-sm text-brightwing-gray-400 mt-1">
-            Control which MCP servers are approved for installation
+            {governanceStatus?.policy_org
+              ? `${governanceStatus.policy_org} — Managed server allowlist`
+              : "Control which MCP servers are approved for installation"}
           </p>
+          {governanceStatus?.policy_enforced && (
+            <p className="text-xs text-amber-400 mt-1">
+              Enforced by external policy — cannot be disabled from this app
+            </p>
+          )}
         </div>
         {governanceStatus && (
           <div className="flex items-center gap-3">
@@ -300,7 +307,7 @@ export default function Governance() {
               <span className={`w-2 h-2 rounded-full ${governanceStatus.enabled ? "bg-green-400" : "bg-yellow-400"}`} />
               {governanceStatus.enabled ? "Enforcing" : "Disabled"}
             </span>
-            {isAdmin && (
+            {isAdmin && !governanceStatus.policy_enforced && (
               <button
                 onClick={() => handleToggleGovernance(!governanceStatus.enabled)}
                 className="text-xs text-brightwing-gray-400 hover:text-brightwing-gray-200 underline"

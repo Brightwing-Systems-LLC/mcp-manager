@@ -210,6 +210,8 @@ export interface GovernanceStatus {
   has_admin_pin: boolean;
   allowlist_count: number;
   pending_requests: number;
+  policy_enforced: boolean;
+  policy_org: string | null;
 }
 
 export interface GovernanceAllowlistEntry {

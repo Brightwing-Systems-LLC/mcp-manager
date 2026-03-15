@@ -66,9 +66,9 @@ fn install_server(
     db: tauri::State<'_, Database>,
 ) -> Result<InstallResult, String> {
     // Governance enforcement: block install if server is not on the allowlist
-    if db.is_governance_enabled().unwrap_or(false) {
-        let allowed = db.is_server_allowed(&server_config.server_name).unwrap_or(false)
-            || db.is_server_allowed(&server_config.config_key).unwrap_or(false);
+    if is_governance_effectively_enabled(&db) {
+        let allowed = is_server_allowed_combined(&db, &server_config.server_name).unwrap_or(false)
+            || is_server_allowed_combined(&db, &server_config.config_key).unwrap_or(false);
         if !allowed {
             db.add_audit_log(
                 "install_blocked",
@@ -1595,17 +1595,111 @@ async fn api_get_server(server_id: String) -> Result<JsonValue, String> {
 
 // --- Governance Commands ---
 
+/// External governance policy file paths (checked in order).
+/// Admins deploy this file via MDM/GPO to enforce governance even after reinstall.
+fn governance_policy_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        paths.push(std::path::PathBuf::from("/Library/Application Support/com.brightwing.mcp-manager/governance-policy.json"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        paths.push(std::path::PathBuf::from("/etc/brightwing/governance-policy.json"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        paths.push(std::path::PathBuf::from("C:\\ProgramData\\Brightwing\\governance-policy.json"));
+    }
+    // Also check user-level data dir (for non-admin setups)
+    if let Some(data_dir) = dirs::data_dir() {
+        paths.push(data_dir.join("com.brightwing.mcp-manager").join("governance-policy.json"));
+    }
+    paths
+}
+
+/// Read external governance policy file if it exists.
+/// Returns (enforced: bool, allowlist: Vec<AllowlistEntry>) from the policy file.
+fn read_external_governance_policy() -> Option<ExternalGovernancePolicy> {
+    for path in governance_policy_paths() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(policy) = serde_json::from_str::<ExternalGovernancePolicy>(&content) {
+                return Some(policy);
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExternalGovernancePolicy {
+    /// If true, governance cannot be disabled from the UI
+    #[serde(default)]
+    enforced: bool,
+    /// Servers in this list are always allowed (merged with DB allowlist)
+    #[serde(default)]
+    allowed_servers: Vec<ExternalAllowlistEntry>,
+    /// If true, ONLY servers in this policy file are allowed (DB allowlist is ignored)
+    #[serde(default)]
+    exclusive: bool,
+    /// Organization name shown in the UI
+    #[serde(default)]
+    org_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExternalAllowlistEntry {
+    identifier: String,
+    display_name: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Check if a server is allowed considering both DB allowlist and external policy.
+fn is_server_allowed_combined(db: &Database, server_identifier: &str) -> Result<bool, String> {
+    // Check external policy first
+    if let Some(policy) = read_external_governance_policy() {
+        if policy.exclusive {
+            // Only external policy allowlist matters
+            return Ok(policy.allowed_servers.iter().any(|s| s.identifier == server_identifier));
+        }
+        // Non-exclusive: check external list first
+        if policy.allowed_servers.iter().any(|s| s.identifier == server_identifier) {
+            return Ok(true);
+        }
+    }
+    // Fall back to DB allowlist
+    db.is_server_allowed(server_identifier)
+}
+
+/// Check if governance is effectively enabled (DB setting OR external policy enforcement).
+fn is_governance_effectively_enabled(db: &Database) -> bool {
+    if let Some(policy) = read_external_governance_policy() {
+        if policy.enforced {
+            return true;
+        }
+    }
+    db.is_governance_enabled().unwrap_or(false)
+}
+
 #[tauri::command]
 fn get_governance_status(db: tauri::State<'_, Database>) -> Result<GovernanceStatus, String> {
-    let enabled = db.is_governance_enabled()?;
+    let db_enabled = db.is_governance_enabled()?;
     let has_pin = db.get_governance_config("admin_pin_hash")?.is_some();
     let allowlist_count = db.get_allowlist()?.len() as u32;
     let pending_requests = db.get_approval_requests(Some("pending"))?.len() as u32;
+    let external_policy = read_external_governance_policy();
+    let policy_enforced = external_policy.as_ref().map_or(false, |p| p.enforced);
+    let policy_org = external_policy.as_ref().and_then(|p| p.org_name.clone());
+    let policy_server_count = external_policy.as_ref().map_or(0, |p| p.allowed_servers.len() as u32);
+
     Ok(GovernanceStatus {
-        enabled,
+        enabled: db_enabled || policy_enforced,
         has_admin_pin: has_pin,
-        allowlist_count,
+        allowlist_count: allowlist_count + policy_server_count,
         pending_requests,
+        policy_enforced,
+        policy_org,
     })
 }
 
@@ -1615,6 +1709,8 @@ struct GovernanceStatus {
     has_admin_pin: bool,
     allowlist_count: u32,
     pending_requests: u32,
+    policy_enforced: bool,
+    policy_org: Option<String>,
 }
 
 #[tauri::command]
@@ -1649,6 +1745,14 @@ fn set_governance_enabled(
 ) -> Result<(), String> {
     if !db.verify_admin_pin(&admin_pin)? {
         return Err("Invalid admin PIN".to_string());
+    }
+    // Cannot disable governance if an external policy enforces it
+    if !enabled {
+        if let Some(policy) = read_external_governance_policy() {
+            if policy.enforced {
+                return Err("Governance is enforced by an external policy file and cannot be disabled from the app.".to_string());
+            }
+        }
     }
     db.set_governance_config("enabled", if enabled { "true" } else { "false" })?;
     let action = if enabled { "governance_enabled" } else { "governance_disabled" };
@@ -1717,11 +1821,11 @@ fn governance_is_server_allowed(
     server_identifier: String,
     db: tauri::State<'_, Database>,
 ) -> Result<bool, String> {
-    // If governance is not enabled, everything is allowed
-    if !db.is_governance_enabled()? {
+    // If governance is not enabled (neither DB nor policy), everything is allowed
+    if !is_governance_effectively_enabled(&db) {
         return Ok(true);
     }
-    db.is_server_allowed(&server_identifier)
+    is_server_allowed_combined(&db, &server_identifier)
 }
 
 #[tauri::command]
