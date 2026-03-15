@@ -12,6 +12,10 @@ import type {
   ProxyServer,
   ToolFilterEntry,
   DaemonStatusInfo,
+  GovernanceStatus,
+  GovernanceAllowlistEntry,
+  GovernanceRequest,
+  GovernanceAuditEntry,
 } from "./lib/types";
 import * as tauri from "./lib/tauri";
 
@@ -111,6 +115,17 @@ interface AppState {
   updateProgress: number;
   checkForUpdate: () => Promise<void>;
   installUpdate: () => Promise<void>;
+
+  // Governance
+  governanceStatus: GovernanceStatus | null;
+  governanceAllowlist: GovernanceAllowlistEntry[];
+  governanceRequests: GovernanceRequest[];
+  governanceAuditLog: GovernanceAuditEntry[];
+  governanceLoading: boolean;
+  refreshGovernanceStatus: () => Promise<void>;
+  refreshGovernanceAllowlist: () => Promise<void>;
+  refreshGovernanceRequests: (statusFilter?: string) => Promise<void>;
+  refreshGovernanceAuditLog: () => Promise<void>;
 
   // Notifications
   toast: { message: string; type: "success" | "error" } | null;
@@ -490,6 +505,47 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       get().showToast(`Update failed: ${e}`, "error");
       set({ updateDownloading: false });
+    }
+  },
+
+  // Governance
+  governanceStatus: null,
+  governanceAllowlist: [],
+  governanceRequests: [],
+  governanceAuditLog: [],
+  governanceLoading: false,
+  refreshGovernanceStatus: async () => {
+    try {
+      const status = await tauri.getGovernanceStatus();
+      set({ governanceStatus: status });
+    } catch (e) {
+      console.error("Failed to get governance status:", e);
+    }
+  },
+  refreshGovernanceAllowlist: async () => {
+    set({ governanceLoading: true });
+    try {
+      const allowlist = await tauri.governanceGetAllowlist();
+      set({ governanceAllowlist: allowlist, governanceLoading: false });
+    } catch (e) {
+      console.error("Failed to get governance allowlist:", e);
+      set({ governanceLoading: false });
+    }
+  },
+  refreshGovernanceRequests: async (statusFilter?: string) => {
+    try {
+      const requests = await tauri.governanceGetRequests(statusFilter);
+      set({ governanceRequests: requests });
+    } catch (e) {
+      console.error("Failed to get governance requests:", e);
+    }
+  },
+  refreshGovernanceAuditLog: async () => {
+    try {
+      const log = await tauri.governanceGetAuditLog(200);
+      set({ governanceAuditLog: log });
+    } catch (e) {
+      console.error("Failed to get governance audit log:", e);
     }
   },
 

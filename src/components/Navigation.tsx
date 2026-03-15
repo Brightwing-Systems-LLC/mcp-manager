@@ -11,6 +11,7 @@ const navItems: { id: View; label: string; icon: string }[] = [
   { id: "add-server", label: "Add Server", icon: "plus" },
   { id: "proxy", label: "Proxy", icon: "shield" },
   { id: "api-keys", label: "API Keys", icon: "key" },
+  { id: "governance", label: "Governance", icon: "lock" },
   { id: "cli", label: "CLI", icon: "terminal" },
   { id: "about", label: "About", icon: "info" },
 ];
@@ -44,6 +45,11 @@ const icons: Record<string, JSX.Element> = {
   key: (
     <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 5.25a3 3 0 0 1 3 3m3 0a6 6 0 0 1-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1 1 21.75 8.25Z" />
+    </svg>
+  ),
+  lock: (
+    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
     </svg>
   ),
   terminal: (

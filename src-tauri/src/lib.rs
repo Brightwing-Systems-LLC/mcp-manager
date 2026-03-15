@@ -8,7 +8,7 @@ pub mod vault_init;
 
 use config::reader::ConfiguredServer;
 use config::writer::{InstallResult, ServerInstallConfig};
-use db::queries::{DisabledServer, Favorite, Installation, ProxyServer, ProxyApiKey, ToolFilterEntry, CachedTool};
+use db::queries::{DisabledServer, Favorite, Installation, ProxyServer, ProxyApiKey, ToolFilterEntry, CachedTool, GovernanceAllowlistEntry, GovernanceRequest, GovernanceAuditEntry};
 use db::Database;
 use deeplink::{DeepLinkAction, DeepLinkState};
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,28 @@ fn install_server(
     server_config: ServerInstallConfig,
     db: tauri::State<'_, Database>,
 ) -> Result<InstallResult, String> {
+    // Governance enforcement: block install if server is not on the allowlist
+    if db.is_governance_enabled().unwrap_or(false) {
+        let allowed = db.is_server_allowed(&server_config.server_name).unwrap_or(false)
+            || db.is_server_allowed(&server_config.config_key).unwrap_or(false);
+        if !allowed {
+            db.add_audit_log(
+                "install_blocked",
+                "user",
+                Some(&server_config.server_name),
+                Some(&format!("Blocked install to {} — server not on allowlist", tool_id)),
+            ).ok();
+            return Ok(InstallResult {
+                success: false,
+                message: format!(
+                    "Governance policy: '{}' is not on the approved server list. Request approval from your administrator.",
+                    server_config.server_name
+                ),
+                needs_restart: false,
+            });
+        }
+    }
+
     // Backup first
     let _ = config::backup::backup_config(&tool_id);
 
@@ -1571,6 +1593,213 @@ async fn api_get_server(server_id: String) -> Result<JsonValue, String> {
     Ok(json)
 }
 
+// --- Governance Commands ---
+
+#[tauri::command]
+fn get_governance_status(db: tauri::State<'_, Database>) -> Result<GovernanceStatus, String> {
+    let enabled = db.is_governance_enabled()?;
+    let has_pin = db.get_governance_config("admin_pin_hash")?.is_some();
+    let allowlist_count = db.get_allowlist()?.len() as u32;
+    let pending_requests = db.get_approval_requests(Some("pending"))?.len() as u32;
+    Ok(GovernanceStatus {
+        enabled,
+        has_admin_pin: has_pin,
+        allowlist_count,
+        pending_requests,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GovernanceStatus {
+    enabled: bool,
+    has_admin_pin: bool,
+    allowlist_count: u32,
+    pending_requests: u32,
+}
+
+#[tauri::command]
+fn setup_governance(
+    admin_pin: String,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    if admin_pin.len() < 4 {
+        return Err("Admin PIN must be at least 4 characters".to_string());
+    }
+    // Hash the PIN before storage
+    let hash = db::queries::sha256_hex(&admin_pin);
+    db.set_governance_config("admin_pin_hash", &hash)?;
+    db.set_governance_config("enabled", "true")?;
+    db.add_audit_log("governance_enabled", "admin", None, Some("Governance mode activated"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn verify_admin_pin(
+    pin: String,
+    db: tauri::State<'_, Database>,
+) -> Result<bool, String> {
+    db.verify_admin_pin(&pin)
+}
+
+#[tauri::command]
+fn set_governance_enabled(
+    enabled: bool,
+    admin_pin: String,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    if !db.verify_admin_pin(&admin_pin)? {
+        return Err("Invalid admin PIN".to_string());
+    }
+    db.set_governance_config("enabled", if enabled { "true" } else { "false" })?;
+    let action = if enabled { "governance_enabled" } else { "governance_disabled" };
+    db.add_audit_log(action, "admin", None, None)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn governance_add_to_allowlist(
+    admin_pin: String,
+    server_identifier: String,
+    display_name: String,
+    description: Option<String>,
+    review_notes: Option<String>,
+    max_version: Option<String>,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    if !db.verify_admin_pin(&admin_pin)? {
+        return Err("Invalid admin PIN".to_string());
+    }
+    db.add_to_allowlist(
+        &server_identifier,
+        &display_name,
+        description.as_deref(),
+        "admin",
+        review_notes.as_deref(),
+        max_version.as_deref(),
+    )?;
+    db.add_audit_log(
+        "allowlist_add",
+        "admin",
+        Some(&server_identifier),
+        Some(&format!("Approved: {}", display_name)),
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+fn governance_remove_from_allowlist(
+    admin_pin: String,
+    server_identifier: String,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    if !db.verify_admin_pin(&admin_pin)? {
+        return Err("Invalid admin PIN".to_string());
+    }
+    db.remove_from_allowlist(&server_identifier)?;
+    db.add_audit_log(
+        "allowlist_remove",
+        "admin",
+        Some(&server_identifier),
+        None,
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+fn governance_get_allowlist(
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<GovernanceAllowlistEntry>, String> {
+    db.get_allowlist()
+}
+
+#[tauri::command]
+fn governance_is_server_allowed(
+    server_identifier: String,
+    db: tauri::State<'_, Database>,
+) -> Result<bool, String> {
+    // If governance is not enabled, everything is allowed
+    if !db.is_governance_enabled()? {
+        return Ok(true);
+    }
+    db.is_server_allowed(&server_identifier)
+}
+
+#[tauri::command]
+fn governance_create_request(
+    server_identifier: String,
+    server_name: String,
+    request_reason: Option<String>,
+    db: tauri::State<'_, Database>,
+) -> Result<i64, String> {
+    let id = db.create_approval_request(
+        &server_identifier,
+        &server_name,
+        "user",
+        request_reason.as_deref(),
+    )?;
+    db.add_audit_log(
+        "request_created",
+        "user",
+        Some(&server_identifier),
+        request_reason.as_deref(),
+    )?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn governance_review_request(
+    admin_pin: String,
+    request_id: i64,
+    approved: bool,
+    review_notes: Option<String>,
+    db: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    if !db.verify_admin_pin(&admin_pin)? {
+        return Err("Invalid admin PIN".to_string());
+    }
+    let status = if approved { "approved" } else { "denied" };
+    db.review_approval_request(request_id, status, "admin", review_notes.as_deref())?;
+
+    // If approved, also add to the allowlist
+    if approved {
+        let requests = db.get_approval_requests(None)?;
+        if let Some(req) = requests.iter().find(|r| r.id == request_id) {
+            db.add_to_allowlist(
+                &req.server_identifier,
+                &req.server_name,
+                None,
+                "admin",
+                review_notes.as_deref(),
+                None,
+            )?;
+        }
+    }
+
+    db.add_audit_log(
+        if approved { "request_approved" } else { "request_denied" },
+        "admin",
+        None,
+        review_notes.as_deref(),
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+fn governance_get_requests(
+    status_filter: Option<String>,
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<GovernanceRequest>, String> {
+    db.get_approval_requests(status_filter.as_deref())
+}
+
+#[tauri::command]
+fn governance_get_audit_log(
+    limit: Option<i64>,
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<GovernanceAuditEntry>, String> {
+    db.get_audit_log(limit.unwrap_or(100))
+}
+
 // --- App Setup ---
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1695,6 +1924,19 @@ pub fn run() {
             stop_daemon,
             is_autostart_enabled,
             set_autostart,
+            // Governance
+            get_governance_status,
+            setup_governance,
+            verify_admin_pin,
+            set_governance_enabled,
+            governance_add_to_allowlist,
+            governance_remove_from_allowlist,
+            governance_get_allowlist,
+            governance_is_server_allowed,
+            governance_create_request,
+            governance_review_request,
+            governance_get_requests,
+            governance_get_audit_log,
         ])
         .setup(|app| {
             // Handle deep links (open-url event from tauri-plugin-deep-link)

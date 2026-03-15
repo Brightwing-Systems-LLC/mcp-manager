@@ -12,6 +12,7 @@ import About from "./components/About";
 import ProxyServers from "./components/ProxyServers";
 import ServerDetail from "./components/ServerDetail";
 import ApiKeysPanel from "./components/ApiKeysPanel";
+import Governance from "./components/Governance";
 import CliPage from "./components/CliPage";
 import Toast from "./components/Toast";
 import RestartBanner from "./components/RestartBanner";
@@ -56,6 +57,7 @@ export default function App() {
         {view === "proxy" && <ProxyServers />}
         {view === "server-detail" && <ServerDetail />}
         {view === "api-keys" && <ApiKeysPanel />}
+        {view === "governance" && <Governance />}
         {view === "cli" && <CliPage />}
         {view === "about" && <About />}
       </main>

@@ -118,8 +118,6 @@ export interface ApiInstallConfig {
   verified: boolean;
 }
 
-export type View = "dashboard" | "search" | "favorites" | "install" | "add-server" | "proxy" | "api-keys" | "cli" | "about" | "server-detail";
-
 // --- Auth Probe Types ---
 
 export interface AuthProbeResult {
@@ -204,3 +202,47 @@ export interface DaemonStatusInfo {
   uptime_secs: number | null;
   daemon_version: string | null;
 }
+
+// --- Governance Types ---
+
+export interface GovernanceStatus {
+  enabled: boolean;
+  has_admin_pin: boolean;
+  allowlist_count: number;
+  pending_requests: number;
+}
+
+export interface GovernanceAllowlistEntry {
+  id: number;
+  server_identifier: string;
+  display_name: string;
+  description: string | null;
+  approved_by: string;
+  approved_at: string;
+  review_notes: string | null;
+  max_version: string | null;
+}
+
+export interface GovernanceRequest {
+  id: number;
+  server_identifier: string;
+  server_name: string;
+  requested_by: string;
+  request_reason: string | null;
+  status: "pending" | "approved" | "denied";
+  reviewed_by: string | null;
+  review_notes: string | null;
+  requested_at: string;
+  reviewed_at: string | null;
+}
+
+export interface GovernanceAuditEntry {
+  id: number;
+  action: string;
+  actor: string;
+  target_server: string | null;
+  detail: string | null;
+  timestamp: string;
+}
+
+export type View = "dashboard" | "search" | "favorites" | "install" | "add-server" | "proxy" | "api-keys" | "cli" | "about" | "server-detail" | "governance";
