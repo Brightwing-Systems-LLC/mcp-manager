@@ -247,7 +247,7 @@ export default function About() {
 
       {/* Version */}
       <div className="text-center text-xs text-brightwing-gray-600 mt-8 pb-4">
-        MCP Manager v0.3.10
+        MCP Manager v0.3.11
       </div>
     </div>
   );

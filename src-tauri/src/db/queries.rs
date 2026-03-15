@@ -682,6 +682,26 @@ impl Database {
         }
     }
 
+    /// Get all OAuth token sets (for vault migration).
+    pub fn get_all_oauth_token_sets(&self) -> Result<Vec<(String, String)>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT server_id, token_json FROM oauth_token_sets ORDER BY server_id")
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Query failed: {}", e))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(|e| format!("Row error: {}", e))?);
+        }
+        Ok(result)
+    }
+
     pub fn delete_oauth_token_set(&self, server_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(

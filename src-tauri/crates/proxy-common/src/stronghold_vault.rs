@@ -19,6 +19,41 @@ pub struct StrongholdBackend {
     inner: Mutex<StrongholdInner>,
 }
 
+/// Re-encrypt an existing Stronghold snapshot with a new passphrase.
+///
+/// Loads the snapshot using `old_passphrase`, then re-commits it encrypted with
+/// `new_passphrase`. Both passphrases are SHA-256 hashed to produce 32-byte keys
+/// (matching `StrongholdBackend::new` behavior).
+pub fn re_encrypt_snapshot(
+    path: &std::path::Path,
+    old_passphrase: &[u8],
+    new_passphrase: &[u8],
+) -> Result<(), VaultError> {
+    let stronghold = Stronghold::default();
+    let snapshot_path = SnapshotPath::from_path(path);
+    let client_path = b"brightwing".to_vec();
+
+    // Load with old key
+    let old_hash = Sha256::digest(old_passphrase);
+    let old_kp = KeyProvider::try_from(Zeroizing::new(old_hash.to_vec()))
+        .map_err(|e| VaultError::Internal(format!("Invalid old passphrase: {}", e)))?;
+
+    stronghold
+        .load_client_from_snapshot(client_path, &old_kp, &snapshot_path)
+        .map_err(|e| VaultError::Io(format!("Failed to load with old key: {}", e)))?;
+
+    // Re-commit with new key
+    let new_hash = Sha256::digest(new_passphrase);
+    let new_kp = KeyProvider::try_from(Zeroizing::new(new_hash.to_vec()))
+        .map_err(|e| VaultError::Internal(format!("Invalid new passphrase: {}", e)))?;
+
+    stronghold
+        .commit_with_keyprovider(&snapshot_path, &new_kp)
+        .map_err(|e| VaultError::Io(format!("Failed to re-encrypt: {}", e)))?;
+
+    Ok(())
+}
+
 struct StrongholdInner {
     stronghold: Stronghold,
     snapshot_path: SnapshotPath,

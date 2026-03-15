@@ -668,6 +668,7 @@ fn cache_tool_schema(
 async fn discover_upstream_tools(
     server_id: String,
     db: tauri::State<'_, Database>,
+    vault: tauri::State<'_, VaultState>,
 ) -> Result<Vec<CachedTool>, String> {
     // 1. Look up server
     let server = db
@@ -682,14 +683,9 @@ async fn discover_upstream_tools(
     // 2. Build auth header from credentials
     let auth_header = match server.auth_type.as_str() {
         "oauth" => {
-            if let Ok(Some(token_json)) = db.get_oauth_token_set(&server_id) {
-                if let Ok(ts) = serde_json::from_str::<oauth::types::OAuthTokenSet>(&token_json) {
-                    Some(format!("Bearer {}", ts.access_token))
-                } else {
-                    None
-                }
-            } else {
-                None
+            match oauth::flow::get_token_set_from_vault(&server_id, vault.0.as_ref()).await {
+                Ok(Some(ts)) => Some(format!("Bearer {}", ts.access_token)),
+                _ => None,
             }
         }
         "api_key" => {
@@ -748,8 +744,9 @@ async fn complete_oauth_callback(
     code: Option<String>,
     flow_states: tauri::State<'_, oauth::flow::OAuthFlowStates>,
     db: tauri::State<'_, Database>,
+    vault: tauri::State<'_, VaultState>,
 ) -> Result<(), String> {
-    oauth::flow::complete_flow(&state, code.as_deref(), &flow_states, &db)
+    oauth::flow::complete_flow(&state, code.as_deref(), &flow_states, &db, vault.0.as_ref())
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -773,32 +770,35 @@ fn get_oauth_status(
 }
 
 #[tauri::command]
-fn disconnect_oauth(
+async fn disconnect_oauth(
     server_id: String,
     db: tauri::State<'_, Database>,
+    vault: tauri::State<'_, VaultState>,
 ) -> Result<(), String> {
-    oauth::flow::disconnect(&server_id, &db).map_err(|e| e.to_string())
+    oauth::flow::disconnect(&server_id, &db, vault.0.as_ref())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn refresh_oauth_token(
     server_id: String,
     db: tauri::State<'_, Database>,
+    vault: tauri::State<'_, VaultState>,
 ) -> Result<(), String> {
-    let token_json = db
-        .get_oauth_token_set(&server_id)
+    // Read full token set from vault
+    let token_set = oauth::flow::get_token_set_from_vault(&server_id, vault.0.as_ref())
+        .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("No OAuth tokens for {}", server_id))?;
-
-    let token_set: oauth::types::OAuthTokenSet =
-        serde_json::from_str(&token_json).map_err(|e| format!("Bad token data: {}", e))?;
+        .ok_or_else(|| format!("No OAuth tokens in vault for {}", server_id))?;
 
     let new_set = oauth::refresh::refresh_token(&token_set)
         .await
         .map_err(|e| e.to_string())?;
 
-    let new_json = serde_json::to_string(&new_set).map_err(|e| e.to_string())?;
-    db.store_oauth_token_set(&server_id, &new_json)
+    // Store updated tokens back to vault + metadata to SQLite
+    oauth::flow::store_token_set(&server_id, &new_set, vault.0.as_ref(), &db)
+        .await
         .map_err(|e| e.to_string())?;
 
     Ok(())
@@ -1588,12 +1588,15 @@ pub fn run() {
         }
     };
 
-    // Migrate API keys from SQLite to vault (one-time, idempotent)
+    // Migrate API keys and OAuth tokens from SQLite to vault (one-time, idempotent)
     {
         let db_ref = &db;
         let vault_ref = vault.as_ref();
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for migration");
-        rt.block_on(vault_init::migrate_api_keys_to_vault(db_ref, vault_ref));
+        rt.block_on(async {
+            vault_init::migrate_api_keys_to_vault(db_ref, vault_ref).await;
+            vault_init::migrate_oauth_tokens_to_vault(db_ref, vault_ref).await;
+        });
     }
 
     tauri::Builder::default()

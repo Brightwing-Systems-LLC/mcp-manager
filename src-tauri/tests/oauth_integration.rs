@@ -17,6 +17,7 @@ use brightwing_mcp_manager_lib::oauth::flow::{
 };
 use brightwing_mcp_manager_lib::oauth::refresh::refresh_token;
 use brightwing_mcp_manager_lib::oauth::types::{OAuthError, OAuthFlowInfo, OAuthTokenSet};
+use proxy_common::vault::InMemoryVaultBackend;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -405,6 +406,7 @@ async fn test_full_oauth_flow_with_dynamic_registration() {
     let db = Database::new_in_memory().unwrap();
     register_oauth_server(&db, "github-mcp", &mock.url());
     let flow_states = OAuthFlowStates::new();
+    let vault = InMemoryVaultBackend::new();
 
     // 1. Start the flow (discovers metadata, registers client, returns auth URL)
     let flow_info: OAuthFlowInfo = start_flow(
@@ -440,6 +442,7 @@ async fn test_full_oauth_flow_with_dynamic_registration() {
         None, // Use stored callback params
         &flow_states,
         &db,
+        &vault,
     )
     .await
     .unwrap();
@@ -478,6 +481,7 @@ async fn test_oauth_flow_with_provided_client_id() {
     let db = Database::new_in_memory().unwrap();
     register_oauth_server(&db, "custom-server", &mock.url());
     let flow_states = OAuthFlowStates::new();
+    let vault = InMemoryVaultBackend::new();
 
     // Start flow with a pre-registered client_id
     let flow_info: OAuthFlowInfo = start_flow(
@@ -500,7 +504,7 @@ async fn test_oauth_flow_with_provided_client_id() {
     // Simulate callback and complete
     simulate_browser_callback(&flow_info.auth_url, "manual-code").await;
 
-    let token_set: OAuthTokenSet = complete_flow(&flow_info.state, None, &flow_states, &db)
+    let token_set: OAuthTokenSet = complete_flow(&flow_info.state, None, &flow_states, &db, &vault)
         .await
         .unwrap();
 
@@ -519,6 +523,7 @@ async fn test_oauth_complete_with_direct_code() {
     let db = Database::new_in_memory().unwrap();
     register_oauth_server(&db, "direct-srv", &mock.url());
     let flow_states = OAuthFlowStates::new();
+    let vault = InMemoryVaultBackend::new();
 
     let flow_info: OAuthFlowInfo = start_flow("direct-srv", &mock.url(), None, &db, &flow_states)
         .await
@@ -530,6 +535,7 @@ async fn test_oauth_complete_with_direct_code() {
         Some("code-from-deep-link"),
         &flow_states,
         &db,
+        &vault,
     )
     .await
     .unwrap();
@@ -585,20 +591,21 @@ async fn test_oauth_disconnect() {
     let db = Database::new_in_memory().unwrap();
     register_oauth_server(&db, "disc-test", &mock.url());
     let flow_states = OAuthFlowStates::new();
+    let vault = InMemoryVaultBackend::new();
 
     // Connect first
     let flow_info: OAuthFlowInfo = start_flow("disc-test", &mock.url(), None, &db, &flow_states)
         .await
         .unwrap();
     simulate_browser_callback(&flow_info.auth_url, "code123").await;
-    let _: OAuthTokenSet = complete_flow(&flow_info.state, None, &flow_states, &db)
+    let _: OAuthTokenSet = complete_flow(&flow_info.state, None, &flow_states, &db, &vault)
         .await
         .unwrap();
 
     assert_eq!(get_status("disc-test", &db).status, "connected");
 
     // Disconnect
-    disconnect("disc-test", &db).unwrap();
+    disconnect("disc-test", &db, &vault).await.unwrap();
 
     assert_eq!(get_status("disc-test", &db).status, "disconnected");
 }
@@ -616,13 +623,14 @@ async fn test_oauth_token_refresh() {
     let db = Database::new_in_memory().unwrap();
     register_oauth_server(&db, "refresh-test", &mock.url());
     let flow_states = OAuthFlowStates::new();
+    let vault = InMemoryVaultBackend::new();
 
     // Complete an initial flow
     let flow_info: OAuthFlowInfo = start_flow("refresh-test", &mock.url(), None, &db, &flow_states)
         .await
         .unwrap();
     simulate_browser_callback(&flow_info.auth_url, "code-for-refresh").await;
-    let initial_tokens: OAuthTokenSet = complete_flow(&flow_info.state, None, &flow_states, &db)
+    let initial_tokens: OAuthTokenSet = complete_flow(&flow_info.state, None, &flow_states, &db, &vault)
         .await
         .unwrap();
 
@@ -659,12 +667,13 @@ async fn test_oauth_refresh_preserves_old_refresh_token() {
     let db = Database::new_in_memory().unwrap();
     register_oauth_server(&db, "preserve-test", &mock.url());
     let flow_states = OAuthFlowStates::new();
+    let vault = InMemoryVaultBackend::new();
 
     let flow_info: OAuthFlowInfo = start_flow("preserve-test", &mock.url(), None, &db, &flow_states)
         .await
         .unwrap();
     simulate_browser_callback(&flow_info.auth_url, "c").await;
-    let initial: OAuthTokenSet = complete_flow(&flow_info.state, None, &flow_states, &db)
+    let initial: OAuthTokenSet = complete_flow(&flow_info.state, None, &flow_states, &db, &vault)
         .await
         .unwrap();
 
@@ -702,13 +711,14 @@ async fn test_oauth_complete_without_callback_fails() {
     let db = Database::new_in_memory().unwrap();
     register_oauth_server(&db, "no-cb", &mock.url());
     let flow_states = OAuthFlowStates::new();
+    let vault = InMemoryVaultBackend::new();
 
     let flow_info: OAuthFlowInfo = start_flow("no-cb", &mock.url(), None, &db, &flow_states)
         .await
         .unwrap();
 
     // Try to complete without simulating browser callback and without providing code
-    let result: Result<OAuthTokenSet, OAuthError> = complete_flow(&flow_info.state, None, &flow_states, &db).await;
+    let result: Result<OAuthTokenSet, OAuthError> = complete_flow(&flow_info.state, None, &flow_states, &db, &vault).await;
     assert!(result.is_err());
     let err_msg = format!("{}", result.unwrap_err());
     assert!(err_msg.contains("No callback received"));
@@ -718,9 +728,10 @@ async fn test_oauth_complete_without_callback_fails() {
 async fn test_oauth_complete_invalid_state_fails() {
     let db = Database::new_in_memory().unwrap();
     let flow_states = OAuthFlowStates::new();
+    let vault = InMemoryVaultBackend::new();
 
     // Try to complete with a state that was never started
-    let result: Result<OAuthTokenSet, OAuthError> = complete_flow("bogus-state", Some("code"), &flow_states, &db).await;
+    let result: Result<OAuthTokenSet, OAuthError> = complete_flow("bogus-state", Some("code"), &flow_states, &db, &vault).await;
     assert!(result.is_err());
     let err_msg = format!("{}", result.unwrap_err());
     assert!(err_msg.contains("Invalid OAuth state"));
@@ -736,13 +747,14 @@ async fn test_oauth_metadata_cached_after_discovery() {
     let db = Database::new_in_memory().unwrap();
     register_oauth_server(&db, "cache-test", &mock.url());
     let flow_states = OAuthFlowStates::new();
+    let vault = InMemoryVaultBackend::new();
 
     // First flow — discovers and caches metadata
     let flow_info1: OAuthFlowInfo = start_flow("cache-test", &mock.url(), None, &db, &flow_states)
         .await
         .unwrap();
     simulate_browser_callback(&flow_info1.auth_url, "c1").await;
-    let _: OAuthTokenSet = complete_flow(&flow_info1.state, None, &flow_states, &db)
+    let _: OAuthTokenSet = complete_flow(&flow_info1.state, None, &flow_states, &db, &vault)
         .await
         .unwrap();
 
@@ -772,13 +784,14 @@ async fn test_oauth_client_secret_forwarded_in_exchange() {
     let db = Database::new_in_memory().unwrap();
     register_oauth_server(&db, "secret-test", &mock.url());
     let flow_states = OAuthFlowStates::new();
+    let vault = InMemoryVaultBackend::new();
 
     let flow_info: OAuthFlowInfo = start_flow("secret-test", &mock.url(), None, &db, &flow_states)
         .await
         .unwrap();
 
     simulate_browser_callback(&flow_info.auth_url, "code-with-secret").await;
-    let tokens: OAuthTokenSet = complete_flow(&flow_info.state, None, &flow_states, &db)
+    let tokens: OAuthTokenSet = complete_flow(&flow_info.state, None, &flow_states, &db, &vault)
         .await
         .unwrap();
 

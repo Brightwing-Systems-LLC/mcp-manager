@@ -61,11 +61,11 @@ impl DaemonState {
             }
 
             IpcRequest::StoreCredentials { server_id, credential } => {
-                self.handle_store_credentials(&server_id, &credential)
+                self.handle_store_credentials(&server_id, &credential).await
             }
 
             IpcRequest::DeleteCredentials { server_id } => {
-                self.handle_delete_credentials(&server_id)
+                self.handle_delete_credentials(&server_id).await
             }
 
             IpcRequest::GetToolFilter { server_id, tool_id } => {
@@ -172,6 +172,33 @@ impl DaemonState {
         }
     }
 
+    /// Try to read an OAuth token set from the encrypted vault.
+    async fn try_get_oauth_from_vault(&self, server_id: &str) -> Option<OAuthTokenSet> {
+        let vault = self.vault.as_ref()?;
+        let vault_key = format!("oauth:{}", server_id);
+        match vault.retrieve(&vault_key).await {
+            Ok(Some(data)) => serde_json::from_slice::<OAuthTokenSet>(&data).ok(),
+            _ => None,
+        }
+    }
+
+    /// Store an OAuth token set in the vault and update SQLite metadata.
+    async fn store_oauth_token_set(&self, server_id: &str, token_set: &OAuthTokenSet) {
+        // Store in vault
+        if let Some(vault) = self.vault.as_ref() {
+            let vault_key = format!("oauth:{}", server_id);
+            if let Ok(json) = serde_json::to_vec(token_set) {
+                let _ = vault.store(&vault_key, &json).await;
+            }
+        }
+
+        // Update SQLite with metadata only
+        let meta = brightwing_mcp_manager_lib::oauth::types::OAuthTokenMeta::from(token_set);
+        if let Ok(meta_json) = serde_json::to_string(&meta) {
+            let _ = self.db.store_oauth_token_set(server_id, &meta_json);
+        }
+    }
+
     async fn handle_get_credentials(&self, server_id: &str) -> IpcResponse {
         // Look up proxy server to determine auth type
         let server = match self.db.get_proxy_server(server_id) {
@@ -198,60 +225,58 @@ impl DaemonState {
 
         let credential = match server.auth_type.as_str() {
             "oauth" => {
-                match self.db.get_oauth_token_set(server_id) {
-                    Ok(Some(token_json)) => {
-                        match serde_json::from_str::<OAuthTokenSet>(&token_json) {
-                            Ok(ts) => {
-                                // Check if token is expired
-                                if let Some(ref expires_at) = ts.expires_at {
-                                    if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
-                                        if exp < chrono::Utc::now() {
-                                            return IpcResponse::CredentialError {
-                                                server_id: server_id.to_string(),
-                                                error: CredentialError {
-                                                    code: CredentialErrorCode::AuthExpired,
-                                                    message: "OAuth token expired. Please re-authenticate in Brightwing.".to_string(),
-                                                },
-                                            };
-                                        }
+                // Try vault first, fall back to SQLite for legacy data
+                let ts = match self.try_get_oauth_from_vault(server_id).await {
+                    Some(ts) => ts,
+                    None => {
+                        // Fallback: try SQLite (pre-migration data)
+                        match self.db.get_oauth_token_set(server_id) {
+                            Ok(Some(token_json)) => {
+                                match serde_json::from_str::<OAuthTokenSet>(&token_json) {
+                                    Ok(ts) => ts,
+                                    Err(_) => {
+                                        return IpcResponse::CredentialError {
+                                            server_id: server_id.to_string(),
+                                            error: CredentialError {
+                                                code: CredentialErrorCode::AuthExpired,
+                                                message: "No OAuth tokens found. Please authenticate in Brightwing.".to_string(),
+                                            },
+                                        };
                                     }
                                 }
-                                Credential::OAuth(OAuthCredential {
-                                    access_token: ts.access_token,
-                                    url: server.upstream_url.unwrap_or(ts.server_url),
-                                    expires_at: ts.expires_at,
-                                })
                             }
-                            Err(e) => {
+                            _ => {
                                 return IpcResponse::CredentialError {
                                     server_id: server_id.to_string(),
                                     error: CredentialError {
-                                        code: CredentialErrorCode::Internal,
-                                        message: format!("Failed to parse token data: {}", e),
+                                        code: CredentialErrorCode::AuthExpired,
+                                        message: "No OAuth tokens found. Please authenticate in Brightwing.".to_string(),
                                     },
                                 };
                             }
                         }
                     }
-                    Ok(None) => {
-                        return IpcResponse::CredentialError {
-                            server_id: server_id.to_string(),
-                            error: CredentialError {
-                                code: CredentialErrorCode::AuthExpired,
-                                message: "No OAuth tokens found. Please authenticate in Brightwing.".to_string(),
-                            },
-                        };
-                    }
-                    Err(e) => {
-                        return IpcResponse::CredentialError {
-                            server_id: server_id.to_string(),
-                            error: CredentialError {
-                                code: CredentialErrorCode::Internal,
-                                message: format!("Database error: {}", e),
-                            },
-                        };
+                };
+
+                // Check if token is expired
+                if let Some(ref expires_at) = ts.expires_at {
+                    if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
+                        if exp < chrono::Utc::now() {
+                            return IpcResponse::CredentialError {
+                                server_id: server_id.to_string(),
+                                error: CredentialError {
+                                    code: CredentialErrorCode::AuthExpired,
+                                    message: "OAuth token expired. Please re-authenticate in Brightwing.".to_string(),
+                                },
+                            };
+                        }
                     }
                 }
+                Credential::OAuth(OAuthCredential {
+                    access_token: ts.access_token,
+                    url: server.upstream_url.unwrap_or(ts.server_url),
+                    expires_at: ts.expires_at,
+                })
             }
             "api_key" => {
                 // Try vault first, fall back to SQLite
@@ -301,28 +326,25 @@ impl DaemonState {
         }
     }
 
-    fn handle_store_credentials(&self, server_id: &str, credential: &Credential) -> IpcResponse {
+    async fn handle_store_credentials(&self, server_id: &str, credential: &Credential) -> IpcResponse {
         match credential {
             Credential::OAuth(oauth) => {
-                // We can't reconstruct a full OAuthTokenSet from just OAuthCredential,
-                // so store as-is in a simplified format. In practice, the GUI stores
-                // full token sets directly — this path is for IPC-based stores.
-                let token_set = serde_json::json!({
-                    "access_token": oauth.access_token,
-                    "token_type": "Bearer",
-                    "server_url": oauth.url,
-                    "token_endpoint": "",
-                    "client_id": "",
-                    "expires_at": oauth.expires_at,
-                });
-                match self.db.store_oauth_token_set(server_id, &token_set.to_string()) {
-                    Ok(()) => IpcResponse::Ok {
-                        message: Some(format!("OAuth credentials stored for '{}'", server_id)),
-                    },
-                    Err(e) => IpcResponse::Error {
-                        code: "db_error".to_string(),
-                        message: format!("Failed to store credentials: {}", e),
-                    },
+                // Build a minimal OAuthTokenSet from the IPC credential
+                let token_set = OAuthTokenSet {
+                    access_token: oauth.access_token.clone(),
+                    refresh_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: None,
+                    expires_at: oauth.expires_at.clone(),
+                    scope: None,
+                    token_endpoint: String::new(),
+                    client_id: String::new(),
+                    client_secret: None,
+                    server_url: oauth.url.clone(),
+                };
+                self.store_oauth_token_set(server_id, &token_set).await;
+                IpcResponse::Ok {
+                    message: Some(format!("OAuth credentials stored for '{}'", server_id)),
                 }
             }
             Credential::ApiKey(api_key) => {
@@ -344,8 +366,13 @@ impl DaemonState {
         }
     }
 
-    fn handle_delete_credentials(&self, server_id: &str) -> IpcResponse {
-        // Delete both OAuth tokens and API keys
+    async fn handle_delete_credentials(&self, server_id: &str) -> IpcResponse {
+        // Delete from vault
+        if let Some(vault) = self.vault.as_ref() {
+            let _ = vault.delete(&format!("oauth:{}", server_id)).await;
+            let _ = vault.delete(&format!("apikey:{}", server_id)).await;
+        }
+        // Delete from SQLite
         let _ = self.db.delete_oauth_token_set(server_id);
         let _ = self.db.delete_api_key(server_id);
         IpcResponse::Ok {
@@ -442,12 +469,13 @@ impl DaemonState {
                         "oauth" => {
                             match self.db.get_oauth_token_set(&s.server_id) {
                                 Ok(Some(json)) => {
-                                    if let Ok(ts) = serde_json::from_str::<OAuthTokenSet>(&json) {
-                                        if is_expiring_soon(&ts, 0) {
-                                            "expired".to_string()
-                                        } else {
-                                            "connected".to_string()
-                                        }
+                                    // Parse as generic JSON to extract expires_at (works for both metadata and full token set)
+                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
+                                        let expired = val.get("expires_at")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                            .map_or(false, |dt| dt < chrono::Utc::now());
+                                        if expired { "expired".to_string() } else { "connected".to_string() }
                                     } else {
                                         "pending".to_string()
                                     }
@@ -570,15 +598,15 @@ impl DaemonState {
         // Build auth header
         let auth_header = match server.auth_type.as_str() {
             "oauth" => {
-                match self.db.get_oauth_token_set(server_id) {
-                    Ok(Some(json)) => {
-                        match serde_json::from_str::<OAuthTokenSet>(&json) {
-                            Ok(ts) => Some(format!("Bearer {}", ts.access_token)),
-                            Err(_) => None,
-                        }
-                    }
-                    _ => None,
-                }
+                self.try_get_oauth_from_vault(server_id)
+                    .await
+                    .map(|ts| format!("Bearer {}", ts.access_token))
+                    .or_else(|| {
+                        // Fallback to SQLite for legacy data
+                        self.db.get_oauth_token_set(server_id).ok().flatten()
+                            .and_then(|json| serde_json::from_str::<OAuthTokenSet>(&json).ok())
+                            .map(|ts| format!("Bearer {}", ts.access_token))
+                    })
             }
             "api_key" => {
                 let injection = server.api_key_injection.as_deref().unwrap_or("bearer");
@@ -771,8 +799,8 @@ fn is_expiring_soon(token_set: &OAuthTokenSet, threshold_minutes: i64) -> bool {
 }
 
 /// Refresh all OAuth tokens that are expiring soon.
-async fn refresh_expiring_tokens(db: &Database) {
-    let servers = match db.get_proxy_servers() {
+async fn refresh_expiring_tokens(state: &DaemonState) {
+    let servers = match state.db.get_proxy_servers() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("brightwing-authd: refresh scheduler: failed to list servers: {}", e);
@@ -785,14 +813,20 @@ async fn refresh_expiring_tokens(db: &Database) {
             continue;
         }
 
-        let token_json = match db.get_oauth_token_set(&server.server_id) {
-            Ok(Some(json)) => json,
-            _ => continue,
-        };
-
-        let token_set: OAuthTokenSet = match serde_json::from_str(&token_json) {
-            Ok(ts) => ts,
-            Err(_) => continue,
+        // Read full token set from vault (or fall back to SQLite for legacy data)
+        let token_set = match state.try_get_oauth_from_vault(&server.server_id).await {
+            Some(ts) => ts,
+            None => {
+                // Fallback to SQLite
+                let token_json = match state.db.get_oauth_token_set(&server.server_id) {
+                    Ok(Some(json)) => json,
+                    _ => continue,
+                };
+                match serde_json::from_str::<OAuthTokenSet>(&token_json) {
+                    Ok(ts) => ts,
+                    Err(_) => continue,
+                }
+            }
         };
 
         // Skip if no refresh token
@@ -809,18 +843,8 @@ async fn refresh_expiring_tokens(db: &Database) {
 
         match refresh_token(&token_set).await {
             Ok(new_set) => {
-                let new_json = match serde_json::to_string(&new_set) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        eprintln!("brightwing-authd: failed to serialize refreshed token for {}: {}", server.server_id, e);
-                        continue;
-                    }
-                };
-                if let Err(e) = db.store_oauth_token_set(&server.server_id, &new_json) {
-                    eprintln!("brightwing-authd: failed to store refreshed token for {}: {}", server.server_id, e);
-                } else {
-                    eprintln!("brightwing-authd: refreshed token for {}", server.server_id);
-                }
+                state.store_oauth_token_set(&server.server_id, &new_set).await;
+                eprintln!("brightwing-authd: refreshed token for {}", server.server_id);
             }
             Err(e) => {
                 eprintln!("brightwing-authd: failed to refresh token for {}: {}", server.server_id, e);
@@ -830,11 +854,11 @@ async fn refresh_expiring_tokens(db: &Database) {
 }
 
 /// Background task that periodically checks and refreshes expiring tokens.
-async fn token_refresh_loop(db: Arc<Database>) {
+async fn token_refresh_loop(state: Arc<DaemonState>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // 5 minutes
     loop {
         interval.tick().await;
-        refresh_expiring_tokens(&db).await;
+        refresh_expiring_tokens(&state).await;
     }
 }
 
@@ -977,6 +1001,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+    // Run migrations (idempotent)
+    if let Some(ref v) = vault {
+        brightwing_mcp_manager_lib::vault_init::migrate_api_keys_to_vault(&db, v.as_ref()).await;
+        brightwing_mcp_manager_lib::vault_init::migrate_oauth_tokens_to_vault(&db, v.as_ref()).await;
+    }
+
     let state = Arc::new(DaemonState::new(Arc::clone(&db), vault));
 
     let mut listener = IpcListener::bind(&socket_path)?;
@@ -997,9 +1027,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn token refresh background task
     {
-        let db = Arc::clone(&db);
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
-            token_refresh_loop(db).await;
+            token_refresh_loop(state).await;
         });
     }
 

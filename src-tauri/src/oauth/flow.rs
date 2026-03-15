@@ -2,9 +2,9 @@ use super::callback::{start_callback_server, CallbackParams};
 use super::discovery::discover_oauth_metadata;
 use super::exchange::{ExchangeParams, exchange_code};
 use super::pkce;
-use super::registration::register_client;
-use super::types::{OAuthError, OAuthFlowInfo, OAuthFlowState, OAuthStatus, OAuthTokenSet};
+use super::types::{OAuthError, OAuthFlowInfo, OAuthFlowState, OAuthStatus, OAuthTokenMeta, OAuthTokenSet};
 use crate::db::Database;
+use proxy_common::vault::VaultBackend;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -32,6 +32,48 @@ pub fn oauth_vault_key(server_id: &str) -> String {
 /// Vault key for stored client registrations.
 pub fn oauth_client_key(server_id: &str) -> String {
     format!("oauth_client:{}", server_id)
+}
+
+/// Store an OAuth token set: secrets go to vault, metadata to SQLite.
+pub async fn store_token_set(
+    server_id: &str,
+    token_set: &OAuthTokenSet,
+    vault: &dyn VaultBackend,
+    db: &Database,
+) -> Result<(), OAuthError> {
+    // Store full token set in vault
+    let vault_json = serde_json::to_vec(token_set)
+        .map_err(|e| OAuthError::Internal(format!("Failed to serialize token set: {}", e)))?;
+    vault
+        .store(&oauth_vault_key(server_id), &vault_json)
+        .await
+        .map_err(|e| OAuthError::Internal(format!("Failed to store tokens in vault: {}", e)))?;
+
+    // Store non-sensitive metadata in SQLite (for status checks)
+    let meta = OAuthTokenMeta::from(token_set);
+    let meta_json = serde_json::to_string(&meta)
+        .map_err(|e| OAuthError::Internal(format!("Failed to serialize metadata: {}", e)))?;
+    db.store_oauth_token_set(server_id, &meta_json)
+        .map_err(|e| OAuthError::Internal(e))?;
+
+    Ok(())
+}
+
+/// Retrieve the full OAuth token set from the vault.
+pub async fn get_token_set_from_vault(
+    server_id: &str,
+    vault: &dyn VaultBackend,
+) -> Result<Option<OAuthTokenSet>, OAuthError> {
+    let vault_key = oauth_vault_key(server_id);
+    match vault.retrieve(&vault_key).await {
+        Ok(Some(data)) => {
+            let ts: OAuthTokenSet = serde_json::from_slice(&data)
+                .map_err(|e| OAuthError::Internal(format!("Failed to parse vault token data: {}", e)))?;
+            Ok(Some(ts))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => Err(OAuthError::Internal(format!("Vault read error: {}", e))),
+    }
 }
 
 /// Start an OAuth flow: discover metadata, register client if needed, generate PKCE,
@@ -125,6 +167,8 @@ pub async fn start_flow(
     })
 }
 
+use super::registration::register_client;
+
 /// Complete an OAuth flow after the callback is received.
 /// If `code` is provided, use it directly. Otherwise, check for a stored callback.
 pub async fn complete_flow(
@@ -132,6 +176,7 @@ pub async fn complete_flow(
     code: Option<&str>,
     flow_states: &OAuthFlowStates,
     db: &Database,
+    vault: &dyn VaultBackend,
 ) -> Result<OAuthTokenSet, OAuthError> {
     // Get the code from either the parameter or the stored callback
     let auth_code = if let Some(c) = code {
@@ -173,44 +218,48 @@ pub async fn complete_flow(
 
     let token_set = exchange_code(&exchange_params).await?;
 
-    // Store the token set in the database
-    let token_json = serde_json::to_string(&token_set)
-        .map_err(|e| OAuthError::Internal(e.to_string()))?;
-    db.store_oauth_token_set(&fs.server_id, &token_json)
-        .map_err(|e| OAuthError::Internal(e))?;
+    // Store secrets in vault, metadata in SQLite
+    store_token_set(&fs.server_id, &token_set, vault, db).await?;
 
     Ok(token_set)
 }
 
-/// Get the OAuth status for a server.
+/// Get the OAuth status for a server (reads metadata from SQLite — no vault needed).
 pub fn get_status(server_id: &str, db: &Database) -> OAuthStatus {
     match db.get_oauth_token_set(server_id) {
-        Ok(Some(json)) => match serde_json::from_str::<OAuthTokenSet>(&json) {
-            Ok(ts) => {
-                let is_expired = ts.expires_at.as_ref().map_or(false, |exp| {
+        Ok(Some(json)) => {
+            // Try parsing as metadata (new format)
+            if let Ok(meta) = serde_json::from_str::<OAuthTokenMeta>(&json) {
+                let is_expired = meta.expires_at.as_ref().map_or(false, |exp| {
                     chrono::DateTime::parse_from_rfc3339(exp)
                         .map_or(false, |dt| dt < chrono::Utc::now())
                 });
-                if is_expired {
+                return OAuthStatus {
+                    status: if is_expired { "expired" } else { "connected" }.to_string(),
+                    expires_at: meta.expires_at,
+                    error_message: None,
+                };
+            }
+            // Fallback: try parsing as full token set (legacy format)
+            match serde_json::from_str::<OAuthTokenSet>(&json) {
+                Ok(ts) => {
+                    let is_expired = ts.expires_at.as_ref().map_or(false, |exp| {
+                        chrono::DateTime::parse_from_rfc3339(exp)
+                            .map_or(false, |dt| dt < chrono::Utc::now())
+                    });
                     OAuthStatus {
-                        status: "expired".to_string(),
-                        expires_at: ts.expires_at,
-                        error_message: None,
-                    }
-                } else {
-                    OAuthStatus {
-                        status: "connected".to_string(),
+                        status: if is_expired { "expired" } else { "connected" }.to_string(),
                         expires_at: ts.expires_at,
                         error_message: None,
                     }
                 }
+                Err(e) => OAuthStatus {
+                    status: "error".to_string(),
+                    expires_at: None,
+                    error_message: Some(format!("Corrupt token data: {}", e)),
+                },
             }
-            Err(e) => OAuthStatus {
-                status: "error".to_string(),
-                expires_at: None,
-                error_message: Some(format!("Corrupt token data: {}", e)),
-            },
-        },
+        }
         Ok(None) => OAuthStatus {
             status: "disconnected".to_string(),
             expires_at: None,
@@ -224,8 +273,16 @@ pub fn get_status(server_id: &str, db: &Database) -> OAuthStatus {
     }
 }
 
-/// Disconnect OAuth for a server (delete stored tokens).
-pub fn disconnect(server_id: &str, db: &Database) -> Result<(), OAuthError> {
+/// Disconnect OAuth for a server (delete stored tokens from both vault and SQLite).
+pub async fn disconnect(
+    server_id: &str,
+    db: &Database,
+    vault: &dyn VaultBackend,
+) -> Result<(), OAuthError> {
+    // Delete from vault
+    let _ = vault.delete(&oauth_vault_key(server_id)).await;
+
+    // Delete from SQLite
     db.delete_oauth_token_set(server_id)
         .map_err(|e| OAuthError::Internal(e))?;
     db.delete_oauth_metadata(server_id)

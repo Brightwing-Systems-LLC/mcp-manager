@@ -34,6 +34,30 @@ pub struct OAuthTokenSet {
     pub server_url: String,
 }
 
+/// Non-sensitive metadata stored in SQLite (secrets go in the vault).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthTokenMeta {
+    pub token_type: String,
+    pub expires_at: Option<String>,
+    pub scope: Option<String>,
+    pub token_endpoint: String,
+    pub client_id: String,
+    pub server_url: String,
+}
+
+impl From<&OAuthTokenSet> for OAuthTokenMeta {
+    fn from(ts: &OAuthTokenSet) -> Self {
+        Self {
+            token_type: ts.token_type.clone(),
+            expires_at: ts.expires_at.clone(),
+            scope: ts.scope.clone(),
+            token_endpoint: ts.token_endpoint.clone(),
+            client_id: ts.client_id.clone(),
+            server_url: ts.server_url.clone(),
+        }
+    }
+}
+
 /// Dynamic client registration result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientRegistration {
