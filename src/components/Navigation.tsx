@@ -5,7 +5,7 @@ import birdIcon from "../assets-logo-bird.png";
 
 const APP_VERSION = "0.3.12";
 
-const navItems: { id: View; label: string; icon: string }[] = [
+const baseNavItems: { id: View; label: string; icon: string }[] = [
   { id: "dashboard", label: "Dashboard", icon: "grid" },
   { id: "search", label: "Search", icon: "search" },
   { id: "add-server", label: "Add Server", icon: "plus" },
@@ -46,6 +46,11 @@ const icons: Record<string, JSX.Element> = {
       <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 5.25a3 3 0 0 1 3 3m3 0a6 6 0 0 1-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1 1 21.75 8.25Z" />
     </svg>
   ),
+  lock: (
+    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
+    </svg>
+  ),
   terminal: (
     <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
       <path strokeLinecap="round" strokeLinejoin="round" d="m6.75 7.5 3 2.25-3 2.25m4.5 0h3m-9 8.25h13.5A2.25 2.25 0 0 0 21 18V6a2.25 2.25 0 0 0-2.25-2.25H5.25A2.25 2.25 0 0 0 3 6v12a2.25 2.25 0 0 0 2.25 2.25Z" />
@@ -59,14 +64,25 @@ const icons: Record<string, JSX.Element> = {
 };
 
 export default function Navigation() {
-  const { view, setView, updateAvailable, updateDownloading, installUpdate, checkForUpdate } = useStore();
+  const { view, setView, updateAvailable, updateDownloading, installUpdate, checkForUpdate, governanceStatus, refreshGovernanceStatus } = useStore();
 
   // Check for updates on mount and every 4 hours
   useEffect(() => {
     checkForUpdate();
+    refreshGovernanceStatus();
     const interval = setInterval(checkForUpdate, 4 * 60 * 60 * 1000);
     return () => clearInterval(interval);
-  }, [checkForUpdate]);
+  }, [checkForUpdate, refreshGovernanceStatus]);
+
+  // Only show governance nav when it's been set up or an external policy exists
+  const showGovernance = governanceStatus && (governanceStatus.has_admin_pin || governanceStatus.policy_enforced);
+  const navItems = showGovernance
+    ? [
+        ...baseNavItems.slice(0, 5),
+        { id: "governance" as View, label: "Governance", icon: "lock" },
+        ...baseNavItems.slice(5),
+      ]
+    : baseNavItems;
 
   return (
     <nav className="w-56 bg-brightwing-gray-800 border-r border-brightwing-gray-700 flex flex-col">

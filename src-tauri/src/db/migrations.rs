@@ -141,6 +141,51 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
             UNIQUE(server_id, tool_id),
             FOREIGN KEY (server_id) REFERENCES proxy_servers(server_id) ON DELETE CASCADE
         );
+
+        -- Governance: registry policy configuration
+        CREATE TABLE IF NOT EXISTS governance_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        -- Governance: approved servers allowlist
+        -- Only servers in this list can be installed when governance is enabled
+        CREATE TABLE IF NOT EXISTS governance_allowlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_identifier TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            description TEXT,
+            approved_by TEXT NOT NULL,
+            approved_at TEXT DEFAULT (datetime('now')),
+            review_notes TEXT,
+            max_version TEXT,
+            UNIQUE(server_identifier)
+        );
+
+        -- Governance: approval requests from users wanting to add a server
+        CREATE TABLE IF NOT EXISTS governance_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_identifier TEXT NOT NULL,
+            server_name TEXT NOT NULL,
+            requested_by TEXT NOT NULL DEFAULT 'user',
+            request_reason TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            reviewed_by TEXT,
+            review_notes TEXT,
+            requested_at TEXT DEFAULT (datetime('now')),
+            reviewed_at TEXT
+        );
+
+        -- Governance: audit log for all governance-related actions
+        CREATE TABLE IF NOT EXISTS governance_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            target_server TEXT,
+            detail TEXT,
+            timestamp TEXT DEFAULT (datetime('now'))
+        );
         ",
     )
     .map_err(|e| format!("Migration failed: {}", e))?;

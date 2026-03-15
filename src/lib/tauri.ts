@@ -19,6 +19,10 @@ import type {
   OAuthStatus,
   DaemonStatusInfo,
   AuthProbeResult,
+  GovernanceStatus,
+  GovernanceAllowlistEntry,
+  GovernanceRequest,
+  GovernanceAuditEntry,
 } from "./types";
 
 export async function scanTools(): Promise<DetectedTool[]> {
@@ -355,4 +359,70 @@ export async function isAutostartEnabled(): Promise<boolean> {
 
 export async function setAutostart(enabled: boolean): Promise<void> {
   return invoke("set_autostart", { enabled });
+}
+
+// --- Governance ---
+
+export async function getGovernanceStatus(): Promise<GovernanceStatus> {
+  return invoke<GovernanceStatus>("get_governance_status");
+}
+
+export async function setupGovernance(adminPin: string): Promise<void> {
+  return invoke("setup_governance", { adminPin });
+}
+
+export async function verifyAdminPin(pin: string): Promise<boolean> {
+  return invoke<boolean>("verify_admin_pin", { pin });
+}
+
+export async function setGovernanceEnabled(enabled: boolean, adminPin: string): Promise<void> {
+  return invoke("set_governance_enabled", { enabled, adminPin });
+}
+
+export async function governanceAddToAllowlist(params: {
+  adminPin: string;
+  serverIdentifier: string;
+  displayName: string;
+  description?: string;
+  reviewNotes?: string;
+  maxVersion?: string;
+}): Promise<void> {
+  return invoke("governance_add_to_allowlist", params);
+}
+
+export async function governanceRemoveFromAllowlist(adminPin: string, serverIdentifier: string): Promise<void> {
+  return invoke("governance_remove_from_allowlist", { adminPin, serverIdentifier });
+}
+
+export async function governanceGetAllowlist(): Promise<GovernanceAllowlistEntry[]> {
+  return invoke<GovernanceAllowlistEntry[]>("governance_get_allowlist");
+}
+
+export async function governanceIsServerAllowed(serverIdentifier: string): Promise<boolean> {
+  return invoke<boolean>("governance_is_server_allowed", { serverIdentifier });
+}
+
+export async function governanceCreateRequest(params: {
+  serverIdentifier: string;
+  serverName: string;
+  requestReason?: string;
+}): Promise<number> {
+  return invoke<number>("governance_create_request", params);
+}
+
+export async function governanceReviewRequest(params: {
+  adminPin: string;
+  requestId: number;
+  approved: boolean;
+  reviewNotes?: string;
+}): Promise<void> {
+  return invoke("governance_review_request", params);
+}
+
+export async function governanceGetRequests(statusFilter?: string): Promise<GovernanceRequest[]> {
+  return invoke<GovernanceRequest[]>("governance_get_requests", { statusFilter: statusFilter || null });
+}
+
+export async function governanceGetAuditLog(limit?: number): Promise<GovernanceAuditEntry[]> {
+  return invoke<GovernanceAuditEntry[]>("governance_get_audit_log", { limit: limit || null });
 }

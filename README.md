@@ -76,6 +76,81 @@ $ bw "AI Cost Manager" get_costs --json | jq '.content[0].text'  # Pipe to jq
 
 ---
 
+## Registry Governance — Corporate MCP Server Control
+
+In a corporate environment you don't want every developer installing arbitrary MCP servers. Registry Governance gives administrators an allowlist-based policy layer that controls which servers can be installed across the organization.
+
+### How It Works
+
+1. **Admin activates governance** from the Governance page and sets a PIN
+2. **Admin curates the allowlist** — adds approved MCP servers by identifier with review notes
+3. **Users can only install allowed servers** — attempts to install anything not on the list are blocked with a clear message
+4. **Users request new servers** — submit an approval request with a justification
+5. **Admin reviews and approves/denies** — approved servers are automatically added to the allowlist
+6. **Every action is audited** — the audit log records all governance events with timestamps
+
+### Enforcement
+
+When governance is enabled, the install command checks the allowlist _server-side in Rust_ before writing any config. This applies to both direct installs and proxy server registrations. Blocked attempts are logged in the audit trail.
+
+### External Policy File (Tamper Resistance)
+
+The in-app governance setup protects against casual changes, but a determined user could reinstall the app to get a fresh database. For true corporate enforcement, deploy an **external governance policy file** via MDM, GPO, or configuration management:
+
+| Platform | Policy File Path |
+|----------|-----------------|
+| **macOS** | `/Library/Application Support/com.brightwing.mcp-manager/governance-policy.json` |
+| **Linux** | `/etc/brightwing/governance-policy.json` |
+| **Windows** | `C:\ProgramData\Brightwing\governance-policy.json` |
+
+Example policy file:
+
+```json
+{
+  "enforced": true,
+  "exclusive": false,
+  "org_name": "Acme Corp",
+  "allowed_servers": [
+    {
+      "identifier": "github-mcp-server",
+      "display_name": "GitHub MCP Server",
+      "description": "Approved for all engineering teams"
+    },
+    {
+      "identifier": "sentry-mcp",
+      "display_name": "Sentry MCP Server"
+    }
+  ]
+}
+```
+
+**Policy fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enforced` | bool | When `true`, governance cannot be disabled from the app UI. Survives reinstall. |
+| `exclusive` | bool | When `true`, _only_ servers listed in this file are allowed (the in-app allowlist is ignored). When `false`, the file's list is merged with the in-app allowlist. |
+| `org_name` | string | Displayed in the Governance UI header (e.g. "Acme Corp — Managed server allowlist"). |
+| `allowed_servers` | array | Servers that are always permitted. Each entry needs `identifier` and `display_name`. |
+
+Because this file lives in a system-protected directory (`/Library/Application Support`, `/etc`, `C:\ProgramData`), regular users cannot modify or delete it. The app reads this file on every governance check, so:
+
+- **Reinstalling the app** doesn't bypass governance — the policy file persists
+- **Updating the app** doesn't reset governance — the Tauri updater replaces the app binary, not system config files
+- **Deleting the database** doesn't help — the external policy file still enforces the allowlist
+
+### Deployment Recommendations
+
+For a corporate rollout:
+
+1. **Deploy the policy file first** via your configuration management tool (Jamf, Intune, Ansible, GPO, etc.)
+2. **Set `enforced: true`** so users cannot toggle governance off
+3. **Start with `exclusive: false`** so local admins can add servers via the in-app allowlist while you build out the central list
+4. **Migrate to `exclusive: true`** once your central allowlist is complete, for single-source-of-truth control
+5. **Use the audit log** for compliance reporting — all install attempts (allowed and blocked) are recorded
+
+---
+
 ## How It Works
 
 ```
@@ -221,6 +296,8 @@ Used by [MCP Scoreboard](https://mcpscoreboard.com) for "Install with Brightwing
 - [x] Proxy request logging
 - [ ] `notifications/tools/list_changed` push to connected clients
 - [x] Encrypted credential vault (Stronghold + OS keychain)
+- [x] Registry governance with allowlist, approval workflow, and audit log
+- [x] External governance policy file for MDM/GPO enforcement
 - [ ] Code signing for macOS, Windows, and Linux
 - [ ] Windows platform hardening
 
