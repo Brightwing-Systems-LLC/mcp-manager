@@ -245,9 +245,26 @@ export default function About() {
         </p>
       </div>
 
+      {/* License */}
+      <div className="mb-6">
+        <h2 className="text-base font-bold mb-3">License</h2>
+        <p className="text-sm text-brightwing-gray-400">
+          This project is released under the{" "}
+          <a
+            href="https://github.com/Brightwing-Systems-LLC/mcp-manager/blob/main/LICENSE"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-brightwing-blue hover:underline"
+          >
+            MIT License
+          </a>
+          . Copyright &copy; 2025–2026 Brightwing Systems, LLC.
+        </p>
+      </div>
+
       {/* Version */}
       <div className="text-center text-xs text-brightwing-gray-600 mt-8 pb-4">
-        MCP Manager v0.3.13
+        MCP Manager v0.3.14
       </div>
     </div>
   );
