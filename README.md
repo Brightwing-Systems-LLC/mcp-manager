@@ -2,7 +2,7 @@
 
 **One app to install, authenticate, proxy, filter, and manage every MCP server across all your AI tools.**
 
-MCP is powerful. Managing it is a nightmare. Every AI tool has its own config format, its own file location, its own quirks. OAuth tokens expire. API keys sit in plaintext JSON. Installing a new server means reading docs, editing configs by hand, and hoping you didn't break the JSON. And once it's running, every tool in every server gets dumped into your context window — whether you need it or not.
+MCP is powerful. Managing it is a nightmare. Every AI tool has its own config format, its own file location, its own quirks. OAuth tokens expire. API keys and tokens sit in plaintext JSON. Installing a new server means reading docs, editing configs by hand, and hoping you didn't break the JSON. And once it's running, every tool in every server gets dumped into your context window — whether you need it or not.
 
 Brightwing MCP Manager fixes all of this. One desktop app. One control plane. Every AI tool you use.
 
@@ -40,11 +40,11 @@ The proxy runs as a lightweight local daemon with start-on-login support. From t
 
 ---
 
-## Encrypted API Key Vault
+## Encrypted Credential Vault
 
-API keys are stored in an encrypted [IOTA Stronghold](https://github.com/iotaledger/stronghold.rs) vault — not in plaintext JSON configs where any process on your machine can read them. The vault is encrypted with a machine-derived key and never leaves your device.
+API keys and OAuth tokens are stored in an encrypted [IOTA Stronghold](https://github.com/iotaledger/stronghold.rs) vault — not in plaintext JSON configs or SQLite databases where any process on your machine can read them. The vault encryption key is a random 32-byte secret stored in your OS keychain (macOS Keychain, Windows Credential Manager, or Linux Secret Service), so credentials are protected even if someone copies the vault file.
 
-Add, reveal, edit, or remove keys per server. Existing plaintext keys are migrated into the vault automatically on first launch.
+Add, reveal, edit, or remove keys per server. Existing plaintext keys and OAuth tokens are migrated into the vault automatically on first launch.
 
 ![API Keys](docs/mcp-mgr-api-keys.png)
 
@@ -99,7 +99,7 @@ $ bw "AI Cost Manager" get_costs --json | jq '.content[0].text'  # Pipe to jq
 All AI tools connect to MCP servers through a local stdio proxy. The proxy handles:
 
 - **Auth injection** — OAuth token refresh and API key insertion on every request
-- **Encrypted vault** — API keys stored in Stronghold encrypted storage, never in plaintext
+- **Encrypted vault** — API keys and OAuth tokens stored in Stronghold encrypted storage, with keychain-backed encryption keys
 - **Tool filtering** — Per-app control over which tools are exposed (and how many tokens they cost)
 - **Request logging** — See what's happening between your AI tools and MCP servers
 
@@ -220,7 +220,7 @@ Used by [MCP Scoreboard](https://mcpscoreboard.com) for "Install with Brightwing
 - [x] MCP Streamable HTTP support for tool discovery
 - [x] Proxy request logging
 - [ ] `notifications/tools/list_changed` push to connected clients
-- [x] Encrypted API key vault (Stronghold)
+- [x] Encrypted credential vault (Stronghold + OS keychain)
 - [ ] Code signing for macOS, Windows, and Linux
 - [ ] Windows platform hardening
 
