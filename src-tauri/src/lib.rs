@@ -2082,3 +2082,108 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running Brightwing MCP Manager");
 }
+
+#[cfg(test)]
+mod governance_tests {
+    use super::*;
+
+    #[test]
+    fn external_policy_deserialize_full() {
+        let json = r#"{
+            "enforced": true,
+            "exclusive": false,
+            "org_name": "Acme Corp",
+            "allowed_servers": [
+                {
+                    "identifier": "github-mcp",
+                    "display_name": "GitHub MCP",
+                    "description": "For engineering"
+                },
+                {
+                    "identifier": "sentry-mcp",
+                    "display_name": "Sentry MCP"
+                }
+            ]
+        }"#;
+        let policy: ExternalGovernancePolicy = serde_json::from_str(json).unwrap();
+        assert!(policy.enforced);
+        assert!(!policy.exclusive);
+        assert_eq!(policy.org_name, Some("Acme Corp".to_string()));
+        assert_eq!(policy.allowed_servers.len(), 2);
+        assert_eq!(policy.allowed_servers[0].identifier, "github-mcp");
+        assert_eq!(policy.allowed_servers[0].display_name, "GitHub MCP");
+        assert_eq!(policy.allowed_servers[0].description, Some("For engineering".to_string()));
+        assert_eq!(policy.allowed_servers[1].identifier, "sentry-mcp");
+        assert!(policy.allowed_servers[1].description.is_none());
+    }
+
+    #[test]
+    fn external_policy_deserialize_minimal() {
+        let json = r#"{}"#;
+        let policy: ExternalGovernancePolicy = serde_json::from_str(json).unwrap();
+        assert!(!policy.enforced);
+        assert!(!policy.exclusive);
+        assert!(policy.org_name.is_none());
+        assert!(policy.allowed_servers.is_empty());
+    }
+
+    #[test]
+    fn external_policy_deserialize_enforced_only() {
+        let json = r#"{"enforced": true}"#;
+        let policy: ExternalGovernancePolicy = serde_json::from_str(json).unwrap();
+        assert!(policy.enforced);
+        assert!(policy.allowed_servers.is_empty());
+    }
+
+    #[test]
+    fn external_policy_exclusive_flag() {
+        let json = r#"{"exclusive": true, "allowed_servers": [{"identifier": "only-this", "display_name": "Only This"}]}"#;
+        let policy: ExternalGovernancePolicy = serde_json::from_str(json).unwrap();
+        assert!(policy.exclusive);
+        assert_eq!(policy.allowed_servers.len(), 1);
+    }
+
+    #[test]
+    fn governance_policy_paths_not_empty() {
+        let paths = governance_policy_paths();
+        assert!(!paths.is_empty(), "Should have at least one policy path");
+    }
+
+    #[test]
+    fn is_server_allowed_combined_db_only() {
+        let db = db::Database::new_in_memory().unwrap();
+        db.add_to_allowlist("test-srv", "Test", None, "admin", None, None).unwrap();
+        // Without external policy file, should fall through to DB check
+        let result = is_server_allowed_combined(&db, "test-srv").unwrap();
+        assert!(result);
+        let result2 = is_server_allowed_combined(&db, "unknown-srv").unwrap();
+        assert!(!result2);
+    }
+
+    #[test]
+    fn is_governance_effectively_enabled_db() {
+        let db = db::Database::new_in_memory().unwrap();
+        assert!(!is_governance_effectively_enabled(&db));
+        db.set_governance_config("enabled", "true").unwrap();
+        assert!(is_governance_effectively_enabled(&db));
+    }
+
+    #[test]
+    fn governance_status_struct_serialize() {
+        let status = GovernanceStatus {
+            enabled: true,
+            has_admin_pin: true,
+            allowlist_count: 5,
+            pending_requests: 2,
+            policy_enforced: false,
+            policy_org: Some("Test Org".to_string()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"enabled\":true"));
+        assert!(json.contains("\"has_admin_pin\":true"));
+        assert!(json.contains("\"allowlist_count\":5"));
+        assert!(json.contains("\"pending_requests\":2"));
+        assert!(json.contains("\"policy_enforced\":false"));
+        assert!(json.contains("\"Test Org\""));
+    }
+}

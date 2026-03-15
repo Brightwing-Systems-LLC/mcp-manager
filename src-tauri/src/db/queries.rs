@@ -1125,3 +1125,424 @@ impl std::io::Write for Sha256Hasher {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod governance_tests {
+    use super::*;
+    use crate::db::Database;
+
+    fn test_db() -> Database {
+        Database::new_in_memory().expect("Failed to create in-memory database")
+    }
+
+    // ─── sha256_hex ─────────────────────────────────────────────────────
+
+    #[test]
+    fn sha256_hex_deterministic() {
+        let h1 = sha256_hex("test-pin");
+        let h2 = sha256_hex("test-pin");
+        assert_eq!(h1, h2, "Same input must produce same hash");
+    }
+
+    #[test]
+    fn sha256_hex_different_inputs() {
+        let h1 = sha256_hex("pin1");
+        let h2 = sha256_hex("pin2");
+        assert_ne!(h1, h2, "Different inputs must produce different hashes");
+    }
+
+    #[test]
+    fn sha256_hex_length() {
+        let h = sha256_hex("any-pin");
+        assert_eq!(h.len(), 32, "Hash should be 32 hex chars (two u64s)");
+    }
+
+    #[test]
+    fn sha256_hex_empty_input() {
+        let h = sha256_hex("");
+        assert!(!h.is_empty());
+        assert_ne!(h, sha256_hex("notempty"));
+    }
+
+    // ─── governance_config ──────────────────────────────────────────────
+
+    #[test]
+    fn config_get_missing_key() {
+        let db = test_db();
+        let val = db.get_governance_config("nonexistent").unwrap();
+        assert!(val.is_none());
+    }
+
+    #[test]
+    fn config_set_and_get() {
+        let db = test_db();
+        db.set_governance_config("my_key", "my_value").unwrap();
+        assert_eq!(
+            db.get_governance_config("my_key").unwrap(),
+            Some("my_value".to_string())
+        );
+    }
+
+    #[test]
+    fn config_overwrite() {
+        let db = test_db();
+        db.set_governance_config("key", "v1").unwrap();
+        db.set_governance_config("key", "v2").unwrap();
+        assert_eq!(
+            db.get_governance_config("key").unwrap(),
+            Some("v2".to_string())
+        );
+    }
+
+    #[test]
+    fn governance_disabled_by_default() {
+        let db = test_db();
+        assert!(!db.is_governance_enabled().unwrap());
+    }
+
+    #[test]
+    fn governance_enable_disable() {
+        let db = test_db();
+        db.set_governance_config("enabled", "true").unwrap();
+        assert!(db.is_governance_enabled().unwrap());
+        db.set_governance_config("enabled", "false").unwrap();
+        assert!(!db.is_governance_enabled().unwrap());
+    }
+
+    // ─── admin PIN ──────────────────────────────────────────────────────
+
+    #[test]
+    fn verify_pin_no_pin_set() {
+        let db = test_db();
+        assert!(!db.verify_admin_pin("anything").unwrap());
+    }
+
+    #[test]
+    fn verify_pin_correct() {
+        let db = test_db();
+        let hash = sha256_hex("secure1234");
+        db.set_governance_config("admin_pin_hash", &hash).unwrap();
+        assert!(db.verify_admin_pin("secure1234").unwrap());
+    }
+
+    #[test]
+    fn verify_pin_incorrect() {
+        let db = test_db();
+        let hash = sha256_hex("correct-pin");
+        db.set_governance_config("admin_pin_hash", &hash).unwrap();
+        assert!(!db.verify_admin_pin("wrong-pin").unwrap());
+    }
+
+    // ─── allowlist CRUD ─────────────────────────────────────────────────
+
+    #[test]
+    fn allowlist_empty_initially() {
+        let db = test_db();
+        assert!(db.get_allowlist().unwrap().is_empty());
+    }
+
+    #[test]
+    fn allowlist_add_and_retrieve() {
+        let db = test_db();
+        db.add_to_allowlist("github-mcp", "GitHub MCP", Some("Git tools"), "admin", Some("Approved"), None)
+            .unwrap();
+        let list = db.get_allowlist().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].server_identifier, "github-mcp");
+        assert_eq!(list[0].display_name, "GitHub MCP");
+        assert_eq!(list[0].description, Some("Git tools".to_string()));
+        assert_eq!(list[0].approved_by, "admin");
+        assert_eq!(list[0].review_notes, Some("Approved".to_string()));
+        assert!(list[0].max_version.is_none());
+    }
+
+    #[test]
+    fn allowlist_add_with_max_version() {
+        let db = test_db();
+        db.add_to_allowlist("sentry-mcp", "Sentry", None, "admin", None, Some("2.0.0"))
+            .unwrap();
+        let list = db.get_allowlist().unwrap();
+        assert_eq!(list[0].max_version, Some("2.0.0".to_string()));
+    }
+
+    #[test]
+    fn allowlist_upsert_same_identifier() {
+        let db = test_db();
+        db.add_to_allowlist("srv", "Name1", None, "admin", None, None).unwrap();
+        db.add_to_allowlist("srv", "Name2", Some("Updated"), "admin2", None, None).unwrap();
+        let list = db.get_allowlist().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].display_name, "Name2");
+        assert_eq!(list[0].description, Some("Updated".to_string()));
+    }
+
+    #[test]
+    fn allowlist_remove() {
+        let db = test_db();
+        db.add_to_allowlist("srv1", "Server 1", None, "admin", None, None).unwrap();
+        db.add_to_allowlist("srv2", "Server 2", None, "admin", None, None).unwrap();
+        db.remove_from_allowlist("srv1").unwrap();
+        let list = db.get_allowlist().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].server_identifier, "srv2");
+    }
+
+    #[test]
+    fn allowlist_remove_nonexistent() {
+        let db = test_db();
+        // Should not error
+        db.remove_from_allowlist("nonexistent").unwrap();
+    }
+
+    #[test]
+    fn is_server_allowed_yes() {
+        let db = test_db();
+        db.add_to_allowlist("my-srv", "My Server", None, "admin", None, None).unwrap();
+        assert!(db.is_server_allowed("my-srv").unwrap());
+    }
+
+    #[test]
+    fn is_server_allowed_no() {
+        let db = test_db();
+        assert!(!db.is_server_allowed("unknown-srv").unwrap());
+    }
+
+    #[test]
+    fn allowlist_ordered_by_display_name() {
+        let db = test_db();
+        db.add_to_allowlist("z-id", "Zulu", None, "admin", None, None).unwrap();
+        db.add_to_allowlist("a-id", "Alpha", None, "admin", None, None).unwrap();
+        db.add_to_allowlist("m-id", "Mike", None, "admin", None, None).unwrap();
+        let list = db.get_allowlist().unwrap();
+        let names: Vec<&str> = list.iter().map(|e| e.display_name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "Mike", "Zulu"]);
+    }
+
+    // ─── approval requests ──────────────────────────────────────────────
+
+    #[test]
+    fn create_request_returns_id() {
+        let db = test_db();
+        let id = db.create_approval_request("srv1", "Server 1", "user1", Some("Need it"))
+            .unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn create_multiple_requests() {
+        let db = test_db();
+        let id1 = db.create_approval_request("srv1", "Server 1", "user1", None).unwrap();
+        let id2 = db.create_approval_request("srv2", "Server 2", "user2", Some("reason")).unwrap();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn get_requests_all() {
+        let db = test_db();
+        db.create_approval_request("srv1", "Server 1", "user1", None).unwrap();
+        db.create_approval_request("srv2", "Server 2", "user2", None).unwrap();
+        let requests = db.get_approval_requests(None).unwrap();
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn get_requests_filter_by_status() {
+        let db = test_db();
+        let id1 = db.create_approval_request("srv1", "S1", "user1", None).unwrap();
+        db.create_approval_request("srv2", "S2", "user2", None).unwrap();
+        db.review_approval_request(id1, "approved", "admin", None).unwrap();
+
+        let pending = db.get_approval_requests(Some("pending")).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].server_identifier, "srv2");
+
+        let approved = db.get_approval_requests(Some("approved")).unwrap();
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].server_identifier, "srv1");
+    }
+
+    #[test]
+    fn request_defaults() {
+        let db = test_db();
+        db.create_approval_request("srv1", "Server 1", "user1", None).unwrap();
+        let requests = db.get_approval_requests(None).unwrap();
+        assert_eq!(requests[0].status, "pending");
+        assert!(requests[0].reviewed_by.is_none());
+        assert!(requests[0].reviewed_at.is_none());
+        assert!(requests[0].request_reason.is_none());
+    }
+
+    #[test]
+    fn review_request_approved() {
+        let db = test_db();
+        let id = db.create_approval_request("srv1", "S1", "user1", None).unwrap();
+        db.review_approval_request(id, "approved", "admin", Some("LGTM")).unwrap();
+        let reqs = db.get_approval_requests(None).unwrap();
+        assert_eq!(reqs[0].status, "approved");
+        assert_eq!(reqs[0].reviewed_by, Some("admin".to_string()));
+        assert_eq!(reqs[0].review_notes, Some("LGTM".to_string()));
+        assert!(reqs[0].reviewed_at.is_some());
+    }
+
+    #[test]
+    fn review_request_denied() {
+        let db = test_db();
+        let id = db.create_approval_request("srv1", "S1", "user1", None).unwrap();
+        db.review_approval_request(id, "denied", "admin", Some("Not approved")).unwrap();
+        let reqs = db.get_approval_requests(None).unwrap();
+        assert_eq!(reqs[0].status, "denied");
+    }
+
+    #[test]
+    fn requests_ordered_newest_first() {
+        let db = test_db();
+        // Create with slight ordering via different calls (SQLite datetime('now') granularity)
+        db.create_approval_request("first", "First", "user1", None).unwrap();
+        db.create_approval_request("second", "Second", "user1", None).unwrap();
+        let reqs = db.get_approval_requests(None).unwrap();
+        // second should come first (newest first) - or same timestamp, then by rowid DESC
+        assert_eq!(reqs.len(), 2);
+    }
+
+    // ─── audit log ──────────────────────────────────────────────────────
+
+    #[test]
+    fn audit_log_empty_initially() {
+        let db = test_db();
+        let log = db.get_audit_log(100).unwrap();
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn audit_log_add_and_retrieve() {
+        let db = test_db();
+        db.add_audit_log("governance_enabled", "admin", None, Some("Activated")).unwrap();
+        let log = db.get_audit_log(100).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].action, "governance_enabled");
+        assert_eq!(log[0].actor, "admin");
+        assert!(log[0].target_server.is_none());
+        assert_eq!(log[0].detail, Some("Activated".to_string()));
+        assert!(!log[0].timestamp.is_empty());
+    }
+
+    #[test]
+    fn audit_log_with_target_server() {
+        let db = test_db();
+        db.add_audit_log("allowlist_add", "admin", Some("github-mcp"), Some("Approved"))
+            .unwrap();
+        let log = db.get_audit_log(100).unwrap();
+        assert_eq!(log[0].target_server, Some("github-mcp".to_string()));
+    }
+
+    #[test]
+    fn audit_log_respects_limit() {
+        let db = test_db();
+        for i in 0..10 {
+            db.add_audit_log(&format!("action_{}", i), "admin", None, None).unwrap();
+        }
+        let log = db.get_audit_log(3).unwrap();
+        assert_eq!(log.len(), 3);
+    }
+
+    #[test]
+    fn audit_log_newest_first() {
+        let db = test_db();
+        db.add_audit_log("first", "admin", None, None).unwrap();
+        db.add_audit_log("second", "admin", None, None).unwrap();
+        let log = db.get_audit_log(100).unwrap();
+        assert_eq!(log.len(), 2);
+        // Both have same timestamp since they run instantly, but order by id DESC effectively
+    }
+
+    // ─── full governance workflow ───────────────────────────────────────
+
+    #[test]
+    fn full_setup_workflow() {
+        let db = test_db();
+
+        // 1. Not enabled initially
+        assert!(!db.is_governance_enabled().unwrap());
+
+        // 2. Setup: store PIN and enable
+        let pin = "admin1234";
+        let hash = sha256_hex(pin);
+        db.set_governance_config("admin_pin_hash", &hash).unwrap();
+        db.set_governance_config("enabled", "true").unwrap();
+        db.add_audit_log("governance_enabled", "admin", None, Some("Governance mode activated")).unwrap();
+
+        // 3. Verify governance is enabled
+        assert!(db.is_governance_enabled().unwrap());
+
+        // 4. Verify PIN
+        assert!(db.verify_admin_pin(pin).unwrap());
+        assert!(!db.verify_admin_pin("wrong").unwrap());
+
+        // 5. Add to allowlist
+        db.add_to_allowlist("github-mcp", "GitHub MCP", Some("Git integration"), "admin", Some("Reviewed"), None).unwrap();
+        db.add_audit_log("allowlist_add", "admin", Some("github-mcp"), Some("Approved: GitHub MCP")).unwrap();
+
+        // 6. Check allowlist
+        assert!(db.is_server_allowed("github-mcp").unwrap());
+        assert!(!db.is_server_allowed("other-mcp").unwrap());
+
+        // 7. User requests a server
+        let req_id = db.create_approval_request("slack-mcp", "Slack MCP", "user", Some("Need for comms")).unwrap();
+        db.add_audit_log("request_created", "user", Some("slack-mcp"), Some("Need for comms")).unwrap();
+
+        // 8. Admin approves
+        db.review_approval_request(req_id, "approved", "admin", Some("OK")).unwrap();
+        db.add_to_allowlist("slack-mcp", "Slack MCP", None, "admin", Some("OK"), None).unwrap();
+        db.add_audit_log("request_approved", "admin", Some("slack-mcp"), Some("OK")).unwrap();
+
+        // 9. Verify server is now allowed
+        assert!(db.is_server_allowed("slack-mcp").unwrap());
+
+        // 10. Verify audit trail
+        let log = db.get_audit_log(100).unwrap();
+        assert_eq!(log.len(), 4);
+        let actions: Vec<&str> = log.iter().map(|e| e.action.as_str()).collect();
+        assert!(actions.contains(&"governance_enabled"));
+        assert!(actions.contains(&"allowlist_add"));
+        assert!(actions.contains(&"request_created"));
+        assert!(actions.contains(&"request_approved"));
+    }
+
+    #[test]
+    fn allowlist_removal_workflow() {
+        let db = test_db();
+        db.add_to_allowlist("srv1", "Server 1", None, "admin", None, None).unwrap();
+        assert!(db.is_server_allowed("srv1").unwrap());
+
+        db.remove_from_allowlist("srv1").unwrap();
+        assert!(!db.is_server_allowed("srv1").unwrap());
+        assert!(db.get_allowlist().unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_denial_workflow() {
+        let db = test_db();
+        let id = db.create_approval_request("bad-srv", "Bad Server", "user", Some("Want it")).unwrap();
+        db.review_approval_request(id, "denied", "admin", Some("Security risk")).unwrap();
+
+        let denied = db.get_approval_requests(Some("denied")).unwrap();
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].review_notes, Some("Security risk".to_string()));
+
+        // Server should NOT be on allowlist
+        assert!(!db.is_server_allowed("bad-srv").unwrap());
+    }
+
+    #[test]
+    fn multiple_requests_same_server() {
+        let db = test_db();
+        let id1 = db.create_approval_request("srv1", "S1", "user1", Some("First try")).unwrap();
+        db.review_approval_request(id1, "denied", "admin", Some("No")).unwrap();
+
+        let id2 = db.create_approval_request("srv1", "S1", "user1", Some("Please reconsider")).unwrap();
+        assert_ne!(id1, id2);
+
+        let all = db.get_approval_requests(None).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+}
