@@ -5,13 +5,12 @@ import birdIcon from "../assets-logo-bird.png";
 
 const APP_VERSION = "0.3.12";
 
-const navItems: { id: View; label: string; icon: string }[] = [
+const baseNavItems: { id: View; label: string; icon: string }[] = [
   { id: "dashboard", label: "Dashboard", icon: "grid" },
   { id: "search", label: "Search", icon: "search" },
   { id: "add-server", label: "Add Server", icon: "plus" },
   { id: "proxy", label: "Proxy", icon: "shield" },
   { id: "api-keys", label: "API Keys", icon: "key" },
-  { id: "governance", label: "Governance", icon: "lock" },
   { id: "cli", label: "CLI", icon: "terminal" },
   { id: "about", label: "About", icon: "info" },
 ];
@@ -65,14 +64,25 @@ const icons: Record<string, JSX.Element> = {
 };
 
 export default function Navigation() {
-  const { view, setView, updateAvailable, updateDownloading, installUpdate, checkForUpdate } = useStore();
+  const { view, setView, updateAvailable, updateDownloading, installUpdate, checkForUpdate, governanceStatus, refreshGovernanceStatus } = useStore();
 
   // Check for updates on mount and every 4 hours
   useEffect(() => {
     checkForUpdate();
+    refreshGovernanceStatus();
     const interval = setInterval(checkForUpdate, 4 * 60 * 60 * 1000);
     return () => clearInterval(interval);
-  }, [checkForUpdate]);
+  }, [checkForUpdate, refreshGovernanceStatus]);
+
+  // Only show governance nav when it's been set up or an external policy exists
+  const showGovernance = governanceStatus && (governanceStatus.has_admin_pin || governanceStatus.policy_enforced);
+  const navItems = showGovernance
+    ? [
+        ...baseNavItems.slice(0, 5),
+        { id: "governance" as View, label: "Governance", icon: "lock" },
+        ...baseNavItems.slice(5),
+      ]
+    : baseNavItems;
 
   return (
     <nav className="w-56 bg-brightwing-gray-800 border-r border-brightwing-gray-700 flex flex-col">
