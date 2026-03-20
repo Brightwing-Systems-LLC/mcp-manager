@@ -508,8 +508,9 @@ async fn probe_server_auth(url: String) -> Result<AuthProbeResult, String> {
         });
     }
 
-    if status == 401 || status == 403 {
-        // Check for OAuth metadata
+    if status == 401 || status == 403 || status == 405 {
+        // Check for OAuth metadata — try this for 401/403 (auth required)
+        // and 405 (some OAuth servers reject unauthenticated POST with Method Not Allowed)
         match oauth::discovery::discover_oauth_metadata(&url).await {
             Ok(_) => {
                 return Ok(AuthProbeResult {
@@ -520,6 +521,15 @@ async fn probe_server_auth(url: String) -> Result<AuthProbeResult, String> {
                 });
             }
             Err(_) => {
+                if status == 405 {
+                    // 405 without OAuth metadata — not an auth issue, method genuinely not allowed
+                    return Ok(AuthProbeResult {
+                        auth_type: "unknown".to_string(),
+                        server_reachable: true,
+                        error_message: Some(format!("HTTP {} Method Not Allowed — the server may not support Streamable HTTP at this URL", status)),
+                        has_oauth_metadata: false,
+                    });
+                }
                 return Ok(AuthProbeResult {
                     auth_type: "api_key".to_string(),
                     server_reachable: true,

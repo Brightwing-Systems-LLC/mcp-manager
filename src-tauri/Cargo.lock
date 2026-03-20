@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "brightwing-mcp-manager"
-version = "0.3.13"
+version = "0.3.15"
 dependencies = [
  "base64 0.22.1",
  "chrono",

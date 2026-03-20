@@ -1,48 +1,79 @@
 use super::types::{OAuthError, OAuthServerMetadata};
 
 /// Discover OAuth metadata from the server's well-known endpoint.
+///
+/// Per RFC 8414 / MCP spec, tries the path-level well-known URL first
+/// (e.g. `https://host/mcp/.well-known/oauth-authorization-server`),
+/// then falls back to the origin-level URL
+/// (e.g. `https://host/.well-known/oauth-authorization-server`).
 pub async fn discover_oauth_metadata(server_url: &str) -> Result<OAuthServerMetadata, OAuthError> {
-    let url = format!(
-        "{}/.well-known/oauth-authorization-server",
-        server_url.trim_end_matches('/')
-    );
-
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| OAuthError::Network(e.to_string()))?;
 
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| OAuthError::DiscoveryFailed(format!("Request failed: {}", e)))?;
+    // Build candidate URLs: path-level first, then origin-level fallback
+    let trimmed = server_url.trim_end_matches('/');
+    let path_level = format!("{}/.well-known/oauth-authorization-server", trimmed);
 
-    if !resp.status().is_success() {
-        return Err(OAuthError::DiscoveryFailed(format!(
-            "HTTP {}",
-            resp.status()
-        )));
+    let origin_level = match reqwest::Url::parse(trimmed) {
+        Ok(parsed) => {
+            let origin = parsed.origin().ascii_serialization();
+            Some(format!("{}/.well-known/oauth-authorization-server", origin))
+        }
+        Err(_) => None,
+    };
+
+    let mut urls = vec![path_level.clone()];
+    if let Some(ref origin) = origin_level {
+        // Only add origin-level if it differs from path-level
+        if origin != &path_level {
+            urls.push(origin.clone());
+        }
     }
 
-    let metadata: OAuthServerMetadata = resp
-        .json()
-        .await
-        .map_err(|e| OAuthError::DiscoveryFailed(format!("Invalid JSON: {}", e)))?;
+    let mut last_err = OAuthError::DiscoveryFailed("No URLs to try".to_string());
 
-    // Validate required fields
-    if metadata.authorization_endpoint.is_empty() {
-        return Err(OAuthError::DiscoveryFailed(
-            "Missing authorization_endpoint".to_string(),
-        ));
-    }
-    if metadata.token_endpoint.is_empty() {
-        return Err(OAuthError::DiscoveryFailed(
-            "Missing token_endpoint".to_string(),
-        ));
+    for candidate_url in &urls {
+        let resp = match client.get(candidate_url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = OAuthError::DiscoveryFailed(format!("Request failed: {}", e));
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            last_err = OAuthError::DiscoveryFailed(format!("HTTP {}", resp.status()));
+            continue;
+        }
+
+        let metadata: OAuthServerMetadata = match resp.json().await {
+            Ok(m) => m,
+            Err(e) => {
+                last_err = OAuthError::DiscoveryFailed(format!("Invalid JSON: {}", e));
+                continue;
+            }
+        };
+
+        // Validate required fields
+        if metadata.authorization_endpoint.is_empty() {
+            last_err = OAuthError::DiscoveryFailed(
+                "Missing authorization_endpoint".to_string(),
+            );
+            continue;
+        }
+        if metadata.token_endpoint.is_empty() {
+            last_err = OAuthError::DiscoveryFailed(
+                "Missing token_endpoint".to_string(),
+            );
+            continue;
+        }
+
+        return Ok(metadata);
     }
 
-    Ok(metadata)
+    Err(last_err)
 }
 
 #[cfg(test)]
