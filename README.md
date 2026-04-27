@@ -255,17 +255,9 @@ An Arch Linux package is available in the AUR as [`mcp-manager-bin`](https://aur
 Install with an AUR helper:
 
 ```bash
-paru -S mcp-manager-bin
-# or
 yay -S mcp-manager-bin
-```
-
-Manual build/install:
-
-```bash
-git clone https://aur.archlinux.org/mcp-manager-bin.git
-cd mcp-manager-bin
-makepkg -si
+# or
+paru -S mcp-manager-bin
 ```
 
 ## Build from Source
