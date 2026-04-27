@@ -248,6 +248,26 @@ chmod +x brightwing-mcp-manager_*.AppImage
 ./brightwing-mcp-manager_*.AppImage
 ```
 
+### Arch Linux (AUR)
+
+An Arch Linux package is available in the AUR as [`mcp-manager-bin`](https://aur.archlinux.org/packages/mcp-manager-bin). It repackages the official Linux `.deb` release for Arch Linux and is community maintained.
+
+Install with an AUR helper:
+
+```bash
+paru -S mcp-manager-bin
+# or
+yay -S mcp-manager-bin
+```
+
+Manual build/install:
+
+```bash
+git clone https://aur.archlinux.org/mcp-manager-bin.git
+cd mcp-manager-bin
+makepkg -si
+```
+
 ## Build from Source
 
 ### Prerequisites
