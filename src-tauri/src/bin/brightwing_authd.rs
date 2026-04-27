@@ -308,7 +308,20 @@ impl DaemonState {
                     }
                 }
             }
-            "none" => Credential::None,
+            "none" => {
+                // No-auth upstreams still need transport details (URL/command) so the
+                // proxy can connect without injecting an Authorization header.
+                // Reuse ApiKeyCredential as a transport envelope with an empty env map.
+                Credential::ApiKey(ApiKeyCredential {
+                    env: std::collections::HashMap::new(),
+                    command: server.upstream_command.clone(),
+                    args: server.upstream_args.as_ref().map(|a| {
+                        a.split_whitespace().map(String::from).collect()
+                    }),
+                    url: server.upstream_url.clone(),
+                    api_key_injection: server.api_key_injection.clone(),
+                })
+            }
             other => {
                 return IpcResponse::CredentialError {
                     server_id: server_id.to_string(),
